@@ -81,7 +81,7 @@ class Planner(AbstractPlanner):
         
         # 2. PLANLAYICI BAŞLIK (HEAD): Yeni eğittiğiniz AR_Planner'ı yükle
         # self._model_path parametresi, test komutundan gelen yeni eğitilmiş model yoludur
-        self.planner_head = SceneGraphModeSelector(num_neighbors=10)
+        self.planner_head = ModeSelector()
         self.planner_head.load_state_dict(torch.load(self._model_path, map_location=self._device))
         self.planner_head.to(self._device)
         self.planner_head.eval()
@@ -632,8 +632,8 @@ class Planner(AbstractPlanner):
             encoder_outputs = self.backbone.encoder(features)
             route_lanes = encoder_outputs['route_lanes']
             initial_state = encoder_outputs['actors'][:, 0, -1]
-            decoder_outputs, env_encoding, _ = self.backbone.decoder(encoder_outputs)
-
+            decoder_outputs, env_encoding = self.backbone.decoder(encoder_outputs)
+            
             _ , ego_plan, neural_plan = self.backbone(features)
 
 
@@ -898,147 +898,6 @@ class Planner(AbstractPlanner):
         plt.close(fig)
         self._debug_candidates_plot_count += 1
    
-    def _save_graph_debug_plot(self, features, candidates, relevance, tau_hat, lat_idx, lon_idx, iteration=0):
-        """
-        Scene graph görselleştirmesi:
-        - Her komşu agent → predicate renginde, relevance büyüklüğünde daire
-        - Seçilen c_lat → turuncu kalın çizgi
-        - Diğer c_lat adayları → gri kesikli
-        - Sağ panel → agent başına relevance bar chart
-        """
-        if not self._debug:
-            return
-
-        out_dir = getattr(self, '_current_scenario_dir', self._debug_dir or "testing_log/debug_plots")
-        out_dir = os.path.join(out_dir, "graph")
-        os.makedirs(out_dir, exist_ok=True)
-
-        PRED_COLORS = [
-            '#1f77b4',  # 0 follow
-            '#ff7f0e',  # 1 yield_to
-            '#d62728',  # 2 blocked_by
-            '#9467bd',  # 3 cut_in
-            '#e7ba52',  # 4 merge_conflict
-            '#2ca02c',  # 5 intersection_conflict
-            '#17becf',  # 6 overtake_target
-            '#7f7f7f',  # 7 vulnerable_user
-        ]
-        NO_MATCH_COLOR = '#dddddd'
-        PRED_PRIORITY = [2, 3, 5, 1, 4, 0, 6, 7]  # blocked_by önce
-
-        fig, (ax_map, ax_bar) = plt.subplots(1, 2, figsize=(16, 8),
-                                             gridspec_kw={'width_ratios': [3, 1]})
-
-        # --- Harita arka planı ---
-        plt.sca(ax_map)
-        map_lanes     = features['map_lanes'][0].detach().cpu().numpy()
-        map_crosswalks = features['map_crosswalks'][0].detach().cpu().numpy()
-        route_lanes   = features['route_lanes'][0].detach().cpu().numpy()
-        ego_past      = features['ego_agent_past'][0].detach().cpu().numpy()
-        neighbors_past = features['neighbor_agents_past'][0].detach().cpu().numpy()
-
-        create_map_raster(map_lanes, map_crosswalks, route_lanes)
-        create_ego_raster(ego_past[-1])
-        ax_map.plot(ego_past[:, 0], ego_past[:, 1], color='#00a8e8', lw=2, zorder=4)
-
-        # --- Aday rotalar ---
-        for i in range(candidates.shape[0]):
-            xy = candidates[i, :, :2]
-            if not np.any(xy):
-                continue
-            if i == lat_idx:
-                ax_map.plot(xy[:, 0], xy[:, 1], '-', lw=4.5, color='tab:orange', zorder=8, alpha=1.0)
-                ax_map.scatter(xy[-1, 0], xy[-1, 1], s=80, color='tab:orange', zorder=9, marker='*')
-            else:
-                ax_map.plot(xy[:, 0], xy[:, 1], '--', lw=1.5, color='gray', zorder=5, alpha=0.55)
-
-        # --- Agent'lar predicate rengiyle ---
-        N = min(tau_hat.shape[0], neighbors_past.shape[0])
-        agent_entries = []  # (n, pred_name, pred_idx, rel)
-        drawn_preds = set()
-
-        for n in range(N):
-            pos = neighbors_past[n, -1, :2]
-            if pos[0] == 0.0 and pos[1] == 0.0:
-                continue
-            rel = float(relevance[n])
-            active = tau_hat[n]
-
-            color = NO_MATCH_COLOR
-            pred_name = 'no_match'
-            pred_idx = -1
-            for k in PRED_PRIORITY:
-                if active[k] > 0.5:
-                    color = PRED_COLORS[k]
-                    pred_name = PREDICATE_NAMES[k]
-                    pred_idx = k
-                    break
-            drawn_preds.add(pred_idx)
-
-            size = 80 + 420 * rel  # 80..500
-            ax_map.scatter(pos[0], pos[1], s=size, c=color,
-                           edgecolors='black', linewidths=0.8, zorder=6, alpha=0.85)
-            ax_map.annotate(
-                f' {n}:{pred_name[:4]}\n r={rel:.2f}',
-                (pos[0], pos[1]), fontsize=6, zorder=7, ha='left', va='center',
-            )
-            agent_entries.append((n, pred_name, pred_idx, rel))
-
-        ax_map.scatter([0], [0], marker='x', s=80, color='black', zorder=12)
-
-        speed_mps = (lon_idx / 11.0) * 15.0
-        ax_map.set_title(
-            f'Scene Graph  |  c_lat={lat_idx}  c_lon={lon_idx}  v={speed_mps:.1f} m/s  |  iter={iteration}',
-            fontsize=10,
-        )
-        ax_map.set_aspect('equal')
-        ax_map.grid(True, alpha=0.3)
-
-        legend_handles = [
-            Line2D([0], [0], color='c',  lw=3, label='lanes'),
-            Line2D([0], [0], color='b',  lw=3, label='crosswalks'),
-            Line2D([0], [0], color='g',  lw=3, label='route_lanes'),
-            Line2D([0], [0], color='tab:orange', lw=4,   label=f'selected c_lat ({lat_idx})'),
-            Line2D([0], [0], color='gray',       lw=1.5, ls='--', label='other candidates'),
-        ]
-        from GameFormer.ar_wrapper import PREDICATE_NAMES as _PN, NUM_PREDICATES as _NP
-        for k in range(_NP):
-            if k in drawn_preds:
-                legend_handles.append(
-                    Line2D([0], [0], marker='o', color='w',
-                           markerfacecolor=PRED_COLORS[k], markersize=9, label=_PN[k])
-                )
-        if -1 in drawn_preds:
-            legend_handles.append(
-                Line2D([0], [0], marker='o', color='w',
-                       markerfacecolor=NO_MATCH_COLOR, markeredgecolor='black',
-                       markersize=9, label='no_match')
-            )
-        ax_map.legend(handles=legend_handles, loc='upper left', fontsize=7)
-
-        # --- Sağ panel: relevance bar chart ---
-        if agent_entries:
-            bar_colors = [PRED_COLORS[e[2]] if e[2] >= 0 else NO_MATCH_COLOR for e in agent_entries]
-            rels      = [e[3] for e in agent_entries]
-            bar_labels = [f'A{e[0]}\n{e[1][:5]}' for e in agent_entries]
-
-            ax_bar.barh(range(len(rels)), rels, color=bar_colors, edgecolor='black', linewidth=0.5)
-            ax_bar.set_yticks(range(len(rels)))
-            ax_bar.set_yticklabels(bar_labels, fontsize=7)
-            ax_bar.set_xlabel('Relevance (σ)')
-            ax_bar.set_xlim(0, 1)
-            ax_bar.set_title('Agent Relevance', fontsize=9)
-            ax_bar.axvline(0.5, color='red', lw=0.8, ls='--', alpha=0.5, label='threshold=0.5')
-            ax_bar.legend(fontsize=7)
-            ax_bar.grid(True, axis='x', alpha=0.3)
-        else:
-            ax_bar.text(0.5, 0.5, 'No agents', transform=ax_bar.transAxes, ha='center', va='center')
-
-        plt.tight_layout()
-        out_path = os.path.join(out_dir, f'graph_iter_{iteration:04d}.png')
-        fig.savefig(out_path, dpi=120, bbox_inches='tight')
-        plt.close(fig)
-
     def _plan(self, ego_state, history, traffic_light_data, observation, iteration=None):
         # Construct input features
         features = observation_adapter(history, traffic_light_data, self._map_api, self._route_roadblock_ids, self._device)
@@ -1073,26 +932,20 @@ class Planner(AbstractPlanner):
             if run_selector:
                 with torch.no_grad():
                     encoder_outputs = self.backbone.encoder(features)
-                    decoder_outputs_sel, _, neighbor_content = self.backbone.decoder(encoder_outputs)
-                    current_states = encoder_outputs['actors'][:, :, -1]
+                    _, env_encoding = self.backbone.decoder(encoder_outputs)
 
                     # c_lat_candidates: (N_lat, N_r, 6) -> [B, N_lat, N_r, feat]
                     c_lat_tensor = torch.tensor(c_lat_candidates, dtype=torch.float32, device=self._device).unsqueeze(0)
-                    mode_scores, _, relevance, tau_hat = self.planner_head(
-                        encoder_outputs['encoding'],
-                        encoder_outputs['mask'],
-                        decoder_outputs_sel,
-                        neighbor_content,
-                        c_lat_tensor,
-                        current_states,
+                    mode_scores, _ = self.planner_head(
+                        env_encoding, c_lat_tensor,
+                        scene_encoding=encoder_outputs['encoding'],
+                        scene_mask=encoder_outputs['mask'],
                     )
                     best_idx = int(torch.argmax(mode_scores, dim=1).cpu().item())
                     lat_idx = best_idx // num_lon
                     lon_idx = best_idx % num_lon
                     self._prev_lat_idx = lat_idx
                     self._prev_lon_idx = lon_idx
-                    self._prev_relevance = relevance[0].cpu().numpy()
-                    self._prev_tau_hat = tau_hat[0].cpu().numpy()
             else:
                 # Cache'den onceki secimi kullan
                 lat_idx = self._prev_lat_idx
@@ -1125,22 +978,10 @@ class Planner(AbstractPlanner):
         
         # 6. Debug Çizimi
         if self._debug:
-            rel_np = getattr(self, '_prev_relevance', None)
-            tau_np = getattr(self, '_prev_tau_hat', None)
-            if rel_np is not None and tau_np is not None:
-                self._save_graph_debug_plot(
-                    features=features,
-                    candidates=c_lat_candidates,
-                    relevance=rel_np,
-                    tau_hat=tau_np,
-                    lat_idx=lat_idx,
-                    lon_idx=lon_idx,
-                    iteration=0 if iteration is None else iteration,
-                )
             self._save_candidates_debug_plot(
                 features,
-                c_lat_candidates,
-                best_idx=lat_idx,
+                c_lat_candidates,  
+                best_idx=lat_idx, # <--- SEÇİLEN ROTAYI FONKSİYONA GÖNDERİYORUZ
                 iteration=0 if iteration is None else iteration,
             )
             self._save_debug_plot(

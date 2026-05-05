@@ -85,9 +85,8 @@ class Decoder(nn.Module):
             decoder_outputs[f'level_{k}_scores'] = last_score
         
         env_encoding = last_content[:, 0]
-        neighbor_content = last_content[:, 1:]  # [B, N_neigh, M, D]
 
-        return decoder_outputs, env_encoding, neighbor_content
+        return decoder_outputs, env_encoding
 
 class DecoderP(nn.Module):
     def __init__(self, neighbors=10, modalities=6, levels=3):
@@ -135,9 +134,8 @@ class DecoderP(nn.Module):
             decoder_outputs[f'level_{k}_scores'] = last_score
         
         env_encoding = last_content[:, 0]
-        neighbor_content = last_content[:, 1:]  # [B, N_neigh, M, D]
 
-        return decoder_outputs, env_encoding, neighbor_content
+        return decoder_outputs, env_encoding
 
 class NeuralPlanner(nn.Module):
     def __init__(self):
@@ -194,7 +192,7 @@ class GameFormer(nn.Module):
         encoder_outputs = self.encoder(inputs)
         route_lanes = encoder_outputs['route_lanes']
         initial_state = encoder_outputs['actors'][:, 0, -1]
-        decoder_outputs, env_encoding, _ = self.decoder(encoder_outputs)
+        decoder_outputs, env_encoding = self.decoder(encoder_outputs)
         neural_plan = self.planner(env_encoding, route_lanes, initial_state)
         
 

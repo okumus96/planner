@@ -9,7 +9,7 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from GameFormer.ar_wrapper import SceneGraphModeSelector
+from GameFormer.ar_wrapper import ModeSelector
 from GameFormer.predictor import GameFormer
 from GameFormer.train_utils import DrivingData, get_expert_mode_index, initLogging, set_seed
 
@@ -45,18 +45,14 @@ def train_epoch(data_loader, gameformer, mode_selector, optimizer, device):
             optimizer.zero_grad()
             with torch.no_grad():
                 encoder_outputs = gameformer.encoder(inputs)
-                decoder_outputs, _, neighbor_content = gameformer.decoder(encoder_outputs)
+                _, env_encoding = gameformer.decoder(encoder_outputs)
 
-            mode_scores, _, relevance, _ = mode_selector(
-                encoder_outputs['encoding'],
-                encoder_outputs['mask'],
-                decoder_outputs,
-                neighbor_content,
-                c_lat_candidates,
-                encoder_outputs['actors'][:, :, -1],
+            mode_scores, _ = mode_selector(
+                env_encoding, c_lat_candidates,
+                scene_encoding=encoder_outputs['encoding'],
+                scene_mask=encoder_outputs['mask'],
             )
-            ce_loss = nn.functional.cross_entropy(mode_scores, gt_mode_idx)
-            loss = ce_loss
+            loss = nn.functional.cross_entropy(mode_scores, gt_mode_idx)
 
             loss.backward()
             #nn.utils.clip_grad_norm_(mode_selector.parameters(), 5.0)
@@ -85,17 +81,13 @@ def valid_epoch(data_loader, gameformer, mode_selector, device):
 
             with torch.no_grad():
                 encoder_outputs = gameformer.encoder(inputs)
-                decoder_outputs, _, neighbor_content = gameformer.decoder(encoder_outputs)
-                mode_scores, _, relevance, _ = mode_selector(
-                    encoder_outputs['encoding'],
-                    encoder_outputs['mask'],
-                    decoder_outputs,
-                    neighbor_content,
-                    c_lat_candidates,
-                    encoder_outputs['actors'][:, :, -1],
+                _, env_encoding = gameformer.decoder(encoder_outputs)
+                mode_scores, _ = mode_selector(
+                    env_encoding, c_lat_candidates,
+                    scene_encoding=encoder_outputs['encoding'],
+                    scene_mask=encoder_outputs['mask'],
                 )
-                ce_loss = nn.functional.cross_entropy(mode_scores, gt_mode_idx)
-                loss = ce_loss
+                loss = nn.functional.cross_entropy(mode_scores, gt_mode_idx)
 
             predictions = mode_scores.argmax(dim=1)
             accuracy = (predictions == gt_mode_idx).float().mean().item()
@@ -128,7 +120,7 @@ def model_training(args):
     gameformer = gameformer.to(args.device)
     freeze_gameformer(gameformer)
 
-    mode_selector = SceneGraphModeSelector(num_neighbors=args.num_neighbors).to(args.device)
+    mode_selector = ModeSelector().to(args.device)
 
     optimizer = optim.AdamW(mode_selector.parameters(), lr=args.learning_rate)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 12, 14, 16, 18], gamma=0.5)
