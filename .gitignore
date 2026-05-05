@@ -1,0 +1,6 @@
+*.pdf
+__pycache__/
+*.log
+*.csv
+testing_log/
+training_log/

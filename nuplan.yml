@@ -1,0 +1,14 @@
+name: nuplan_final
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip=24.0  # Senin calisan sistemindeki versiyon sabitlendi
+  - wheel
+  - setuptools
+  # Derleme ve Segfault hatalarini onleyen C kutuphaneleri
+  - suitesparse
+  - libspatialindex
+  - rtree
+  - compilers
