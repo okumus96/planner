@@ -3,6 +3,7 @@ _convert_: "all"
 
 scenario_types: # List of scenario types to include
   - changing_lane
+
 scenario_tokens: null # List of scenario tokens to include
 
 log_names: null # Filter scenarios by log names

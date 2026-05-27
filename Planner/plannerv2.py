@@ -923,7 +923,7 @@ class Planner(AbstractPlanner):
 
         # ModeSelector skoru en yuksek olani sec
         # Stabilite icin sadece her N iterasyonda bir yeniden secim yap, arada cache kullan
-        SELECT_EVERY = 10
+        SELECT_EVERY = 80
         num_lon = 12
         best_c_lat_np = None
         run_selector = (iteration is None) or (iteration % SELECT_EVERY == 0) or (not hasattr(self, '_prev_lat_idx'))
@@ -932,13 +932,12 @@ class Planner(AbstractPlanner):
             if run_selector:
                 with torch.no_grad():
                     encoder_outputs = self.backbone.encoder(features)
-                    _, env_encoding = self.backbone.decoder(encoder_outputs)
 
                     # c_lat_candidates: (N_lat, N_r, 6) -> [B, N_lat, N_r, feat]
                     c_lat_tensor = torch.tensor(c_lat_candidates, dtype=torch.float32, device=self._device).unsqueeze(0)
                     mode_scores, _ = self.planner_head(
-                        env_encoding, c_lat_tensor,
-                        scene_encoding=encoder_outputs['encoding'],
+                        encoder_outputs['encoding'],
+                        c_lat_tensor,
                         scene_mask=encoder_outputs['mask'],
                     )
                     best_idx = int(torch.argmax(mode_scores, dim=1).cpu().item())
@@ -967,11 +966,24 @@ class Planner(AbstractPlanner):
         # Infer prediction model
         with torch.no_grad():
             ego_plan, neural_plan, predictions, scores, ego_state_transformed, neighbors_state_transformed = self._get_prediction(features)
-            
+
+        # --- TEST: NeuralPlanner'i bypass et, ref_path2 + mode_selector'in lon_idx hizini kullan ---
+        # neural_plan'in TrajectoryPlanner icindeki rolu: ref_path uzerinde baslangic speed
+        # profili belirlemek. Burada o profili dogrudan constant-speed sampling ile uretiyoruz.
+        # ref_path2 spacing = 0.1m, fake_plan_idx[t] = t * best_speed_mps (cunku v*t*0.1m / 0.1m).
+        USE_FAKE_NEURAL_PLAN = True
+        if USE_FAKE_NEURAL_PLAN and ref_path2 is not None:
+            N_FAKE = 80   # 8s @ 10Hz
+            DT_FAKE = 0.1
+            fake_distances_m = np.arange(N_FAKE) * DT_FAKE * best_speed_mps
+            fake_idx = (fake_distances_m * 10).astype(np.int32).clip(0, len(ref_path2) - 1)
+            fake_plan_np = ref_path2[fake_idx, :3]   # [80, 3]: x, y, theta
+            neural_plan = torch.from_numpy(fake_plan_np).float().unsqueeze(0).to(self._device)
+        # --------------------------------------------------------------------------------
 
         # Trajectory refinement
         with torch.no_grad():
-            final_plan = self._trajectory_planner.plan(ego_state, ego_state_transformed, neighbors_state_transformed, 
+            final_plan = self._trajectory_planner.plan(ego_state, ego_state_transformed, neighbors_state_transformed,
                                                  predictions, neural_plan, scores, ref_path2, observation)
 
 

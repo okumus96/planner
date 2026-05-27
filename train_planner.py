@@ -45,11 +45,10 @@ def train_epoch(data_loader, gameformer, mode_selector, optimizer, device):
             optimizer.zero_grad()
             with torch.no_grad():
                 encoder_outputs = gameformer.encoder(inputs)
-                _, env_encoding = gameformer.decoder(encoder_outputs)
 
             mode_scores, _ = mode_selector(
-                env_encoding, c_lat_candidates,
-                scene_encoding=encoder_outputs['encoding'],
+                encoder_outputs['encoding'],
+                c_lat_candidates,
                 scene_mask=encoder_outputs['mask'],
             )
             loss = nn.functional.cross_entropy(mode_scores, gt_mode_idx)
@@ -81,10 +80,9 @@ def valid_epoch(data_loader, gameformer, mode_selector, device):
 
             with torch.no_grad():
                 encoder_outputs = gameformer.encoder(inputs)
-                _, env_encoding = gameformer.decoder(encoder_outputs)
                 mode_scores, _ = mode_selector(
-                    env_encoding, c_lat_candidates,
-                    scene_encoding=encoder_outputs['encoding'],
+                    encoder_outputs['encoding'],
+                    c_lat_candidates,
                     scene_mask=encoder_outputs['mask'],
                 )
                 loss = nn.functional.cross_entropy(mode_scores, gt_mode_idx)

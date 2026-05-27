@@ -1,0 +1,28 @@
+Samples processed: 299
+Total valid neighbor predictions: 1970
+
+=== Overall (full 8s horizon) ===
+metric            mean   median     p25     p75      max
+minADE@6         0.623    0.238   0.122   0.701    18.57
+minFDE@6         1.429    0.363   0.137   1.325    48.69
+top1_ADE         1.215    0.312   0.136   1.241    27.56
+
+=== Horizon-stratified mean (3s / 5s / 8s) ===
+  minADE  :   0.187  /  0.319  /  0.623  m
+  minFDE  :   0.292  /  0.605  /  1.429  m
+
+=== Diagnostic ratios ===
+  top1_ADE / minADE@6      = 1.95   (1.0 = perfect score head; >2 = bad)
+  miss-rate (FDE > 2 m)    = 19.3%
+  miss-rate (FDE > 4 m)    = 9.2%
+  score-head wrong (>2x)   = 22.0%   (agents where top1 > 2× oracle)
+
+=== Per scenario type (mean across agents) ===
+  scenario_type                             N   minADE   minFDE    top1    gap
+  changing_lane                           282    0.726    1.622   1.391   1.91
+  high_lateral_acceleration               258    0.755    1.704   1.533   2.03
+  starting_left_turn                      321    0.868    2.216   1.731   1.99
+  starting_right_turn                     296    0.756    1.717   1.389   1.84
+  stationary_in_traffic                   467    0.295    0.559   0.610   2.06
+  traversing_pickup_dropoff               346    0.543    1.263   1.024   1.89
+

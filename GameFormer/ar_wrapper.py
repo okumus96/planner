@@ -35,10 +35,11 @@ class ModeSelector(nn.Module):
         self.query_encoder = CrossTransformer(dim=dim)
         self.score_mlp = nn.Sequential(nn.Linear(dim, 64), nn.ELU(), nn.Linear(64, 1))
 
-    def forward(self, env_encoding, c_lat, scene_encoding=None, scene_mask=None):
-        B = env_encoding.shape[0]
-        device = env_encoding.device
-        
+    def forward(self, scene_encoding, c_lat, scene_mask=None):
+        # CarPlanner Sec. 3.3.2: selector sadece s0 (encoder output) ile çalışır.
+        B = scene_encoding.shape[0]
+        device = scene_encoding.device
+
         # --- A. LATERAL MODE HAZIRLIĞI ---
         # c_lat girdisi: [B, N_lat, N_r, feature_dim] -> Örn: [B, 5, 50, 6]
         lat_feat = self.lat_encoder(c_lat) # [B, N_lat, N_r, D]
@@ -49,9 +50,9 @@ class ModeSelector(nn.Module):
         # c_lon_j = j / N_lon formülü
         j_vals = torch.arange(self.num_lon, dtype=torch.float32, device=device) # [0, 1, ..., 11]
         c_lon_scalar = j_vals / (self.num_lon - 1) # [0.0, ..., 1.0] - egitim/inference ile tutarli
-        
+
         # Skaler değeri D boyutuna kopyala -> [N_lon, D]
-        lon_feat = c_lon_scalar.unsqueeze(1).repeat(1, self.dim) 
+        lon_feat = c_lon_scalar.unsqueeze(1).repeat(1, self.dim)
         # Batch boyutuna genişlet -> [B, N_lon, D]
         lon_feat = lon_feat.unsqueeze(0).expand(B, -1, -1)
 
@@ -71,31 +72,22 @@ class ModeSelector(nn.Module):
         mode_queries = aligned_modes.view(B, self.num_lat * self.num_lon, self.dim)
 
         # --- E. FUSION VE SKORLAMA ---
-        # Context: encoder'dan gelen sahne (harita+ajan gecmisi) ile decoder'dan gelen
-        # interaction encoding'i birlestirir -> [B, N_scene+6, D]
-        if scene_encoding is not None:
-            env_mask = torch.zeros(B, env_encoding.shape[1], dtype=torch.bool, device=device)
-            context = torch.cat([scene_encoding, env_encoding], dim=1)
-            context_mask = torch.cat([scene_mask, env_mask], dim=1) if scene_mask is not None else None
-        else:
-            context = env_encoding
-            context_mask = None
-        mode_features = self.query_encoder(mode_queries, context, context, mask=context_mask) # [B, 60, D]
+        # Context sadece s0 encoder output'u (CarPlanner-style minimal)
+        mode_features = self.query_encoder(mode_queries, scene_encoding, scene_encoding, mask=scene_mask) # [B, 60, D]
         
         # Her mod için olasılık skoru hesapla
         mode_scores = self.score_mlp(mode_features).squeeze(-1) # [B, 60]
 
-        # --- YENİ: SIFIR (PADDED) ROTALARI MASKELEME (LOGIT MASKING) ---
-        # 1. Hangi yanal (lateral) rotaların geçerli olduğunu bul.
-        # c_lat shape: [B, N_lat, N_r, feature_dim]. Eğer rota tamamen 0 ise toplamı < 1e-4 olur.
-        lat_valid_mask = (torch.abs(c_lat).sum(dim=(2, 3)) > 1e-4) # Shape: [B, 5] (Bool)
-        
-        # 2. Bu 5'lik maskeyi 12 hız moduyla genişletip 60'lık maskeye (1D) çevir.
-        mode_valid_mask = lat_valid_mask.unsqueeze(2).expand(-1, -1, self.num_lon) # [B, 5, 12]
-        mode_valid_mask = mode_valid_mask.reshape(B, self.num_lat * self.num_lon) # [B, 60]
-        
-        # 3. Geçersiz (sıfır olan) rotaların skorunu -1e9 (Eksi Sonsuz) yap.
-        mode_scores = mode_scores.masked_fill(~mode_valid_mask, -1e9)
+        # --- LOGIT MASKING SADECE INFERENCE'TA UYGULANIR ---
+        # Training'de mask kapalı: agin "padded c_lat -> dusuk score" implicit kuralini
+        # ogrenmesine izin veriyoruz (smooth structural learning, daha az hesitation).
+        # Inference'ta (eval mode) mask aktif: arac asla padded bir lateral rotaya
+        # gitmesin diye safety net.
+        if not self.training:
+            lat_valid_mask = (torch.abs(c_lat).sum(dim=(2, 3)) > 1e-4)              # [B, 5]
+            mode_valid_mask = lat_valid_mask.unsqueeze(2).expand(-1, -1, self.num_lon)  # [B, 5, 12]
+            mode_valid_mask = mode_valid_mask.reshape(B, self.num_lat * self.num_lon)   # [B, 60]
+            mode_scores = mode_scores.masked_fill(~mode_valid_mask, -1e9)
 
         return mode_scores, mode_features
 
