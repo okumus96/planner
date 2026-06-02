@@ -704,7 +704,18 @@ class Planner(AbstractPlanner):
             return np.column_stack([rx, ry, ryaw, rk, v_max, occupancy]).astype(np.float32)
 
         # 4. SPLINE VE EGO FRAME DÖNÜŞÜMÜ
-        ref_path_4d = self._path_planner.post_process(optimal_path_polyline, ego_state)
+        # Mimic _get_reference_path: swallow any spline/post_process failure (e.g.
+        # singular matrix on too-short polylines) and fall back to safe brake path.
+        try:
+            ref_path_4d = self._path_planner.post_process(optimal_path_polyline, ego_state)
+        except Exception:
+            rx = np.linspace(0.0, 10.0, target_len)
+            ry = np.zeros(target_len)
+            ryaw = np.zeros(target_len)
+            rk = np.zeros(target_len)
+            v_max = np.zeros(target_len)
+            occupancy = np.zeros(target_len)
+            return np.column_stack([rx, ry, ryaw, rk, v_max, occupancy]).astype(np.float32)
         
         # 5. HIZ VE IŞIK ENJEKSİYONU
         max_speed = annotate_speed(ref_path_4d, chosen_speed_mps)
@@ -807,7 +818,13 @@ class Planner(AbstractPlanner):
         plt.close(fig)
         self._debug_plot_count += 1
 
-    def _save_candidates_debug_plot(self, features, candidates, best_idx=None, iteration=0):
+    def _save_candidates_debug_plot(self, features, candidates, best_idx=None, iteration=0,
+                                     top3=None, num_lon=12):
+        """
+        top3: optional list of 3 tuples [(mode_idx, score), ...] sorted by rank (0 = selected).
+              mode_idx in [0, num_lat*num_lon). lat = mode_idx // num_lon, lon = mode_idx % num_lon.
+              Each mode maps to a (c_lat route, target speed) pair.
+        """
         if not self._debug:
             return
         if candidates is None:
@@ -838,60 +855,131 @@ class Planner(AbstractPlanner):
             if neighbors_past[i, -1, 0] != 0:
                 ax.plot(neighbors_past[i, :, 0], neighbors_past[i, :, 1], color='m', linewidth=1.0, alpha=0.6, zorder=3)
 
-        # ADAY ROTALARIN ÇİZİMİ (RENK VE KALINLIK AYARI)
+        # --- Yeni tasarim: yildiz tabanli top-3 ---
+        # Her top-k mod = (route, hiz). 8 sn sonra ego'nun olacagi konum:
+        #   pos_8s = route_polyline @ distance = speed * 8s
+        # Bu konuma renkli yildiz koyariz. Ayni rota + farkli hiz -> ayni cizgi
+        # uzerinde 3 farkli pozisyonda yildiz -> SPEED FARKLARI GORSEL OLUR.
+        rank_colors  = {0: 'tab:orange', 1: 'mediumpurple', 2: 'darkcyan'}
+        rank_sizes   = {0: 320, 1: 200, 2: 130}
+        rank_zs      = {0: 14,  1: 13,  2: 12}
+        rank_titles  = {0: 'TOP-1 (SELECTED)', 1: 'TOP-2', 2: 'TOP-3'}
+        HORIZON_S = 8.0
+        ROUTE_PT_SPACING_M = 0.1  # candidates 0.1m spacing ile sample edilmis
+
+        # --- Aday rotalari ciz: her top-k icin AYRI olarak kendi renginde ciz ---
+        # Ayni lat'a birden fazla rank duserse her biri ayri kez cizilir (z-order'la):
+        # en yuksek rank en ustte, daha kalin. Stars zaten farkli pozisyonda olur.
+        rank_route_lw    = {0: 4.0, 1: 3.0, 2: 2.2}
+        rank_route_z     = {0: 8,   1: 7,   2: 6}
+
+        # Her rota icin son geçerli nokta indeksini hesapla (padded sifir bolgesini sayma)
+        def _last_valid_idx_of(path):
+            """6 ozelliklik path icin tam-sifir noktalari padding sayar."""
+            valid = (np.abs(path).sum(axis=-1) > 1e-4)
+            valid_idx = np.where(valid)[0]
+            return int(valid_idx[-1]) if valid_idx.size > 0 else -1
+
+        # 1) Once gri arka plan adaylari (top-3'e dahil olmayanlar)
+        top3_lats = set()
+        if top3 is not None:
+            top3_lats = {mode_idx // num_lon for (mode_idx, _) in top3}
+
         drawn_count = 0
         for i in range(candidates.shape[0]):
             path = candidates[i]
             if path.ndim != 2 or path.shape[1] < 2:
                 continue
-            xy = path[:, :2]
-            if not np.any(xy):
+            last_v = _last_valid_idx_of(path)
+            if last_v < 1:
                 continue
-
-            # EĞER BU ROTA AĞ TARAFINDAN SEÇİLEN ROTAYSA (Renkli yap)
-            if best_idx is not None and i == best_idx:
-                color = 'tab:orange'  # Parlak Turuncu
-                lw = 4.5              # Daha kalın
-                alpha = 1.0           # Tamamen opak
-                z = 10                # En üstte görünsün
-                linestyle = '-'         # Düz çizgi
-                label_text = f'candidate_{i} (SELECTED)'
-            # EĞER SEÇİLMEDİYSE (Silik gri yap)
-            else:
-                color = 'gray'        # Silik Gri
-                lw = 2.0              # Daha ince
-                alpha = 1           # Yarı şeffaf
-                z = 5                 # Altta kalsın
-                linestyle = '--'         # Düz çizgi
-                label_text = f'candidate_{i}'
-
-            ax.plot(xy[:, 0], xy[:, 1], linewidth=lw, color=color, label=label_text, alpha=alpha, linestyle=linestyle, zorder=z)
-            ax.scatter(xy[-1, 0], xy[-1, 1], color=color, s=30, alpha=alpha, zorder=z)
+            xy = path[:last_v + 1, :2]
+            if i not in top3_lats:
+                ax.plot(xy[:, 0], xy[:, 1], color='gray', linewidth=1.4,
+                        alpha=0.5, linestyle='--', zorder=5)
             drawn_count += 1
 
-        if drawn_count == 0:
-            ax.text(0.5, 0.5, 'No valid candidates', transform=ax.transAxes, ha='center', va='center', fontsize=12)
+        # 2) Sonra her top-k rotasini AYRI olarak ciz (top-3'ten top-1'e dogru, top-1 en ustte)
+        if top3 is not None:
+            for rank in [2, 1, 0]:
+                mode_idx, _ = top3[rank]
+                lat = mode_idx // num_lon
+                if lat < 0 or lat >= candidates.shape[0]:
+                    continue
+                path = candidates[lat]
+                last_v = _last_valid_idx_of(path)
+                if last_v < 1:
+                    continue
+                xy = path[:last_v + 1, :2]
+                ax.plot(xy[:, 0], xy[:, 1], color=rank_colors[rank],
+                        linewidth=rank_route_lw[rank], alpha=0.95,
+                        zorder=rank_route_z[rank])
 
-        ax.scatter([0.0], [0.0], marker='x', s=60, color='black', label='ego_origin', zorder=12)
-        ax.set_title(f'Candidate Reference Paths Iter {iteration}')
+        if drawn_count == 0:
+            ax.text(0.5, 0.5, 'No valid candidates', transform=ax.transAxes,
+                    ha='center', va='center', fontsize=12)
+
+        # --- Her top-k icin yildiz ekle (target_idx'i son geçerli noktaya clamp et) ---
+        if top3 is not None:
+            for rank, (mode_idx, score) in enumerate(top3):
+                lat = mode_idx // num_lon
+                if lat < 0 or lat >= candidates.shape[0]:
+                    continue
+                lon = mode_idx % num_lon
+                speed_mps = lon / 11.0 * 15.0
+                target_dist_m = speed_mps * HORIZON_S
+                target_idx = int(target_dist_m / ROUTE_PT_SPACING_M)
+
+                path = candidates[lat]
+                last_v = _last_valid_idx_of(path)
+                if last_v < 1:
+                    continue
+                # target_idx pad bolgesine duserse son geçerli noktaya kaydir
+                target_idx = min(target_idx, last_v)
+                px, py = float(path[target_idx, 0]), float(path[target_idx, 1])
+
+                ax.scatter(px, py, color=rank_colors[rank], s=rank_sizes[rank],
+                           marker='*', edgecolors='black', linewidths=1.5,
+                           zorder=rank_zs[rank])
+
+        ax.scatter([0.0], [0.0], marker='x', s=60, color='black', zorder=15)
+
+        # --- Title sade ---
+        if top3 is not None:
+            mode_idx_0, score_0 = top3[0]
+            speed_0 = (mode_idx_0 % num_lon) / 11.0 * 15.0
+            ax.set_title(
+                f'Mode Selector top-3 — Iter {iteration}   '
+                f'(SELECTED v={speed_0:.1f} m/s, score={score_0:.2f})',
+                fontsize=10,
+            )
+        else:
+            ax.set_title(f'Candidate Reference Paths — Iter {iteration}', fontsize=10)
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
 
-        # Legend Dinamik Oluşturma
+        # --- Legend ---
         legend_handles = [
             Line2D([0], [0], color='c', lw=3, label='lanes'),
             Line2D([0], [0], color='b', lw=4, label='crosswalks'),
             Line2D([0], [0], color='g', lw=4, label='route_lanes'),
             Line2D([0], [0], color='#00a8e8', lw=2, label='ego_past'),
             Line2D([0], [0], color='m', lw=2, label='neighbors_past'),
+            Line2D([0], [0], color='gray', lw=1.4, linestyle='--', label='other candidate routes'),
         ]
-        
-        # Sadece seçilen rotayı legend'da vurgula (Kalabalığı azaltır)
-        if best_idx is not None:
-            legend_handles.append(Line2D([0], [0], color='tab:orange', lw=4.5, label='SELECTED CANDIDATE'))
-            legend_handles.append(Line2D([0], [0], color='gray', lw=2.0, alpha=1, label='OTHER CANDIDATES'))
+        if top3 is not None:
+            for rank in range(3):
+                mode_idx, score = top3[rank]
+                lat_r = mode_idx // num_lon
+                v = (mode_idx % num_lon) / 11.0 * 15.0
+                legend_handles.append(
+                    Line2D([0], [0], marker='*', color=rank_colors[rank],
+                           markerfacecolor=rank_colors[rank], markeredgecolor='black',
+                           markersize=14 - rank * 2, lw=rank_route_lw[rank],
+                           label=f'{rank_titles[rank]}: lat={lat_r} @ v={v:.1f} m/s (score={score:.2f})')
+                )
 
-        ax.legend(handles=legend_handles, loc='best')
+        ax.legend(handles=legend_handles, loc='best', fontsize=8)
 
         file_name = os.path.join(out_dir, f'debug_candidates_iter_{iteration:04d}.png')
         fig.savefig(file_name, dpi=120, bbox_inches='tight')
@@ -923,15 +1011,34 @@ class Planner(AbstractPlanner):
 
         # ModeSelector skoru en yuksek olani sec
         # Stabilite icin sadece her N iterasyonda bir yeniden secim yap, arada cache kullan
-        SELECT_EVERY = 80
+        # DEBUG MODE: her frame yeniden secimi calistir ki viz guncel kalsin
+        SELECT_EVERY = 1
         num_lon = 12
         best_c_lat_np = None
-        run_selector = (iteration is None) or (iteration % SELECT_EVERY == 0) or (not hasattr(self, '_prev_lat_idx'))
+        run_selector = (
+            (iteration is None)
+            or (iteration % SELECT_EVERY == 0)
+            or (not hasattr(self, '_prev_lat_idx'))
+            or self._debug  # debug'da her frame fresh top-3
+        )
 
         if c_lat_candidates is not None:
             if run_selector:
                 with torch.no_grad():
                     encoder_outputs = self.backbone.encoder(features)
+
+                    # Decoder'i de calistir, komsular icin argmax-mod top1 yorungelerini cek
+                    N_NBR = 10
+                    decoder_outputs, _ = self.backbone.decoder(encoder_outputs)
+                    last_k = max(int(k.split('_')[1]) for k in decoder_outputs if 'interactions' in k)
+                    inter = decoder_outputs[f'level_{last_k}_interactions'][:, 1:1 + N_NBR]   # [B, N, M, T, 4]
+                    sc = decoder_outputs[f'level_{last_k}_scores'][:, 1:1 + N_NBR]            # [B, N, M]
+                    bm = sc.argmax(-1)
+                    B_, N_, M_, T_, _ = inter.shape
+                    g = bm.view(B_, N_, 1, 1, 1).expand(-1, -1, 1, T_, 2)
+                    top1_fut = torch.gather(inter[..., :2], 2, g).squeeze(2)                  # [B, N, T, 2]
+                    nbr_states = encoder_outputs['actors'][:, 1:1 + N_NBR, -1]                # [B, N, 5]
+                    nbr_valid = ~encoder_outputs['mask'][:, 1:1 + N_NBR]                      # [B, N]
 
                     # c_lat_candidates: (N_lat, N_r, 6) -> [B, N_lat, N_r, feat]
                     c_lat_tensor = torch.tensor(c_lat_candidates, dtype=torch.float32, device=self._device).unsqueeze(0)
@@ -939,8 +1046,17 @@ class Planner(AbstractPlanner):
                         encoder_outputs['encoding'],
                         c_lat_tensor,
                         scene_mask=encoder_outputs['mask'],
+                        neighbor_top1_futures=top1_fut,
+                        neighbor_current_states=nbr_states,
+                        neighbor_valid=nbr_valid,
                     )
-                    best_idx = int(torch.argmax(mode_scores, dim=1).cpu().item())
+                    # Top-3 modlari yakala (viz icin) — rank 0 = secilen
+                    top3_scores, top3_idx = mode_scores.topk(3, dim=1)
+                    top3_idx_list = top3_idx[0].cpu().tolist()       # [3]
+                    top3_scores_list = top3_scores[0].cpu().tolist() # [3]
+                    self._prev_top3 = list(zip(top3_idx_list, top3_scores_list))
+
+                    best_idx = top3_idx_list[0]
                     lat_idx = best_idx // num_lon
                     lon_idx = best_idx % num_lon
                     self._prev_lat_idx = lat_idx
@@ -971,7 +1087,7 @@ class Planner(AbstractPlanner):
         # neural_plan'in TrajectoryPlanner icindeki rolu: ref_path uzerinde baslangic speed
         # profili belirlemek. Burada o profili dogrudan constant-speed sampling ile uretiyoruz.
         # ref_path2 spacing = 0.1m, fake_plan_idx[t] = t * best_speed_mps (cunku v*t*0.1m / 0.1m).
-        USE_FAKE_NEURAL_PLAN = True
+        USE_FAKE_NEURAL_PLAN = False
         if USE_FAKE_NEURAL_PLAN and ref_path2 is not None:
             N_FAKE = 80   # 8s @ 10Hz
             DT_FAKE = 0.1
@@ -992,9 +1108,11 @@ class Planner(AbstractPlanner):
         if self._debug:
             self._save_candidates_debug_plot(
                 features,
-                c_lat_candidates,  
+                c_lat_candidates,
                 best_idx=lat_idx, # <--- SEÇİLEN ROTAYI FONKSİYONA GÖNDERİYORUZ
                 iteration=0 if iteration is None else iteration,
+                top3=getattr(self, '_prev_top3', None),  # [(mode_idx, score), x3]
+                num_lon=num_lon,
             )
             self._save_debug_plot(
                 features=features, # HARİTA VERİSİ EKLENDİ

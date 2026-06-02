@@ -6,7 +6,7 @@ from .predictor_modules import *
 
 import torch
 import torch.nn as nn
-from .predictor_modules import CrossTransformer # Kendi import yolunuza göre ayarlayın
+from .predictor_modules import CrossTransformer, FutureEncoder
 
 class ModeSelector(nn.Module):
     def __init__(self, dim=256, num_lat=5, num_lon=12, feature_dim=6):
@@ -14,7 +14,7 @@ class ModeSelector(nn.Module):
         self.dim = dim
         self.num_lat = num_lat
         self.num_lon = num_lon
-        
+
         # 1. Enlemsel Rota Kodlayıcı (PointNet) -> [N_r x D_m] to [D]
         # feature_dim = 6 (x, y, yaw, curvature, v_max, occupancy)
         self.lat_encoder = nn.Sequential(
@@ -22,21 +22,35 @@ class ModeSelector(nn.Module):
             nn.Linear(64, 128), nn.ReLU(),
             nn.Linear(128, dim)
         )
-        
+
         # 2. Boylamsal Mod için Embedding ARTIK YOK. (Makaleye göre deterministik hesaplanacak)
-        
+
         # 3. 2D'den D'ye Düşüren Linear Katman (Alignment Layer)
         self.mode_proj = nn.Sequential(
             nn.Linear(2 * dim, dim),
             nn.ReLU()
         )
-        
-        # 4. Çapraz Dikkat Mekanizması ve Skorlama
+
+        # 4. Komşu top-1 future encoder (decoder argmax trajectorylerini D-dim'a çevirir).
+        # GF predictor_modules'taki FutureEncoder ile aynı mimari; agirliklari burada
+        # ayri (mode_selector ile birlikte ogreniliyor).
+        self.neighbor_future_encoder = FutureEncoder()
+
+        # 5. Çapraz Dikkat Mekanizması ve Skorlama
         self.query_encoder = CrossTransformer(dim=dim)
         self.score_mlp = nn.Sequential(nn.Linear(dim, 64), nn.ELU(), nn.Linear(64, 1))
 
-    def forward(self, scene_encoding, c_lat, scene_mask=None):
-        # CarPlanner Sec. 3.3.2: selector sadece s0 (encoder output) ile çalışır.
+    def forward(self, scene_encoding, c_lat, scene_mask=None,
+                neighbor_top1_futures=None, neighbor_current_states=None,
+                neighbor_valid=None):
+        """
+        scene_encoding: [B, S, D]    GF encoder full fused scene
+        c_lat:          [B, N_lat, N_r, feature_dim]
+        scene_mask:     [B, S]       key_padding_mask from encoder
+        neighbor_top1_futures: [B, N_nbr, T, 2]  argmax-mod predicted xy per neighbor
+        neighbor_current_states: [B, N_nbr, >=5] (x, y, heading, vx, vy)
+        neighbor_valid: [B, N_nbr]   bool, True = valid neighbor (else token masked)
+        """
         B = scene_encoding.shape[0]
         device = scene_encoding.device
 
@@ -71,9 +85,37 @@ class ModeSelector(nn.Module):
         # Transformer Query'si için düzleştir (Flatten) -> [B, 60, D]
         mode_queries = aligned_modes.view(B, self.num_lat * self.num_lon, self.dim)
 
-        # --- E. FUSION VE SKORLAMA ---
-        # Context sadece s0 encoder output'u (CarPlanner-style minimal)
-        mode_features = self.query_encoder(mode_queries, scene_encoding, scene_encoding, mask=scene_mask) # [B, 60, D]
+        # --- E. CONTEXT INSASI ---
+        # Default: sadece scene_encoding (CarPlanner-style).
+        # Eger komsu top-1 future'lar verilirse, FutureEncoder ile [B, N_nbr, D]'ye
+        # encode edip scene_encoding'in SONUNA append ederiz; key_padding_mask de uzar.
+        if neighbor_top1_futures is not None:
+            # FutureEncoder [B, N, M, T, 2] bekliyor -> M=1 ekle, sonra sik
+            fut_in = neighbor_top1_futures.unsqueeze(2)                               # [B, N_nbr, 1, T, 2]
+            future_emb = self.neighbor_future_encoder(fut_in, neighbor_current_states).squeeze(2)  # [B, N_nbr, D]
+
+            N_nbr = future_emb.shape[1]
+            context = torch.cat([scene_encoding, future_emb], dim=1)                  # [B, S+N_nbr, D]
+
+            # Mask uzat: gecersiz komsulara karsilik gelen future tokenlari maskelenir
+            if neighbor_valid is None:
+                neighbor_valid = torch.ones(B, N_nbr, dtype=torch.bool, device=device)
+            future_mask = ~neighbor_valid                                             # [B, N_nbr]
+
+            if scene_mask is None:
+                S = scene_encoding.shape[1]
+                full_mask = torch.cat(
+                    [torch.zeros(B, S, dtype=torch.bool, device=device), future_mask],
+                    dim=1,
+                )
+            else:
+                full_mask = torch.cat([scene_mask, future_mask], dim=1)               # [B, S+N_nbr]
+        else:
+            context = scene_encoding
+            full_mask = scene_mask
+
+        # --- F. FUSION VE SKORLAMA ---
+        mode_features = self.query_encoder(mode_queries, context, context, mask=full_mask)  # [B, 60, D]
         
         # Her mod için olasılık skoru hesapla
         mode_scores = self.score_mlp(mode_features).squeeze(-1) # [B, 60]

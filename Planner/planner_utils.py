@@ -28,7 +28,7 @@ class TrajectoryPlanner:
         plan = plan[0].cpu().numpy()
         #plan = torch.zeros_like(plan)
         #plan = plan[0].cpu().numpy()
-        predictions = torch.zeros_like(predictions)
+        #predictions = torch.zeros_like(predictions)
         #neighbors_state_transformed = torch.zeros_like(neighbors_state_transformed)
 
         # Get the plan in the reference path

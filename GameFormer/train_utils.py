@@ -124,27 +124,45 @@ def motion_metrics(plan_trajectory, prediction_trajectories, ego_future, neighbo
 
 def get_expert_mode_index(ego_future, c_lat_candidates, num_lat=5, num_lon=12, max_speed=15.0):
     """
-    CarPlanner (Section 3.4): Eğitim (Loss) için Uzmanın seçtiği C_lat ve C_lon'u bularak 
-    60 mod içerisindeki doğru cevabın (0-59) indeksini döndürür.
-    ego_future: [B, 80, 2] (Uzmanın gerçek 8 saniyelik yörüngesi)
-    c_lat_candidates: [B, 5, 50, 3] (BFS rotaları)
+    CarPlanner (Section 3.4) — Mode Assignment.
+
+    Lateral GT:
+        "Ego'nun 8s sonraki konumu hangi rotanin UZERINDE?"
+        Her rota icin: min_t  ||route_point_t - gt_endpoint||
+        En kucuk min-mesafeli rota = pozitif lateral mod.
+
+        NOT: Eski versiyon route ENDPOINT'i (sabit ~120m'deki son nokta) ile
+        gt endpoint'ini karsilastiriyordu — ego hizina bagli olarak boylamsal
+        fark yanal farki bastiriyordu. Yeni versiyon hizdan bagimsiz: ego'nun
+        8s sonraki konumu hangi rotanin uzerindeyse o rota dogru cevap.
+
+    Longitudinal GT: ortalama hiza en yakin bucket (degismedi).
+
+    ego_future:        [B, 80, 2]
+    c_lat_candidates:  [B, 5, T, 6]
     """
-    NUM_LON =12
+    NUM_LON = 12
     B = ego_future.shape[0]
     device = ego_future.device
-    
-    # 1. C_LAT DOĞRU CEVABINI BUL (En son noktaya en yakın rota)
-    gt_endpoint = ego_future[:, -1, :2] # Uzmanın 8 saniye sonraki son noktası [B, 2]
-    route_endpoints = c_lat_candidates[:, :, -1, :2] # BFS rotalarının son noktaları [B, 5, 2]
 
-    # Mesafe hesabı (L2 Norm)
-    dists = torch.norm(route_endpoints - gt_endpoint.unsqueeze(1), dim=-1) # [B, 5]
+    # 1. C_LAT DOGRU CEVAP (min distance from gt endpoint to ANY point on each route)
+    gt_endpoint = ego_future[:, -1, :2]                                  # [B, 2]
+    gt_exp = gt_endpoint.unsqueeze(1).unsqueeze(1)                       # [B, 1, 1, 2]
+    diffs = c_lat_candidates[..., :2] - gt_exp                           # [B, 5, T, 2]
+    dists_all = torch.norm(diffs, dim=-1)                                # [B, 5, T]
 
-    # Sifir-padded kandidatleri mesafe hesabindan cikar (origin'e yakin gorunup yanlis secilmesin)
-    lat_valid = (torch.abs(c_lat_candidates).sum(dim=(2, 3)) > 1e-4)  # [B, 5]
-    dists = dists.masked_fill(~lat_valid, float('inf'))
+    # Padded nokta maskelemesi: tum 6 ozellik tam sifir olan noktalar dolgu sayilir
+    # (gercek nokta ego frame'de (0,0)'a yakin olsa bile curvature/v_max gibi alanlari non-zero)
+    point_valid = (torch.abs(c_lat_candidates).sum(dim=-1) > 1e-4)       # [B, 5, T]
+    dists_all = dists_all.masked_fill(~point_valid, float('inf'))
 
-    best_lat = torch.argmin(dists, dim=-1) # [B] (Hangi rota en yakınsa onun indeksi)
+    min_dist = dists_all.min(dim=-1).values                              # [B, 5]
+
+    # Tamamen padded rotalari ele
+    lat_valid = (torch.abs(c_lat_candidates).sum(dim=(2, 3)) > 1e-4)     # [B, 5]
+    min_dist = min_dist.masked_fill(~lat_valid, float('inf'))
+
+    best_lat = torch.argmin(min_dist, dim=-1)                            # [B]
     
     # 2. C_LON DOĞRU CEVABINI BUL (Ortalama hıza en yakın dilim)
     # 8 saniyede alınan toplam mesafe / 8.0 = Ortalama Hız
