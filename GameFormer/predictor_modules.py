@@ -115,8 +115,13 @@ class CrossTransformer(nn.Module):
         self.norm_2 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(nn.Linear(dim, dim*4), nn.GELU(), nn.Dropout(dropout), nn.Linear(dim*4, dim), nn.Dropout(dropout))
 
-    def forward(self, query, key, value, mask=None):
-        attention_output, _ = self.cross_attention(query, key, value, key_padding_mask=mask)
+    def forward(self, query, key, value, mask=None, attn_bias=None):
+        # attn_bias: opsiyonel additive float mask, sekil [B*heads, L_q, S_key].
+        # nn.MultiheadAttention bunu attention logitlerine ekler (QK^T/sqrt(d) + bias).
+        # SceneRelevanceGraph'tan gelen onem (importance) skorunu key basina bias olarak
+        # enjekte etmek icin kullanilir. None ise davranis eskisiyle aynidir.
+        attention_output, _ = self.cross_attention(query, key, value,
+                                                   key_padding_mask=mask, attn_mask=attn_bias)
         attention_output = self.norm_1(attention_output)
         output = self.norm_2(self.ffn(attention_output) + attention_output)
 

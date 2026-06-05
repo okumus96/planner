@@ -23,8 +23,6 @@ class ModeSelector(nn.Module):
             nn.Linear(128, dim)
         )
 
-        # 2. Boylamsal Mod için Embedding ARTIK YOK. (Makaleye göre deterministik hesaplanacak)
-
         # 3. 2D'den D'ye Düşüren Linear Katman (Alignment Layer)
         self.mode_proj = nn.Sequential(
             nn.Linear(2 * dim, dim),
@@ -42,7 +40,9 @@ class ModeSelector(nn.Module):
 
     def forward(self, scene_encoding, c_lat, scene_mask=None,
                 neighbor_top1_futures=None, neighbor_current_states=None,
-                neighbor_valid=None):
+                neighbor_valid=None,
+                graph_context=None, graph_valid=None, importance=None,
+                importance_beta=2.0, hard_topk=None):
         """
         scene_encoding: [B, S, D]    GF encoder full fused scene
         c_lat:          [B, N_lat, N_r, feature_dim]
@@ -50,6 +50,16 @@ class ModeSelector(nn.Module):
         neighbor_top1_futures: [B, N_nbr, T, 2]  argmax-mod predicted xy per neighbor
         neighbor_current_states: [B, N_nbr, >=5] (x, y, heading, vx, vy)
         neighbor_valid: [B, N_nbr]   bool, True = valid neighbor (else token masked)
+
+        SceneRelevanceGraph entegrasyonu (opsiyonel, geriye donuk uyumlu):
+        graph_context:  [B, V, D]    grafik-rafine dugum gommeleri. Verilirse context
+                                     scene_encoding YERINE bunlar olur (plana gore).
+        graph_valid:    [B, V] bool  gecerli dugum maskesi (True=gecerli).
+        importance:     [B, V]       ego-merkezli onem dagilimi (toplam 1). Cross-attention'a
+                                     beta*log(importance) additive bias olarak enjekte edilir.
+        importance_beta: float       bias siddeti.
+        hard_topk:      int | None   eval modunda en onemli k dugum disindakileri maskele
+                                     (hard secim). Egitimde her zaman soft kalir.
         """
         B = scene_encoding.shape[0]
         device = scene_encoding.device
@@ -85,37 +95,87 @@ class ModeSelector(nn.Module):
         # Transformer Query'si için düzleştir (Flatten) -> [B, 60, D]
         mode_queries = aligned_modes.view(B, self.num_lat * self.num_lon, self.dim)
 
-        # --- E. CONTEXT INSASI ---
-        # Default: sadece scene_encoding (CarPlanner-style).
-        # Eger komsu top-1 future'lar verilirse, FutureEncoder ile [B, N_nbr, D]'ye
-        # encode edip scene_encoding'in SONUNA append ederiz; key_padding_mask de uzar.
+        # --- E. BASE CONTEXT SECIMI ---
+        # graph_context verilirse (SceneRelevanceGraph) context scene_encoding YERINE
+        # grafik-rafine dugumler olur ve onem (importance) bias'i hazirlanir. Verilmezse
+        # eski davranis (scene_encoding, bias yok) korunur -> geriye donuk uyumlu.
+        if graph_context is not None:
+            base_context = graph_context                                              # [B, V, D]
+            if graph_valid is not None:
+                base_mask = ~graph_valid                                              # [B, V] True=pad
+            elif scene_mask is not None:
+                base_mask = scene_mask
+            else:
+                base_mask = torch.zeros(B, base_context.shape[1], dtype=torch.bool, device=device)
+
+            if importance is not None:
+                base_bias = importance_beta * torch.log(importance.clamp_min(1e-6))   # [B, V]
+                # Hard top-k (sadece eval): en onemli k dugum disindakileri maskele.
+                if (hard_topk is not None) and (not self.training):
+                    V = importance.shape[1]
+                    k = min(hard_topk, V)
+                    keep_idx = importance.topk(k, dim=1).indices                      # [B, k]
+                    keep = torch.zeros(B, V, dtype=torch.bool, device=device)
+                    keep.scatter_(1, keep_idx, True)
+                    base_mask = base_mask | (~keep)
+            else:
+                base_bias = torch.zeros(B, base_context.shape[1], device=device)
+        else:
+            base_context = scene_encoding
+            base_mask = scene_mask if scene_mask is not None else \
+                torch.zeros(B, scene_encoding.shape[1], dtype=torch.bool, device=device)
+            base_bias = torch.zeros(B, base_context.shape[1], device=device)
+
+        # --- E.2 KOMSU FUTURE TOKENLARI (opsiyonel, eskisi gibi append) ---
+        # Komsularin tahmin edilen gelecek trajektorilerini FutureEncoder ile [B, N_nbr, D]'ye
+        # encode edip context'in SONUNA ekleriz; mask de uzar.
+        #
+        # ONEMLI: future tokenlarina, KARSILIK GELEN komsu ajanin importance'ini bias olarak
+        # veririz. SceneRelevanceGraph layout'u node 0=ego, 1..N_nbr=komsular oldugundan
+        # future token j  <->  graph node (1+j). Boylece "onemli" dedigimiz ajanin GELECEGI de
+        # attention'da yukselir (ayni ajan hem anlik-durum node'u hem future token'i olarak
+        # ayni onem bias'ini alir).
         if neighbor_top1_futures is not None:
-            # FutureEncoder [B, N, M, T, 2] bekliyor -> M=1 ekle, sonra sik
             fut_in = neighbor_top1_futures.unsqueeze(2)                               # [B, N_nbr, 1, T, 2]
             future_emb = self.neighbor_future_encoder(fut_in, neighbor_current_states).squeeze(2)  # [B, N_nbr, D]
-
             N_nbr = future_emb.shape[1]
-            context = torch.cat([scene_encoding, future_emb], dim=1)                  # [B, S+N_nbr, D]
 
-            # Mask uzat: gecersiz komsulara karsilik gelen future tokenlari maskelenir
             if neighbor_valid is None:
                 neighbor_valid = torch.ones(B, N_nbr, dtype=torch.bool, device=device)
             future_mask = ~neighbor_valid                                             # [B, N_nbr]
 
-            if scene_mask is None:
-                S = scene_encoding.shape[1]
-                full_mask = torch.cat(
-                    [torch.zeros(B, S, dtype=torch.bool, device=device), future_mask],
-                    dim=1,
-                )
+            if (importance is not None) and (graph_context is not None) and importance.shape[1] >= 1 + N_nbr:
+                nbr_imp = importance[:, 1:1 + N_nbr]                                   # [B, N_nbr]
+                future_bias = importance_beta * torch.log(nbr_imp.clamp_min(1e-6))     # [B, N_nbr]
             else:
-                full_mask = torch.cat([scene_mask, future_mask], dim=1)               # [B, S+N_nbr]
+                future_bias = torch.zeros(B, N_nbr, device=device)
+
+            context = torch.cat([base_context, future_emb], dim=1)
+            full_mask = torch.cat([base_mask, future_mask], dim=1)
+            full_bias = torch.cat([base_bias, future_bias], dim=1)
         else:
-            context = scene_encoding
-            full_mask = scene_mask
+            context = base_context
+            full_mask = base_mask
+            full_bias = base_bias
 
         # --- F. FUSION VE SKORLAMA ---
-        mode_features = self.query_encoder(mode_queries, context, context, mask=full_mask)  # [B, 60, D]
+        # full_bias [B, S] -> additive attn_mask [B*heads, 60, S] (tum mod query'lerine broadcast).
+        # Sadece grafik+importance verildiyse bias uygulanir; aksi halde None (eski davranis).
+        # Tip uyusmazligi uyarisini onlemek icin padding'i de float bias'a katar (key basina
+        # -inf) ve key_padding_mask'i None birakiriz -> tek tip (float) maske.
+        attn_bias = None
+        key_padding = full_mask
+        if (importance is not None) and (graph_context is not None):
+            neg_inf = torch.finfo(full_bias.dtype).min
+            full_bias = full_bias.masked_fill(full_mask, neg_inf)        # padded keys -> -inf
+            L = mode_queries.shape[1]
+            S_tot = context.shape[1]
+            n_heads = self.query_encoder.cross_attention.num_heads
+            attn_bias = full_bias[:, None, :].expand(B, L, S_tot)
+            attn_bias = attn_bias.unsqueeze(1).expand(B, n_heads, L, S_tot).reshape(B * n_heads, L, S_tot).contiguous()
+            key_padding = None
+
+        mode_features = self.query_encoder(mode_queries, context, context, mask=key_padding, attn_bias=attn_bias)  # [B, 60, D]
         
         # Her mod için olasılık skoru hesapla
         mode_scores = self.score_mlp(mode_features).squeeze(-1) # [B, 60]

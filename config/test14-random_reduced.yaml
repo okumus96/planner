@@ -2,7 +2,7 @@ _target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
 _convert_: "all"
 
 scenario_types: # List of scenario types to include
-  - changing_lane
+  - starting_left_turn
 
 scenario_tokens: null # List of scenario tokens to include
 

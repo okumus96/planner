@@ -10,6 +10,9 @@ from GameFormer.predictor import GameFormer
 from GameFormer.data_utils import create_map_raster, create_ego_raster, create_agents_raster
 from .state_lattice_path_planner import LatticePlanner
 from GameFormer.ar_wrapper import *
+from GameFormer.relevance_graph import (SceneRelevanceGraph, plot_scene_graph, annotate_map_node_ids,
+                                        plot_bev_relevance, build_relevance_record, draw_relevance)
+import pickle
 from Planner.cubic_spline import calc_spline_course
 
 
@@ -32,6 +35,13 @@ class Planner(AbstractPlanner):
         self._debug_max_plots = debug_max_plots
         self._debug_plot_count = 0
         self._debug_candidates_plot_count = 0
+        # SceneRelevanceGraph hard top-k secimi (None = soft bias). Inference'ta None disinda
+        # bir k verilirse en onemli k dugum disindakiler maskelenir.
+        self._graph_hard_topk = None
+        self._prev_importance = None  # son adimin grafik onem ciktisi (viz icin)
+        # Debug onem gorsellestirme: NORMALIZE onem (imp/max) bu esigin ustundekiler vurgulanir.
+        self._relevance_threshold = 0.65
+        self._relevance_records = []  # senaryo boyunca per-adim onem verisi (--debug ile kaydedilir)
 
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -68,6 +78,7 @@ class Planner(AbstractPlanner):
         # Her yeni senaryoda sayaçları sıfırla ki "--debug_max_plots 200" limiti HER senaryo için baştan başlasın
         self._debug_plot_count = 0
         self._debug_candidates_plot_count = 0
+        self._relevance_records = []  # yeni senaryo -> onem kaydini sifirla
 
     def _initialize_model(self):
         # 1. OMURGA (BACKBONE): Orijinal eğitilmiş GameFormer'ı yükle ve dondur
@@ -85,7 +96,21 @@ class Planner(AbstractPlanner):
         self.planner_head.load_state_dict(torch.load(self._model_path, map_location=self._device))
         self.planner_head.to(self._device)
         self.planner_head.eval()
-        
+
+        # 3. SAHNE ONEM GRAFIGI (opsiyonel): mode_selector ile birlikte egitildiyse, ayni
+        # klasordeki 'relevance_graph_*.pth' checkpoint'i otomatik yuklenir. Bulunamazsa
+        # mode_selector grafiksiz calisir (eski davranis).
+        self.relevance_graph = None
+        graph_path = self._model_path.replace("mode_selector", "relevance_graph")
+        if graph_path != self._model_path and os.path.exists(graph_path):
+            self.relevance_graph = SceneRelevanceGraph()
+            self.relevance_graph.load_state_dict(torch.load(graph_path, map_location=self._device))
+            self.relevance_graph.to(self._device)
+            self.relevance_graph.eval()
+            print(f"[Planner] SceneRelevanceGraph yuklendi: {graph_path}")
+        else:
+            print("[Planner] SceneRelevanceGraph checkpoint bulunamadi; mode_selector grafiksiz calisacak.")
+
     def _initialize_route_plan(self, route_roadblock_ids):
         self._route_roadblocks = []
 
@@ -718,7 +743,11 @@ class Planner(AbstractPlanner):
             return np.column_stack([rx, ry, ryaw, rk, v_max, occupancy]).astype(np.float32)
         
         # 5. HIZ VE IŞIK ENJEKSİYONU
-        max_speed = annotate_speed(ref_path_4d, chosen_speed_mps)
+        # Egrilik-tabanli (fizik) hiz profili: donus-sonrasi duz kesimde hiz geri toplanir
+        # -> ego_progress_along_expert_route ve ego_is_making_progress metriklerini iyilestirir.
+        # (Eski kor '3 m/s sabitle' davranisi annotate_speed'de duruyor; model-feature yollari
+        #  satir 172/240 hala onu kullaniyor, sadece SURULEN trajektori burada degisti.)
+        max_speed = annotate_speed_curvature(ref_path_4d, chosen_speed_mps)
         occupancy = np.zeros(shape=(ref_path_4d.shape[0], 1))
         
         for data in traffic_light_data:
@@ -818,6 +847,25 @@ class Planner(AbstractPlanner):
         plt.close(fig)
         self._debug_plot_count += 1
 
+    def _record_relevance(self, features, iteration=0, lat_idx=None, lon_idx=None):
+        """--debug: o adimin GAT onem verisini kompakt numpy record olarak biriktir ve
+        senaryo klasorune relevance_data.pkl olarak yaz. render_relevance_video.py bundan
+        senaryo videosu uretir. (Goruntu degil VERI kaydedilir.)"""
+        graph_out = getattr(self, '_prev_importance', None)
+        if (graph_out is None) or ('importance' not in graph_out):
+            return
+        rec = build_relevance_record(
+            features, graph_out,
+            extra={'iteration': int(iteration),
+                   'lat_idx': None if lat_idx is None else int(lat_idx),
+                   'lon_idx': None if lon_idx is None else int(lon_idx)},
+        )
+        self._relevance_records.append(rec)
+        out_dir = getattr(self, '_current_scenario_dir', self._debug_dir or "testing_log/debug_plots")
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, 'relevance_data.pkl'), 'wb') as f:
+            pickle.dump({'threshold': self._relevance_threshold, 'records': self._relevance_records}, f)
+
     def _save_candidates_debug_plot(self, features, candidates, best_idx=None, iteration=0,
                                      top3=None, num_lon=12):
         """
@@ -836,6 +884,9 @@ class Planner(AbstractPlanner):
         out_dir = os.path.join(out_dir, "candidates")
         os.makedirs(out_dir, exist_ok=True)
 
+        # Tek panel BEV; GAT onemi (esigi gecenler) dogrudan bu haritanin uzerine bindirilir
+        graph_out = getattr(self, '_prev_importance', None)
+        has_graph = (graph_out is not None) and ('importance' in graph_out)
         fig = plt.figure(figsize=(9, 9))
         ax = fig.add_subplot(111)
 
@@ -981,6 +1032,12 @@ class Planner(AbstractPlanner):
 
         ax.legend(handles=legend_handles, loc='best', fontsize=8)
 
+        # --- ONEM OVERLAY: normalize onemi esigi gecen eleman/ajanlar bu BEV uzerinde vurgulanir ---
+        if has_graph:
+            rec = build_relevance_record(features, graph_out)
+            n_pass = draw_relevance(ax, rec, threshold=self._relevance_threshold, draw_base=False)
+            ax.set_title(ax.get_title() + f'  | onem>={self._relevance_threshold:.2f}: {n_pass} eleman (kirmizi)')
+
         file_name = os.path.join(out_dir, f'debug_candidates_iter_{iteration:04d}.png')
         fig.savefig(file_name, dpi=120, bbox_inches='tight')
         plt.close(fig)
@@ -1040,6 +1097,19 @@ class Planner(AbstractPlanner):
                     nbr_states = encoder_outputs['actors'][:, 1:1 + N_NBR, -1]                # [B, N, 5]
                     nbr_valid = ~encoder_outputs['mask'][:, 1:1 + N_NBR]                      # [B, N]
 
+                    # SceneRelevanceGraph (varsa): rafine dugumler + onem dagilimini hesapla
+                    graph_kwargs = {}
+                    if self.relevance_graph is not None:
+                        graph_out = self.relevance_graph(encoder_outputs, features, num_agents=N_NBR + 1,
+                                                         return_attention=True)
+                        graph_kwargs = dict(
+                            graph_context=graph_out['context'],
+                            graph_valid=graph_out['valid'],
+                            importance=graph_out['importance'],
+                            hard_topk=self._graph_hard_topk,
+                        )
+                        self._prev_importance = graph_out  # viz icin sakla
+
                     # c_lat_candidates: (N_lat, N_r, 6) -> [B, N_lat, N_r, feat]
                     c_lat_tensor = torch.tensor(c_lat_candidates, dtype=torch.float32, device=self._device).unsqueeze(0)
                     mode_scores, _ = self.planner_head(
@@ -1049,6 +1119,7 @@ class Planner(AbstractPlanner):
                         neighbor_top1_futures=top1_fut,
                         neighbor_current_states=nbr_states,
                         neighbor_valid=nbr_valid,
+                        **graph_kwargs,
                     )
                     # Top-3 modlari yakala (viz icin) — rank 0 = secilen
                     top3_scores, top3_idx = mode_scores.topk(3, dim=1)
@@ -1123,6 +1194,9 @@ class Planner(AbstractPlanner):
                 final_path=final_plan,
                 iteration=0 if iteration is None else iteration,
             )
+            # Per-adim onem verisini diske biriktir -> sonra render_relevance_video.py ile video
+            self._record_relevance(features, iteration=0 if iteration is None else iteration,
+                                   lat_idx=lat_idx, lon_idx=lon_idx)
 
         # Çıktıları numpy'a çevir (Eski kodlar)
         
