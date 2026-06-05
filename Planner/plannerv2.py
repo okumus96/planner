@@ -10,6 +10,7 @@ from GameFormer.predictor import GameFormer
 from GameFormer.data_utils import create_map_raster, create_ego_raster, create_agents_raster
 from .state_lattice_path_planner import LatticePlanner
 from GameFormer.ar_wrapper import *
+from GameFormer.train_utils import sort_candidates_by_lateral
 from GameFormer.relevance_graph import (SceneRelevanceGraph, plot_scene_graph, annotate_map_node_ids,
                                         plot_bev_relevance, build_relevance_record, draw_relevance)
 import pickle
@@ -1052,6 +1053,12 @@ class Planner(AbstractPlanner):
             ego_state,
             traffic_light_data,
             points_per_route=MAX_LEN * 10,
+        )
+        # Adaylari uzamsal sol->sag sirala (ordinal + frame'ler arasi kararli indeks).
+        # Egitimdeki DrivingData ile AYNI helper -> train/inference tutarli; lat_idx artik
+        # kararli bir fiziksel serite karsilik gelir (jitter + indeks-cache riski azalir).
+        c_lat_candidates, c_lat_candidates_global = sort_candidates_by_lateral(
+            c_lat_candidates, c_lat_candidates_global
         )
         #print(c_lat_candidates.shape)  # (N, Seq_Len, 6)
         #features['c_lat_candidates'] = torch.tensor(c_lat_candidates, dtype=torch.float32, device=self._device).unsqueeze(0)
