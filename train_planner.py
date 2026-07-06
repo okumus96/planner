@@ -13,6 +13,7 @@ from GameFormer.ar_wrapper import ModeSelector
 from GameFormer.predictor import GameFormer
 from GameFormer.relevance_graph import SceneRelevanceGraph
 from GameFormer.train_utils import DrivingData, get_expert_mode_index, initLogging, set_seed
+from GameFormer.mode_cost import compute_mode_costs, cost_soft_target
 
 
 def extract_neighbor_top1_futures(gameformer, encoder_outputs, num_neighbors):
@@ -118,19 +119,8 @@ def soft_ce_loss(scores, soft_target):
     return -(soft_target * log_p).sum(-1).mean()
 
 
-def importance_entropy(importance):
-    """Mean entropy of the per-node importance distribution [B, V].
-
-    Adding this (with a small positive weight) to the loss MINIMIZES entropy, encouraging
-    a peaky / sparse importance distribution -> more interpretable 'which nodes matter'.
-    Invalid nodes already carry ~0 mass (masked softmax), so they contribute ~0 here.
-    """
-    ent = -(importance * torch.log(importance.clamp_min(1e-9))).sum(-1)   # [B]
-    return ent.mean()
-
-
 def train_epoch(data_loader, gameformer, mode_selector, relevance_graph, optimizer, device,
-                sigma_lat, sigma_lon, num_neighbors, importance_beta, importance_reg):
+                sigma_lat, sigma_lon, num_neighbors, importance_beta, cost_weight, cost_temp):
     losses, acc1, acc3, acc5 = [], [], [], []
     lat_a, lon_a, lon_pm1_a = [], [], []
     mode_selector.train()
@@ -155,7 +145,9 @@ def train_epoch(data_loader, gameformer, mode_selector, relevance_graph, optimiz
                 )
 
             # SceneRelevanceGraph (trainable) -> rafine dugumler + onem dagilimi
-            graph_out = relevance_graph(encoder_outputs, inputs, num_agents=num_neighbors + 1)
+            # Faz 2: komsu tahmini gelecekleri de ver -> prediction-aware (gelecek-bilincli) node'lar
+            graph_out = relevance_graph(encoder_outputs, inputs, num_agents=num_neighbors + 1,
+                                        neighbor_futures=top1_fut, neighbor_states=nbr_states)
 
             mode_scores, _ = mode_selector(
                 encoder_outputs['encoding'],
@@ -166,12 +158,14 @@ def train_epoch(data_loader, gameformer, mode_selector, relevance_graph, optimiz
                 neighbor_valid=nbr_valid,
                 graph_context=graph_out['context'],
                 graph_valid=graph_out['valid'],
-                importance=graph_out['importance'],
-                importance_beta=importance_beta,
+                importance=None,  # BIAS KAPALI: cross-transformer'a importance verilmiyor (readout sadece viz icin)
             )
             loss = soft_ce_loss(mode_scores, soft_target)
-            if importance_reg > 0:
-                loss = loss + importance_reg * importance_entropy(graph_out['importance'])
+            # Faz 3: cost-aware mode sinyali (refinement'in KENDI cost'lari: accel/jerk/speed_target) -> CE'ye EK
+            if cost_weight > 0:
+                mode_cost, mode_valid = compute_mode_costs(c_lat_candidates, inputs['ego_agent_past'])
+                cost_tgt = cost_soft_target(mode_cost, mode_valid, temperature=cost_temp)
+                loss = loss + cost_weight * soft_ce_loss(mode_scores, cost_tgt)
 
             loss.backward()
             optimizer.step()
@@ -197,7 +191,7 @@ def train_epoch(data_loader, gameformer, mode_selector, relevance_graph, optimiz
 
 
 def valid_epoch(data_loader, gameformer, mode_selector, relevance_graph, device,
-                sigma_lat, sigma_lon, num_neighbors, importance_beta):
+                sigma_lat, sigma_lon, num_neighbors, importance_beta, cost_weight, cost_temp):
     losses, acc1, acc3, acc5 = [], [], [], []
     lat_a, lon_a, lon_pm1_a = [], [], []
     mode_selector.eval()
@@ -220,7 +214,8 @@ def valid_epoch(data_loader, gameformer, mode_selector, relevance_graph, device,
                 top1_fut, nbr_states, nbr_valid = extract_neighbor_top1_futures(
                     gameformer, encoder_outputs, num_neighbors=num_neighbors
                 )
-                graph_out = relevance_graph(encoder_outputs, inputs, num_agents=num_neighbors + 1)
+                graph_out = relevance_graph(encoder_outputs, inputs, num_agents=num_neighbors + 1,
+                                            neighbor_futures=top1_fut, neighbor_states=nbr_states)
                 mode_scores, _ = mode_selector(
                     encoder_outputs['encoding'],
                     c_lat_candidates,
@@ -230,10 +225,13 @@ def valid_epoch(data_loader, gameformer, mode_selector, relevance_graph, device,
                     neighbor_valid=nbr_valid,
                     graph_context=graph_out['context'],
                     graph_valid=graph_out['valid'],
-                    importance=graph_out['importance'],
-                    importance_beta=importance_beta,
+                    importance=None,  # BIAS KAPALI: train ile tutarli (egitimde de None veriliyor)
                 )
                 loss = soft_ce_loss(mode_scores, soft_target)
+                if cost_weight > 0:
+                    mode_cost, mode_valid = compute_mode_costs(c_lat_candidates, inputs['ego_agent_past'])
+                    cost_tgt = cost_soft_target(mode_cost, mode_valid, temperature=cost_temp)
+                    loss = loss + cost_weight * soft_ce_loss(mode_scores, cost_tgt)
 
             losses.append(loss.item())
             acc1.append(topk_correct(mode_scores, gt_mode_idx, 1).float().mean().item())
@@ -297,12 +295,13 @@ def model_training(args):
          train_lat, train_lon, train_lon_pm1) = train_epoch(
             train_loader, gameformer, mode_selector, relevance_graph, optimizer, args.device,
             args.sigma_lat, args.sigma_lon, args.num_neighbors,
-            args.importance_beta, args.importance_reg,
+            args.importance_beta, args.cost_weight, args.cost_temp,
         )
         (val_loss, val_top1, val_top3, val_top5,
          val_lat, val_lon, val_lon_pm1) = valid_epoch(
             valid_loader, gameformer, mode_selector, relevance_graph, args.device,
             args.sigma_lat, args.sigma_lon, args.num_neighbors, args.importance_beta,
+            args.cost_weight, args.cost_temp,
         )
 
         log = {
@@ -371,7 +370,8 @@ if __name__ == "__main__":
     parser.add_argument("--sigma_lon", type=float, help="Gaussian soft-target sigma over lon axis", default=1.0)
     parser.add_argument("--graph_layers", type=int, help="number of HeteroEdgeGATv2 layers", default=2)
     parser.add_argument("--importance_beta", type=float, help="strength of importance attention bias", default=2.0)
-    parser.add_argument("--importance_reg", type=float, help="weight of importance entropy regularizer (peakier importance)", default=1e-3)
+    parser.add_argument("--cost_weight", type=float, help="weight of cost-aware mode loss (refinement costs); 0=kapali (varsayilan: sadece Gaussian soft-label CE)", default=0.0)
+    parser.add_argument("--cost_temp", type=float, help="temperature for softmax(-cost) soft target over modes", default=1.0)
     args = parser.parse_args()
 
     model_training(args)

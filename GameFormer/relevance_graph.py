@@ -23,6 +23,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .predictor_modules import FutureEncoder
+
 
 # Dugum tipi indeksleri (heterojen gomme icin)
 NODE_TYPE_EGO = 0
@@ -197,13 +199,17 @@ class SceneRelevanceGraph(nn.Module):
         self.type_embedding = nn.Embedding(NUM_NODE_TYPES, dim)
         self.input_norm = nn.LayerNorm(dim)
 
+        # Faz 2 (prediction-aware): komsu tahmini gelecek yorungesini node ozelligine kaynastir.
+        # FutureEncoder: trajs[B,N,M,T,2] + current_states[B,N,5] -> [B,N,M,D] (M=1 ile cagrilir).
+        self.future_encoder = FutureEncoder()
+        self.future_fuse = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU())
+
         self.layers = nn.ModuleList([
             HeteroEdgeGATv2Layer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(layers)
         ])
 
-        # Ego-merkezli onem readout (tek kafa, yorumlanabilirlik icin)
-        self.imp_q = nn.Linear(dim, dim)
-        self.imp_k = nn.Linear(dim, dim)
+        # NOT: eski imp_q/imp_k readout'u kaldirildi -> importance artik SON katmanin ego
+        # attention satiri (forward'da hesaplaniyor; bias dustugu icin ayri readout egitilemezdi).
 
     def _agent_types(self, neighbor_agents_past, num_neighbors):
         """neighbor_agents_past [B, N, T, F] son-zaman tip one-hot kanallarindan ajan tipi.
@@ -221,7 +227,8 @@ class SceneRelevanceGraph(nn.Module):
         ego_type = torch.full((B, 1), NODE_TYPE_EGO, dtype=torch.long, device=device)
         return torch.cat([ego_type, nbr_type], dim=1)            # [B, 1+N]
 
-    def forward(self, encoder_outputs, inputs, num_agents, return_attention=False):
+    def forward(self, encoder_outputs, inputs, num_agents, return_attention=False,
+                neighbor_futures=None, neighbor_states=None):
         """
         encoder_outputs: GameFormer encoder ciktisi (dict) -> 'encoding','mask','actors'
         inputs:          ham ozellikler (dict) -> 'map_lanes','map_crosswalks','route_lanes',
@@ -236,15 +243,35 @@ class SceneRelevanceGraph(nn.Module):
           'slices':     dict             dugum tipi -> (start, end) indeks dilimleri,
         }
         """
-        device = encoder_outputs['encoding'].device
+        device = (encoder_outputs['agent_tokens'] if 'agent_tokens' in encoder_outputs
+                  else encoder_outputs['encoding']).device
         Na = num_agents
 
         # --- Ajan dugumleri (frozen encoder'dan, detached) ---
-        agent_feat = encoder_outputs['encoding'][:, :Na].detach()          # [B, Na, D]
+        # ONEMLI: FUSION ONCESI temiz per-ajan gommeleri kullan. Encoder'in 6-kat full-attention
+        # fusion'i ('encoding') tum ajan+harita token'larini birbirine karistirir; o ciktiyi node
+        # yapmak, grafin ogrenecegi interaction'i zaten node ozelliginin icine gomer -> daireseldir
+        # ve attention yorumlanamaz olur. 'agent_tokens' = ego_encoder(ego) + agent_encoder(komsu_i),
+        # fusion'dan ONCE -> her node yalnizca KENDI gecmisini tasir, interaction'i graf kurar.
+        if 'agent_tokens' in encoder_outputs:
+            agent_feat = encoder_outputs['agent_tokens'][:, :Na].detach()  # [B, Na, D] (temiz, fusion oncesi)
+        else:
+            agent_feat = encoder_outputs['encoding'][:, :Na].detach()      # geri-uyum (fused, eski davranis)
         agent_valid = ~encoder_outputs['mask'][:, :Na]                     # [B, Na] True=gecerli
         agent_pose = encoder_outputs['actors'][:, :Na, -1].detach()        # [B, Na, 5]
         agent_types = self._agent_types(inputs['neighbor_agents_past'], Na - 1)  # [B, Na]
         B = agent_feat.shape[0]
+
+        # --- Faz 2: komsu tahmini gelecekleri node ozelligine kaynastir (varsa) ---
+        # Ego (idx 0) anlik kalir; niyeti route node'lari + anlik hizdan gelir ("ego'nun committed
+        # future'i yok"). Komsular (idx 1..N) "nereye gidiyor" bilgisini node'a tasir -> importance
+        # ve interaction artik gelecek-bilincli olur (sadece anlik geometri degil).
+        if neighbor_futures is not None and neighbor_states is not None:
+            N = Na - 1
+            fut_in = neighbor_futures[:, :N].unsqueeze(2)                              # [B, N, 1, T, 2]
+            fut_emb = self.future_encoder(fut_in, neighbor_states[:, :N]).squeeze(2)   # [B, N, D]
+            nbr_fused = self.future_fuse(torch.cat([agent_feat[:, 1:1 + N], fut_emb], dim=-1))  # [B, N, D]
+            agent_feat = torch.cat([agent_feat[:, :1], nbr_fused], dim=1)              # [B, Na, D]
 
         # --- Per-element harita dugumleri (kendi trainable encoder'imiz) ---
         lanes = inputs['map_lanes'][..., :3].float()
@@ -295,12 +322,13 @@ class SceneRelevanceGraph(nn.Module):
             h, a = layer(h, edge, edge_allow)
             attns.append(a)
 
-        # --- Ego-merkezli onem readout ---
-        q_ego = self.imp_q(h[:, 0])                                            # [B, D]
-        k_all = self.imp_k(h)                                                  # [B, V, D]
-        imp_logits = (q_ego[:, None, :] * k_all).sum(-1) / math.sqrt(self.dim)  # [B, V]
-        imp_logits = imp_logits.masked_fill(~valid, torch.finfo(imp_logits.dtype).min)
-        importance = torch.softmax(imp_logits, dim=-1)                         # [B, V]
+        # --- Importance = SON katmanin ego attention satiri (head-ortalamali) ---
+        # imp_q/imp_k readout'u KALDIRILDI: bias dustugu icin egitilemezdi (random kalirdi).
+        # Bunun yerine ego'nun (idx 0) SON-katman attention dagilimini kullaniyoruz: task
+        # uzerinden egitiliyor, ego-merkezli, kaynaklar uzerinde softmax oldugu icin TOPLAM=1.
+        # Head'ler ORTALANIYOR (layer ici attn_full.mean) -> toplam=1 korunur (max-pool bozardi).
+        last_attn = attns[-1]                                                  # [B,V,V] son katman, head-avg
+        importance = last_attn[:, 0, :]                                        # ego satiri -> [B,V], toplam=1
 
         out = {
             'context': h,
@@ -311,8 +339,8 @@ class SceneRelevanceGraph(nn.Module):
             'slices': slices,
         }
         if return_attention:
-            # Katmanlar uzerinde ortalama yonlu attention [B,V,V] (kim kime ne kadar bagli).
-            out['attention'] = torch.stack(attns, 0).mean(0).detach()
+            # SON katman yonlu attention [B,V,V] (head-avg); importance = bunun ego satiri.
+            out['attention'] = last_attn.detach()
         return out
 
 
@@ -432,13 +460,11 @@ def annotate_map_node_ids(ax, graph_out, shown, batch_idx=0, fontsize=6):
 
 
 def plot_scene_graph(graph_out, raw_inputs=None, batch_idx=0, ax=None, save_path=None,
-                     title=None, top_k=5, min_edge=0.05, annotate=True):
-    """GAT'i SOYUT bir node-link grafigi olarak ciz (harita YOK): dugumler cember duzeninde
-    (ego merkezde), kenarlar attention gucune gore kalinlik tasir ve UZERINDE attention
-    degeri yazar. Dugumlerin ICINE node id'si yazilir; ayni id'ler BEV uzerinde
-    annotate_map_node_ids ile gosterilir -> eslesme saglanir.
-
-    SADECE en onemli top_k dugum (ego haric) + ego cizilir.
+                     title=None, top_k=5, min_edge=0.01, annotate=True):
+    """EGO-YILDIZ importance grafigi (harita YOK): ego merkezde, en onemli top_k eleman cevrede.
+    Kenarlar SADECE ego->node; kalinlik/etiket = importance (ego self-loop CIKARILIP gosterilen
+    elemanlar uzerinde yeniden normalize edildi -> cizilen kenarlar TOPLAM 1). Ham attention
+    skoru YOK; her kenar 0-1 importance (ego'nun o elemana verdigi onem).
 
     Doner: shown (gosterilen node id'leri) -> caller BEV'e ayni id'leri basabilir.
     """
@@ -446,10 +472,8 @@ def plot_scene_graph(graph_out, raw_inputs=None, batch_idx=0, ax=None, save_path
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    assert 'attention' in graph_out, "graph_out'ta 'attention' yok; return_attention=True ile cagir."
-    imp = graph_out['importance'][batch_idx].detach().cpu().numpy()      # [V]
+    imp = graph_out['importance'][batch_idx].detach().cpu().numpy()      # [V] ego attention satiri (toplam 1)
     ntypes = graph_out['node_types'][batch_idx].detach().cpu().numpy()   # [V]
-    A = graph_out['attention'][batch_idx].detach().cpu().numpy()         # [V,V] (i<-j, yonlu)
 
     own_fig = ax is None
     if own_fig:
@@ -467,33 +491,33 @@ def plot_scene_graph(graph_out, raw_inputs=None, batch_idx=0, ax=None, save_path
         ang = np.pi / 2 - 2 * np.pi * k / max(len(others), 1)   # tepeden saat yonu
         layout[node] = (float(np.cos(ang)), float(np.sin(ang)))
 
-    # --- Kenarlar: gosterilen dugumler arasi, attention degeri UZERINDE yazili ---
-    S = np.maximum(A, A.T)                # yonsuz guc (kalinlik icin)
-    np.fill_diagonal(S, 0.0)
-    smax = max(S[np.ix_(shown, shown)].max(), 1e-6) if len(shown) >= 2 else 1.0
-    for a in range(len(shown)):
-        for b in range(a + 1, len(shown)):
-            i, j = int(shown[a]), int(shown[b])
-            w = S[i, j] / smax
-            if w < min_edge:
-                continue
-            (x1, y1), (x2, y2) = layout[i], layout[j]
-            ax.plot([x1, x2], [y1, y2], '-', color='steelblue',
-                    linewidth=0.8 + 5.0 * w, alpha=0.3 + 0.6 * w, zorder=2)
-            # Kenar uzerine attention degeri (yonlu: i<-j ve j<-i ortalamasi gosterilebilir;
-            # burada yonsuz guc S kullaniliyor)
-            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            ax.annotate(f"{S[i, j]:.2f}", (mx, my), fontsize=7, color='navy', zorder=8,
-                        ha='center', va='center',
-                        bbox=dict(boxstyle='round,pad=0.12', fc='white', ec='steelblue', alpha=0.85, lw=0.5))
+    # --- ego self-loop CIKAR + gosterilen elemanlar uzerinde yeniden normalize (kenarlar TOPLAM 1) ---
+    others_imp = np.array([imp[v] for v in others], dtype=float)
+    others_imp = others_imp / max(others_imp.sum(), 1e-9)
+    imp_of = {node: float(w) for node, w in zip(others, others_imp)}
+
+    # --- Kenarlar: SADECE ego->node, kalinlik/etiket = importance (toplam 1) ---
+    ex, ey = layout[ego_nodes[0]] if ego_nodes else (0.0, 0.0)
+    wmax = max(others_imp.max(), 1e-6) if len(others_imp) else 1.0
+    for node in others:
+        w = imp_of[node]
+        if w < min_edge:
+            continue
+        x, y = layout[node]
+        rel = w / wmax
+        ax.plot([ex, x], [ey, y], '-', color='crimson',
+                linewidth=1.0 + 6.0 * rel, alpha=0.35 + 0.6 * rel, zorder=2)
+        mx, my = (ex + x) / 2, (ey + y) / 2
+        ax.annotate(f"{w:.2f}", (mx, my), fontsize=8, color='darkred', zorder=8,
+                    ha='center', va='center',
+                    bbox=dict(boxstyle='round,pad=0.12', fc='white', ec='crimson', alpha=0.9, lw=0.5))
 
     # --- Dugumler: marker=tip, renk/boyut=onem (KOYU=yuksek), ICINE node id ---
     type_marker = {
         NODE_TYPE_VEHICLE: 'o', NODE_TYPE_PEDESTRIAN: 'P', NODE_TYPE_BICYCLE: 'X',
         NODE_TYPE_LANE: 's', NODE_TYPE_CROSSWALK: 'D', NODE_TYPE_ROUTE: '^',
     }
-    top_imp = np.array([imp[v] for v in shown if ntypes[v] != NODE_TYPE_EGO])
-    vmax = max(top_imp.max(), 1e-6) if len(top_imp) else 1.0
+    vmax = max(others_imp.max(), 1e-6) if len(others_imp) else 1.0
     sc = None
     for v in shown:
         x, y = layout[int(v)]
@@ -501,7 +525,7 @@ def plot_scene_graph(graph_out, raw_inputs=None, batch_idx=0, ax=None, save_path
             ax.scatter(x, y, c='deepskyblue', s=900, marker='*', edgecolors='k', linewidths=1.2, zorder=6)
         else:
             mk = type_marker.get(int(ntypes[v]), 'o')
-            sc = ax.scatter(x, y, c=[imp[v]], cmap='YlOrRd', vmin=0, vmax=vmax,
+            sc = ax.scatter(x, y, c=[imp_of[int(v)]], cmap='YlOrRd', vmin=0, vmax=vmax,
                             s=850, marker=mk, edgecolors='k', linewidths=1.0, zorder=5)
         if annotate:
             ax.annotate(str(int(v)), (x, y), fontsize=10, fontweight='bold', color='black',
@@ -520,7 +544,7 @@ def plot_scene_graph(graph_out, raw_inputs=None, batch_idx=0, ax=None, save_path
         Line2D([0], [0], marker='s', color='w', markerfacecolor='orange', markeredgecolor='k', markersize=11, label='lane (serit)'),
         Line2D([0], [0], marker='D', color='w', markerfacecolor='orange', markeredgecolor='k', markersize=10, label='crosswalk'),
         Line2D([0], [0], marker='^', color='w', markerfacecolor='orange', markeredgecolor='k', markersize=11, label='route'),
-        Line2D([0], [0], color='steelblue', lw=4, label='kenar = attention (uzerindeki sayi = guc)'),
+        Line2D([0], [0], color='crimson', lw=4, label='kenar = ego onemi (importance, toplam 1)'),
     ]
     ax.legend(handles=legend_handles, loc='upper right', fontsize=7, framealpha=0.9)
 
@@ -528,7 +552,7 @@ def plot_scene_graph(graph_out, raw_inputs=None, batch_idx=0, ax=None, save_path
     ax.set_ylim(-1.4, 1.4)
     ax.set_aspect('equal')
     ax.axis('off')
-    ax.set_title(title or 'GAT iliski grafigi (node ici = id, kenar = attention)')
+    ax.set_title(title or 'Ego-yildiz onem grafigi (kenar = importance, toplam 1; node ici = id)')
 
     if save_path is not None:
         plt.tight_layout()

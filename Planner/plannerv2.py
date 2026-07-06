@@ -10,7 +10,7 @@ from GameFormer.predictor import GameFormer
 from GameFormer.data_utils import create_map_raster, create_ego_raster, create_agents_raster
 from .state_lattice_path_planner import LatticePlanner
 from GameFormer.ar_wrapper import *
-from GameFormer.train_utils import sort_candidates_by_lateral
+from GameFormer.train_utils import sort_candidates_by_lateral, get_expert_mode_index
 from GameFormer.relevance_graph import (SceneRelevanceGraph, plot_scene_graph, annotate_map_node_ids,
                                         plot_bev_relevance, build_relevance_record, draw_relevance)
 import pickle
@@ -24,7 +24,8 @@ from nuplan.planning.simulation.observation.idm.utils import path_to_linestring
 
 
 class Planner(AbstractPlanner):
-    def __init__(self, model_path, device=None, debug=False, debug_dir=None, debug_max_plots=50):
+    def __init__(self, model_path, device=None, debug=False, debug_dir=None, debug_max_plots=50,
+                 oracle_mode=False):
         self._max_path_length = MAX_LEN # [m]
         self._future_horizon = T # [s] 
         self._step_interval = DT # [s]
@@ -43,6 +44,12 @@ class Planner(AbstractPlanner):
         # Debug onem gorsellestirme: NORMALIZE onem (imp/max) bu esigin ustundekiler vurgulanir.
         self._relevance_threshold = 0.65
         self._relevance_records = []  # senaryo boyunca per-adim onem verisi (--debug ile kaydedilir)
+
+        # M1 ORACLE MODU: ModeSelector skorlarini BYPASS et, modu uzman (log) gelecekten sec.
+        # "Mod arayuzu, secim mukemmel olsa yeterli bilgi tasiyor mu?" sorusunu olcer.
+        # _oracle_scenario, run_nuplan_test.py'de her senaryo basinda set edilir.
+        self._oracle_mode = oracle_mode
+        self._oracle_scenario = None
 
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1044,6 +1051,34 @@ class Planner(AbstractPlanner):
         plt.close(fig)
         self._debug_candidates_plot_count += 1
    
+    def _oracle_mode_index(self, ego_state, c_lat_candidates, iteration):
+        """M1: Uzman (log) gelecek yorungesinden GT modunu hesapla — egitimle AYNI
+        get_expert_mode_index mantigi. ModeSelector tamamen bypass edilir.
+
+        Not: closed-loop'ta ego logdan saptikca 'log gelecegi' yaklasik bir oracle olur;
+        open-loop / nonreactive icin birebir dogrudur.
+        Doner: (lat_idx, lon_idx)."""
+        it = 0 if iteration is None else int(iteration)
+        n = self._N_points
+        states = list(self._oracle_scenario.get_ego_future_trajectory(it, self._future_horizon, n))
+        if len(states) == 0:
+            return 0, 0
+        pts = np.array([[s.rear_axle.x, s.rear_axle.y] for s in states], dtype=np.float64)  # global
+        # Mevcut ego pozuna gore ego-frame'e cevir (egitim verisiyle ayni cerceve)
+        ex, ey, eh = ego_state.rear_axle.x, ego_state.rear_axle.y, ego_state.rear_axle.heading
+        rel = pts - np.array([ex, ey])
+        c, s = np.cos(eh), np.sin(eh)
+        ego_future_np = np.stack([rel[:, 0] * c + rel[:, 1] * s,
+                                  -rel[:, 0] * s + rel[:, 1] * c], axis=-1)                 # [n,2]
+        if len(ego_future_np) < n:  # senaryo sonuna yakin: son nokta ile doldur
+            pad = np.repeat(ego_future_np[-1:], n - len(ego_future_np), axis=0)
+            ego_future_np = np.concatenate([ego_future_np, pad], axis=0)
+
+        ego_future = torch.tensor(ego_future_np, dtype=torch.float32).unsqueeze(0)          # [1,80,2]
+        c_lat_t = torch.tensor(c_lat_candidates, dtype=torch.float32).unsqueeze(0)          # [1,5,T,6]
+        _, lat_idx, lon_idx = get_expert_mode_index(ego_future, c_lat_t)
+        return int(lat_idx.item()), int(lon_idx.item())
+
     def _plan(self, ego_state, history, traffic_light_data, observation, iteration=None):
         # Construct input features
         features = observation_adapter(history, traffic_light_data, self._map_api, self._route_roadblock_ids, self._device)
@@ -1087,7 +1122,11 @@ class Planner(AbstractPlanner):
         )
 
         if c_lat_candidates is not None:
-            if run_selector:
+            if self._oracle_mode and (self._oracle_scenario is not None):
+                # M1 ORACLE: secimi uzman gelecekten al; selector hic calismaz.
+                lat_idx, lon_idx = self._oracle_mode_index(ego_state, c_lat_candidates, iteration)
+                self._prev_lat_idx, self._prev_lon_idx = lat_idx, lon_idx
+            elif run_selector:
                 with torch.no_grad():
                     encoder_outputs = self.backbone.encoder(features)
 
@@ -1108,12 +1147,12 @@ class Planner(AbstractPlanner):
                     graph_kwargs = {}
                     if self.relevance_graph is not None:
                         graph_out = self.relevance_graph(encoder_outputs, features, num_agents=N_NBR + 1,
-                                                         return_attention=True)
+                                                         return_attention=True,
+                                                         neighbor_futures=top1_fut, neighbor_states=nbr_states)
                         graph_kwargs = dict(
                             graph_context=graph_out['context'],
                             graph_valid=graph_out['valid'],
-                            importance=graph_out['importance'],
-                            hard_topk=self._graph_hard_topk,
+                            importance=None,  # BIAS KAPALI: cross-transformer'a importance verilmiyor
                         )
                         self._prev_importance = graph_out  # viz icin sakla
 

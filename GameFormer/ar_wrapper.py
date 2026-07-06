@@ -126,37 +126,13 @@ class ModeSelector(nn.Module):
                 torch.zeros(B, scene_encoding.shape[1], dtype=torch.bool, device=device)
             base_bias = torch.zeros(B, base_context.shape[1], device=device)
 
-        # --- E.2 KOMSU FUTURE TOKENLARI (opsiyonel, eskisi gibi append) ---
-        # Komsularin tahmin edilen gelecek trajektorilerini FutureEncoder ile [B, N_nbr, D]'ye
-        # encode edip context'in SONUNA ekleriz; mask de uzar.
-        #
-        # ONEMLI: future tokenlarina, KARSILIK GELEN komsu ajanin importance'ini bias olarak
-        # veririz. SceneRelevanceGraph layout'u node 0=ego, 1..N_nbr=komsular oldugundan
-        # future token j  <->  graph node (1+j). Boylece "onemli" dedigimiz ajanin GELECEGI de
-        # attention'da yukselir (ayni ajan hem anlik-durum node'u hem future token'i olarak
-        # ayni onem bias'ini alir).
-        if neighbor_top1_futures is not None:
-            fut_in = neighbor_top1_futures.unsqueeze(2)                               # [B, N_nbr, 1, T, 2]
-            future_emb = self.neighbor_future_encoder(fut_in, neighbor_current_states).squeeze(2)  # [B, N_nbr, D]
-            N_nbr = future_emb.shape[1]
-
-            if neighbor_valid is None:
-                neighbor_valid = torch.ones(B, N_nbr, dtype=torch.bool, device=device)
-            future_mask = ~neighbor_valid                                             # [B, N_nbr]
-
-            if (importance is not None) and (graph_context is not None) and importance.shape[1] >= 1 + N_nbr:
-                nbr_imp = importance[:, 1:1 + N_nbr]                                   # [B, N_nbr]
-                future_bias = importance_beta * torch.log(nbr_imp.clamp_min(1e-6))     # [B, N_nbr]
-            else:
-                future_bias = torch.zeros(B, N_nbr, device=device)
-
-            context = torch.cat([base_context, future_emb], dim=1)
-            full_mask = torch.cat([base_mask, future_mask], dim=1)
-            full_bias = torch.cat([base_bias, future_bias], dim=1)
-        else:
-            context = base_context
-            full_mask = base_mask
-            full_bias = base_bias
+        # --- E.2 KOMSU FUTURE TOKENLARI KALDIRILDI ---
+        # Faz 2'de komsu future'lari zaten graph H'nin ajan node'larina kaynastirildi; burada
+        # AYRICA future token'i append etmek fazlalik olurdu (komsu future'i iki kez girerdi).
+        # Context artik sadece graph H (+ ego/harita node'lari).
+        context = base_context
+        full_mask = base_mask
+        full_bias = base_bias
 
         # --- F. FUSION VE SKORLAMA ---
         # full_bias [B, S] -> additive attn_mask [B*heads, 60, S] (tum mod query'lerine broadcast).

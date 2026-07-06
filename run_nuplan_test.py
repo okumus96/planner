@@ -74,6 +74,8 @@ def build_simulation(experiment, planner, scenarios, output_dir, simulation_dir,
 
     # Iterate through scenarios
     for scenario in tqdm(scenarios, desc='Running simulation'):
+        # M1 oracle modu icin: planner uzman gelecege senaryo uzerinden erisir.
+        planner._oracle_scenario = scenario
         tracker = LQRTracker(q_longitudinal=[10.0], r_longitudinal=[1.0], q_lateral=[1.0, 10.0, 0.0], 
                             r_lateral=[1.0], discretization_time=0.1, tracking_horizon=10, 
                             jerk_penalty=1e-4, curvature_rate_penalty=1e-2, 
@@ -174,7 +176,10 @@ def main(args):
         debug=args.debug,
         debug_dir=f"{output_dir}/debug_plots",
         debug_max_plots=args.debug_max_plots,
+        oracle_mode=args.oracle_mode,
     )
+    if args.oracle_mode:
+        print("[M1] ORACLE MODE: ModeSelector bypass, mod uzman gelecekten secilecek.")
 
     # initialize main aggregator
     metric_aggregators = build_metrics_aggregators(experiment_name, output_dir, aggregator_metric_dir)
@@ -297,7 +302,10 @@ def main(args):
     simulation_file = [str(file) for file in pathlib.Path(output_dir).iterdir() if file.is_file() and file.suffix == '.nuboard']
 
     # show metrics and scenarios
-    build_nuboard(builder, simulation_file)
+    if args.no_nuboard:
+        print(f"[no_nuboard] Skipping nuBoard. Results: {output_dir}")
+    else:
+        build_nuboard(builder, simulation_file)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run NuPlan test')
@@ -310,6 +318,9 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cuda', help='device to run model on')
     parser.add_argument('--debug', action='store_true', help='save per-iteration debug trajectory plots')
     parser.add_argument('--debug_max_plots', type=int, default=200, help='maximum number of debug plots to save')
+    parser.add_argument('--oracle_mode', action='store_true',
+                        help='M1: bypass ModeSelector, pick mode from expert (log) future — mode-interface upper bound')
+    parser.add_argument('--no_nuboard', action='store_true', help='do not launch nuBoard after simulation (batch runs)')
     parser.add_argument('--scenarios_per_type', type=int, default=10, help='number of scenarios per type')
     parser.add_argument('--total_scenarios', default=None, help='limit total number of scenarios')
     parser.add_argument('--shuffle_scenarios', type=bool, default=False, help='shuffle scenarios')
