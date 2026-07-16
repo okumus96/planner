@@ -1,0 +1,323 @@
+"""
+Causal graph BEV visualization. For each scene the ego + neighbor agents are drawn and colored by
+M_cas (agents), and the map polylines (lanes/crosswalks/routes) are colored by M_cas_map. The palette
+is SEQUENTIAL: light = non-causal ... dark red = causal.
+
+Selection (which agents / map elements count as "causal") uses ONE rule applied IDENTICALLY to agents
+and to map:
+  --select topn      --topn N     : top-N by score for agents AND top-N for map (scale-independent).
+  --select threshold --threshold T : score > T for both (note: map scores ~0.2 << agent scores ~0.5,
+                                     because each relation has its OWN softmax over a different count,
+                                     so use a low T or prefer topn).
+Selected agents get a bold black outline + M_cas label + predicted-future line (blue). The selected map
+elements get an M_cas_map label.
+
+Example:
+  python viz_causal.py --pretrained_path training_log/normal/model_epoch_19_valADE_1.6487.pth \
+    --causal_path training_log/causal_map/causal_epoch_16_minADE_0.7396.pth \
+    --valid_set /home/lt-hta-ai4/ssd1/nuplan/processed_data/validation \
+    --select topn --topn 1 --scenario turn --out viz_out/causal_map.png
+"""
+
+import argparse
+import os
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle, Circle, RegularPolygon, Patch
+from matplotlib.lines import Line2D
+from matplotlib.transforms import Affine2D
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib as mpl
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from GameFormer.predictor import GameFormer
+from GameFormer.causal_graph import CausalPlanner
+from GameFormer.train_utils import DrivingData
+from train_planner import read_batch, extract_neighbor_top1_futures, freeze_gameformer
+
+# Sequential palette: LIGHT (non-causal) -> DARK RED (causal). Truncated so the low end stays visible
+# (red contrasts better than blue against the faint map polylines).
+CMAP = LinearSegmentedColormap.from_list("mcas_seq", mpl.colormaps["Reds"](np.linspace(0.12, 1.0, 256)))
+FUTURE_COLOR = "#1565C0"    # blue: causal agent's predicted future (contrast vs red map)
+# agent type idx: neighbor_agents_past[..., 8:11] one-hot argmax -> 0=vehicle, 1=pedestrian, 2=bicycle
+
+
+def select_mask(values, valid, mode, thr, topn):
+    """Return a boolean 'selected' mask over elements, applying the SAME rule to agents and map.
+    mode='topn' -> top-`topn` valid elements by value; mode='threshold' -> value > thr among valid."""
+    sel = np.zeros(values.shape, dtype=bool)
+    idx = np.where(valid)[0]
+    if len(idx) == 0:
+        return sel
+    if mode == "topn":
+        order = idx[np.argsort(values[idx])[::-1]]
+        sel[order[:max(topn, 0)]] = True
+    else:  # threshold (absolute), same number for agents and map
+        sel[idx[values[idx] > thr]] = True
+    return sel
+
+
+def _draw_car(ax, x, y, heading, length, width, facecolor, edgecolor, lw, alpha=1.0, z=5):
+    length = length if length > 0.5 else 4.5
+    width = width if width > 0.3 else 2.0
+    rect = Rectangle((-length / 2, -width / 2), length, width,
+                     facecolor=facecolor, edgecolor=edgecolor, lw=lw, alpha=alpha, zorder=z)
+    rect.set_transform(Affine2D().rotate(heading).translate(x, y) + ax.transData)
+    ax.add_patch(rect)
+
+
+def _draw_agent(ax, x, y, heading, length, width, atype, facecolor, edgecolor, lw, z=5):
+    """Shape = agent type (vehicle=rect, pedestrian=circle, bicycle=triangle); color = M_cas."""
+    if atype == 1:      # pedestrian
+        ax.add_patch(Circle((x, y), 0.9, facecolor=facecolor, edgecolor=edgecolor, lw=lw, zorder=z))
+    elif atype == 2:    # bicycle
+        ax.add_patch(RegularPolygon((x, y), numVertices=3, radius=1.3, orientation=heading - np.pi / 2,
+                                    facecolor=facecolor, edgecolor=edgecolor, lw=lw, zorder=z))
+    else:               # vehicle
+        _draw_car(ax, x, y, heading, length, width, facecolor, edgecolor, lw, z=z)
+
+
+def _plot_map_causal(ax, polys, mcas, valid):
+    """Draw map polylines colored by M_cas_map (light->dark red, per-scene scaled).
+    Map is COLORED ONLY (no selection / no labels) -- selection is agents-only."""
+    vm = mcas[valid]
+    vmax = float(vm.max()) if vm.size else 1.0
+    vmax = max(vmax, 1e-6)
+    order = np.argsort(mcas)                                 # low first -> causal drawn on top
+    for e in order:
+        if not valid[e]:
+            continue
+        poly = polys[e]
+        msk = np.abs(poly).sum(-1) > 1e-3
+        if msk.sum() < 2:
+            continue
+        r = float(mcas[e]) / vmax
+        ax.plot(poly[msk, 0], poly[msk, 1], color=CMAP(r), lw=0.8 + 3.2 * r,
+                zorder=1 + 2.0 * r, alpha=0.9, solid_capstyle="round")
+
+
+def ego_maneuver(ego_future):
+    """ego_future [80,3] (x,y,heading, ego-frame) -> maneuver dict (turn dir + start/stop)."""
+    xy = ego_future[:, :2]
+    hd = ego_future[:, 2]
+    dheading = float(np.arctan2(np.sin(hd[-1] - hd[0]), np.cos(hd[-1] - hd[0])))
+    v = np.linalg.norm(np.diff(xy, axis=0), axis=-1) / 0.1
+    v0, vend = float(v[:5].mean()), float(v[-5:].mean())
+    turn = "left" if dheading > 0.35 else ("right" if dheading < -0.35 else "straight")
+    starting = (v0 < 1.5) and (vend > v0 + 2.0)
+    stopping = (v0 > 3.0) and (vend < 1.0)
+    return {"turn": turn, "dheading": dheading, "v0": v0, "vend": vend,
+            "starting": starting, "stopping": stopping}
+
+
+def scenario_match(man, scenario):
+    t, st, sp = man["turn"], man["starting"], man["stopping"]
+    return {
+        "any": True, "straight": t == "straight", "left_turn": t == "left", "right_turn": t == "right",
+        "turn": t != "straight", "starting": st, "stopping": sp,
+        "starting_left_turn": st and t == "left", "starting_right_turn": st and t == "right",
+        "stopping_straight": sp and t == "straight",
+    }.get(scenario, True)
+
+
+def plot_scene(ax, s, mode, thr, topn, branch="cas"):
+    """s: dict of numpy arrays for one sample. branch='cas'|'cfd' -> only affects label text
+    (mask/data used was already selected upstream in collect_scenes)."""
+    tag_word = "causal" if branch == "cas" else "confound"
+    _plot_map_causal(ax, s["map_polys"], s["map_mcas"], s["map_valid"])   # map: colored only
+
+    # ego (idx 0) -> origin, black
+    _draw_car(ax, s["ego"][0], s["ego"][1], s["ego"][2], 4.8, 2.0,
+              facecolor="#222222", edgecolor="black", lw=1.0, z=6)
+    ax.plot(s["ego_plan"][:, 0], s["ego_plan"][:, 1], "--", color="#2ca02c", lw=1.8, zorder=7)
+
+    agent_sel = select_mask(s["M_cas"][:s["N"]], s["valid"], mode, thr, topn)
+    xs, ys = [s["ego"][0]], [s["ego"][1]]
+    for j in range(s["N"]):
+        if not s["valid"][j]:
+            continue
+        x, y, hd = s["pos"][j, 0], s["pos"][j, 1], s["pos"][j, 2]
+        m = float(s["M_cas"][j])
+        causal = bool(agent_sel[j])
+        _draw_agent(ax, x, y, hd, s["dims"][j, 0], s["dims"][j, 1], int(s["types"][j]),
+                    facecolor=CMAP(m), edgecolor=("black" if causal else "0.45"),
+                    lw=(2.4 if causal else 0.8), z=(8 if causal else 5))
+        if causal:
+            ax.text(x, y + 2.2, f"{m:.2f}", color="black", fontsize=7, ha="center",
+                    fontweight="bold", zorder=9)
+            fut = s["fut"][j]                            # causal agent's predicted future (ego-frame, absolute)
+            fm = np.abs(fut).sum(-1) > 1e-3
+            if fm.sum() > 1:
+                ax.plot(fut[fm, 0], fut[fm, 1], "-", color=FUTURE_COLOR, lw=1.6, alpha=0.95, zorder=6)
+        xs.append(x); ys.append(y)
+
+    r = 40
+    ax.set_xlim(min(xs) - 10, max(xs) + 10)
+    ax.set_ylim(min(ys) - 10, max(ys) + 10)
+    ax.set_xlim(np.clip(ax.get_xlim(), -r, r))
+    ax.set_ylim(np.clip(ax.get_ylim(), -r, r))
+    ax.set_aspect("equal")
+    ax.set_xticks([]); ax.set_yticks([])
+    man = s.get("man", {})
+    tag = man.get("turn", "?")
+    if man.get("starting"):
+        tag = "start+" + tag
+    if man.get("stopping"):
+        tag = "stop+" + tag
+    ax.set_title(f"[{tag}]  {tag_word} agents: {int(agent_sel.sum())}  |  "
+                 f"maxA={s['M_cas'][s['valid']].max():.2f}  maxMap={s['map_mcas'][s['map_valid']].max():.2f}",
+                 fontsize=8)
+
+
+@torch.no_grad()
+def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device,
+                   scenario, mode, thr, topn, branch="cas"):
+    """branch='cas' (varsayilan) -> M_cas/M_cas_map + f_cas'ten uretilen plan (ANA, deploy edilen).
+    branch='cfd' -> M_cfd/M_cfd_map + f_cfd'den uretilen plan (traj_cfd/score_cfd, tani/ablasyon amacli,
+    hicbir ajan silinmez)."""
+    scenes = []
+    Na = num_neighbors + 1
+    mask_key = "M_cas" if branch == "cas" else "M_cfd"
+    map_key = "M_cas_map" if branch == "cas" else "M_cfd_map"
+    for batch in loader:
+        inputs, ego_future, _, _ = read_batch(batch, device)
+        enc = gameformer.encoder(inputs)
+        top1_fut, nbr_states, _ = extract_neighbor_top1_futures(gameformer, enc, num_neighbors)
+        out = causal(enc, inputs, num_agents=Na, neighbor_futures=top1_fut, neighbor_states=nbr_states,
+                     also_cfd_plan=(branch == "cfd"))
+
+        M_cas = out[mask_key]; valid = out["nbr_valid"]
+        M_cas_map = out[map_key]; map_valid = out["map_valid"]
+        actors = enc["actors"][:, :, -1]
+        traj_key, score_key = ("traj_cfd", "score_cfd") if branch == "cfd" else ("traj", "score")
+        traj = out[traj_key][:, 0, :, :, :2]
+        best = out[score_key][:, 0].argmax(-1)
+        dims = inputs["neighbor_agents_past"][:, :, -1, 6:8]
+        types = inputs["neighbor_agents_past"][:, :, -1, 8:11].argmax(-1)
+
+        # flat list of map polylines (order matches M_cas_map: lanes, crosswalks, routes)
+        map_src = [inputs["map_lanes"][:, :, :, :2], inputs["map_crosswalks"][:, :, :, :2],
+                   inputs["route_lanes"][:, :, :, :2]]
+
+        B = M_cas.shape[0]
+        for b in range(B):
+            v = valid[b]
+            if v.sum() < 2:
+                continue
+            man = ego_maneuver(ego_future[b].cpu().numpy())
+            if scenario != "any" and not scenario_match(man, scenario):
+                continue
+            mca = M_cas[b].cpu().numpy(); vv = v.cpu().numpy()
+            if scenario == "any":
+                # 'any' -> keep interactive scenes: at least one SELECTED agent
+                if not select_mask(mca[:num_neighbors], vv, mode, thr, topn).any():
+                    continue
+            polys = [arr[b, e].cpu().numpy() for arr in map_src for e in range(arr.shape[1])]
+            scenes.append({
+                "man": man, "N": num_neighbors,
+                "M_cas": mca, "valid": vv,
+                "ego": actors[b, 0, :3].cpu().numpy(),
+                "pos": actors[b, 1:Na, :3].cpu().numpy(),
+                "dims": dims[b].cpu().numpy(), "types": types[b].cpu().numpy(),
+                "ego_plan": traj[b, best[b]].cpu().numpy(),
+                "fut": top1_fut[b].cpu().numpy(),
+                "map_polys": polys,
+                "map_mcas": M_cas_map[b].cpu().numpy(),
+                "map_valid": map_valid[b].cpu().numpy(),
+            })
+            if len(scenes) >= num_scenes:
+                return scenes
+    return scenes
+
+
+def main(args):
+    dev = args.device
+    gameformer = GameFormer(encoder_layers=args.encoder_layers, decoder_levels=args.decoder_levels,
+                            neighbors=args.num_neighbors)
+    gameformer.load_state_dict(torch.load(args.pretrained_path, map_location=dev))
+    gameformer = gameformer.to(dev); freeze_gameformer(gameformer)
+
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes).to(dev)
+    causal.load_state_dict(torch.load(args.causal_path, map_location=dev))
+    causal.eval()
+
+    valid_set = DrivingData(args.valid_set + "/*.npz", args.num_neighbors)
+    loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
+
+    scenes = collect_scenes(gameformer, causal, loader, args.num_neighbors, args.num_scenes, dev,
+                            args.scenario, args.select, args.threshold, args.topn, branch=args.branch)
+    sel_desc = f"topn={args.topn}" if args.select == "topn" else f"threshold={args.threshold}"
+    print(f"collected {len(scenes)} scenes (scenario={args.scenario}, branch={args.branch}, "
+          f"select={args.select} {sel_desc}).")
+
+    n = len(scenes)
+    cols = min(3, n) if n else 1
+    rows = int(np.ceil(n / cols)) if n else 1
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 4.2, rows * 4.2), squeeze=False)
+    for i in range(rows * cols):
+        ax = axes[i // cols][i % cols]
+        if i < n:
+            plot_scene(ax, scenes[i], args.select, args.threshold, args.topn, branch=args.branch)
+        else:
+            ax.axis("off")
+    sm = mpl.cm.ScalarMappable(cmap=CMAP, norm=plt.Normalize(0, 1))
+    mask_name = "M_cas" if args.branch == "cas" else "M_cfd"
+    tag_word = "causal" if args.branch == "cas" else "confound"
+    fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01,
+                 label=f"{mask_name}   (light = non-{tag_word}  ->  dark = {tag_word})")
+
+    sel_label = f"top-{args.topn}" if args.select == "topn" else f"M > {args.threshold:g}"
+    handles = [
+        Patch(facecolor="#222222", edgecolor="black", label="Ego"),
+        Line2D([0], [0], color="#2ca02c", lw=1.8, ls="--",
+               label=f"Ego plan (pred, from f_{args.branch})"),
+        Patch(facecolor=CMAP(0.9), edgecolor="black", lw=2.2, label=f"{tag_word.capitalize()} agent ({sel_label})"),
+        Line2D([0], [0], color=FUTURE_COLOR, lw=1.6, label=f"{tag_word.capitalize()} agent future traj."),
+        Line2D([0], [0], color=CMAP(0.95), lw=3.2, label=f"Map polyline (dark = high {mask_name}_map)"),
+        Line2D([0], [0], color=CMAP(0.25), lw=1.2, label="Map polyline (light = low)"),
+        Patch(facecolor="0.7", edgecolor="0.4", label="Type: vehicle (rect)"),
+        Line2D([0], [0], marker="o", ls="None", markerfacecolor="0.7", markeredgecolor="0.4",
+               markersize=11, label="Type: pedestrian (circle)"),
+        Line2D([0], [0], marker="^", ls="None", markerfacecolor="0.7", markeredgecolor="0.4",
+               markersize=12, label="Type: bicycle (triangle)"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=5, fontsize=8.5,
+               frameon=True, bbox_to_anchor=(0.5, -0.04))
+
+    fig.suptitle(f"{tag_word.capitalize()} graph — agents ({mask_name}) + map ({mask_name}_map)   "
+                 f"(scenario={args.scenario}, select={args.select} {sel_desc})  |  "
+                 f"{os.path.basename(args.causal_path)}", fontsize=11)
+    fig.savefig(args.out, dpi=140, bbox_inches="tight")
+    print(f"Saved: {args.out}")
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="BEV visualization of the causal graph (agents + map)")
+    p.add_argument("--pretrained_path", required=True)
+    p.add_argument("--causal_path", required=True)
+    p.add_argument("--valid_set", required=True)
+    p.add_argument("--branch", type=str, default="cas", choices=["cas", "cfd"],
+                   help="'cas' (varsayilan) = M_cas/M_cas_map + ANA plan (f_cas'ten, deploy edilen). "
+                        "'cfd' = M_cfd/M_cfd_map + f_cfd'den uretilen plan (tani/ablasyon, hicbir ajan silinmez).")
+    p.add_argument("--select", type=str, default="topn", choices=["topn", "threshold"],
+                   help="selection rule applied IDENTICALLY to agents and map")
+    p.add_argument("--topn", type=int, default=1, help="for --select topn: top-N per relation")
+    p.add_argument("--threshold", type=float, default=0.5, help="for --select threshold: M > T (same for both)")
+    p.add_argument("--scenario", type=str, default="any",
+                   choices=["any", "straight", "left_turn", "right_turn", "turn", "starting",
+                            "stopping", "starting_left_turn", "starting_right_turn", "stopping_straight"],
+                   help="scene filter by ego maneuver (derived from the GT future)")
+    p.add_argument("--num_scenes", type=int, default=9)
+    p.add_argument("--num_neighbors", type=int, default=10)
+    p.add_argument("--encoder_layers", type=int, default=3)
+    p.add_argument("--decoder_levels", type=int, default=2)
+    p.add_argument("--graph_layers", type=int, default=3)
+    p.add_argument("--modes", type=int, default=6)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--out", type=str, default="causal_bev.png")
+    p.add_argument("--device", type=str, default="cuda")
+    main(p.parse_args())

@@ -2,18 +2,18 @@ import argparse
 import csv
 import logging
 import os
+from collections import defaultdict
 
 import numpy as np
 import torch
-from torch import nn, optim
+import torch.nn.functional as F
+from torch import optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from GameFormer.ar_wrapper import ModeSelector
 from GameFormer.predictor import GameFormer
-from GameFormer.relevance_graph import SceneRelevanceGraph
-from GameFormer.train_utils import DrivingData, get_expert_mode_index, initLogging, set_seed
-from GameFormer.mode_cost import compute_mode_costs, cost_soft_target
+from GameFormer.causal_graph import CausalPlanner
+from GameFormer.train_utils import DrivingData, imitation_loss, initLogging, set_seed
 
 
 def extract_neighbor_top1_futures(gameformer, encoder_outputs, num_neighbors):
@@ -32,7 +32,6 @@ def extract_neighbor_top1_futures(gameformer, encoder_outputs, num_neighbors):
     top1_futures = torch.gather(nbr_inter[..., :2], 2, g).squeeze(2)  # [B, N, T, 2]
 
     current_states = encoder_outputs['actors'][:, 1:1 + num_neighbors, -1]  # [B, N, 5]
-    # encoder's mask: agent_mask is the first (1+N_dataset) entries; True = padded
     nbr_valid = ~encoder_outputs['mask'][:, 1:1 + num_neighbors]            # [B, N]
 
     return top1_futures, current_states, nbr_valid
@@ -51,206 +50,151 @@ def read_batch(batch, device):
     c_lat_candidates = batch[7].to(device).float()
     return inputs, ego_future, neighbors_future, c_lat_candidates
 
+
 def freeze_gameformer(gameformer):
     gameformer.eval()
     for parameter in gameformer.parameters():
         parameter.requires_grad = False
 
-def topk_correct(scores, target, k):
-    """Returns boolean tensor [B], True if target is in top-k of scores."""
-    topk_idx = scores.topk(k, dim=1).indices       # [B, k]
-    return (topk_idx == target.unsqueeze(1)).any(dim=1)
+
+def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask):
+    """Causal-Planner'a SADIK loss (ref: ~/Causal-Planner lightning_trainer.py). Backdoor/GRL YOK.
+
+    CP'nin toplami:
+        loss = <traj lossleri> + decision_loss + 0.2*scenario_loss
+             + 0.5 * decision_causal_inference_loss
+             + 0.5 * soft_mask_loss
+    Bizdeki karsiliklari (scenario_loss PLUTO'ya ozel, bizde yok):
+        L_TRAJ                  <- CP: agent_reg_loss + agent_cls_loss (bizde GMM WTA)
+        lambda_kld  * L_KLD     <- CP: decision_loss = CE(decision_causal, m*)          [1.0]
+        lambda_ci   * L_CI      <- CP: KL(uniform||p_cfd) + 0.1*(-H)                    [0.5]
+        lambda_mask * L_MASK    <- CP: (comp+excl+norm)_other + (comp+excl+norm)_g2a    [0.5]
+
+    Onceki (sadik OLMAYAN) halinden farklar:
+      - comp/excl artik MSE (onceden L1 / ham ortalama)
+      - normalization_loss EKLENDI (softmax yuzunden ~0 cikar; CP'de de oyle)
+      - ajan+harita TOPLANIYOR (onceden 0.5x ortalama) -> adv ~0.87 yerine ~1.6 (CP ile ayni olcek)
+      - confound dali icin KL ana terim, entropy 0.1 agirlikli yardimci (onceden entropy tek basinaydi)
+    Doner (loss, metrics_dict)."""
+    gt = ego_future[:, None]                                       # [B, 1, 80, 3]
+    l_traj, _, best_mode = imitation_loss(out['traj'], out['score'], gt)
+    m_star = best_mode[:, 0]                                       # [B] kazanan mod (ana head)
+    K = out['psi_cas'].shape[-1]
+
+    # --- decision_loss (CP): causal dal dogru modu bilsin ---
+    l_kld = F.cross_entropy(out['psi_cas'], m_star)
+
+    # --- decision_causal_inference_loss (CP): KL(uniform || p_cfd) + 0.1*(-H) ---
+    log_p_cfd = F.log_softmax(out['psi_cfd'], dim=-1)
+    target_uniform = torch.ones_like(out['psi_cfd']) / K
+    l_kl = F.kl_div(input=log_p_cfd, target=target_uniform, reduction='batchmean', log_target=False)
+    ent = -(log_p_cfd.exp() * log_p_cfd).sum(-1).mean()            # H(p_cfd), tavan = ln K
+    l_ci = l_kl + 0.1 * (-ent)
+
+    # --- soft_mask_loss (CP): her iliski icin comp+excl+norm, sonra iliskiler TOPLANIR ---
+    def _soft_mask(M_cas, M_cfd, valid):
+        """CP: complementarity_loss + exclusivity_loss + normalization_loss (hepsi MSE)."""
+        vs = valid                                                  # [B, n] bool
+        comp = F.mse_loss((M_cas + M_cfd)[vs], torch.ones_like(M_cas[vs]))          # -> 1
+        excl = F.mse_loss((M_cas * M_cfd)[vs], torch.zeros_like(M_cas[vs]))         # -> 0
+        rows = vs.any(dim=-1)                                       # [B] en az 1 gecerli
+        cs, fs = M_cas.sum(-1)[rows], M_cfd.sum(-1)[rows]
+        ones = torch.ones_like(cs)
+        norm = F.mse_loss(cs, ones) + F.mse_loss(fs, ones)          # softmax -> ~0 (CP'de de no-op)
+        return comp, excl, norm
+
+    comp_ag, excl_ag, norm_ag = _soft_mask(out['M_cas'], out['M_cfd'], out['nbr_valid'])
+    comp_mp, excl_mp, norm_mp = _soft_mask(out['M_cas_map'], out['M_cfd_map'], out['map_valid'])
+    l_comp, l_excl, l_norm = comp_ag + comp_mp, excl_ag + excl_mp, norm_ag + norm_mp
+    l_mask = l_comp + l_excl + l_norm                               # CP: other_soft_mask + g2a_soft_mask
+
+    nv_f = out['nbr_valid'].float()
+    loss = l_traj + lambda_kld * l_kld + lambda_ci * l_ci + lambda_mask * l_mask
+
+    with torch.no_grad():
+        traj_xy = out['traj'][:, 0, :, :, :2]                     # [B, M, 80, 2]
+        gt_xy = gt[:, 0, None, :, :2]                             # [B, 1, 80, 2]
+        ade = torch.norm(traj_xy - gt_xy, dim=-1).mean(-1)        # [B, M]
+        best = ade.argmin(-1)                                     # [B]
+        minade = ade.gather(1, best[:, None]).mean().item()
+        fde = torch.norm(traj_xy[:, :, -1] - gt_xy[:, :, -1], dim=-1)  # [B, M]
+        minfde = fde.gather(1, best[:, None]).mean().item()
+
+        cas_acc = (out['psi_cas'].argmax(-1) == m_star).float().mean().item()   # yuksek olmali
+        cfd_acc = (out['psi_cfd'].argmax(-1) == m_star).float().mean().item()   # ~1/K (bilgisiz olmali)
+        nvb = out['nbr_valid']
+        # M_cas komsular uzerinde dagilim -> mean yaniltici, PEAK'e bak.
+        mcas_peak = out['M_cas'].masked_fill(~nvb, 0.0).max(-1).values.mean().item()   # en causal ajan
+        mcas_map_peak = out['M_cas_map'].masked_fill(~out['map_valid'], 0.0).max(-1).values.mean().item()  # en causal harita
+        q_bar = ((out['M_cas'] * nv_f).sum() / nv_f.sum().clamp(min=1.0)).item()       # marjinal E[M_cas]
+        # M_cfd'yi DOGRUDAN gozleyen metrik (adv/excl yapisal olarak olu, ent/cfdacc dolayli).
+        mcfd_peak = out['M_cfd'].masked_fill(~nvb, 0.0).max(-1).values.mean().item()   # en confounding ajan
+        # UNIFORM REFERANSI: n_valid komsuya esit dagilsa peak tam 1/n_valid olurdu. Peak'i buna gore oku:
+        #   peak ~= unif  -> dagilim duz, M sekillenMIYOR (olu)
+        #   peak >> unif  -> dagilim tepe yapiyor, M gercekten seciyor
+        n_valid = nvb.sum(-1).clamp(min=1).float()                                     # [B]
+        unif = (1.0 / n_valid).mean().item()
+
+        # ENTROPI MAKASI (CP lightning_trainer.py:232-236 ile ayni mantik): causal dal PEAKED
+        # (dusuk entropi, decision_loss ile denetleniyor), confound dal UNIFORM (yuksek entropi).
+        # Ayrisma = aradaki makas. casent'i olcmeden makasi goremiyorduk; asil izlenecek sayi bu.
+        log_p_cas = F.log_softmax(out['psi_cas'], dim=-1)
+        casent = -(log_p_cas.exp() * log_p_cas).sum(-1).mean().item()
+        entgap = ent.item() - casent                     # BUYUK olmali (cfd tavanda, cas dipte)
+
+    metrics = {
+        'loss': loss.item(), 'traj': l_traj.item(), 'kld': l_kld.item(),
+        'kl': l_kl.item(), 'ent': ent.item(), 'casent': casent, 'entgap': entgap,
+        'ci': l_ci.item(), 'mask': l_mask.item(),
+        'comp': l_comp.item(), 'excl': l_excl.item(), 'norm': l_norm.item(),
+        'minADE': minade, 'minFDE': minfde, 'casacc': cas_acc, 'cfdacc': cfd_acc,
+        'mcas_peak': mcas_peak, 'mcas_map_peak': mcas_map_peak, 'qbar': q_bar,
+        'mcfd_peak': mcfd_peak, 'unif': unif,
+    }
+    return loss, metrics
 
 
-def latlon_acc(scores, target, num_lon=12):
-    """Argmax tahmininin lat/lon eksenlerini AYRI AYRI olcer (sadece teshis/log icin,
-    loss'a girmez). top-1 darbogazinin lat'ta mi lon'da mi oldugunu gormek icin.
-
-    Doner (hepsi skaler float):
-      lat_acc:  lateral indeks tam dogru
-      lon_acc:  longitudinal indeks tam dogru
-      lon_pm1:  longitudinal indeks +-1 bin icinde (bitisik-bin karismasini gormek icin)
-    """
-    pred = scores.argmax(dim=1)
-    pred_lat, pred_lon = pred // num_lon, pred % num_lon
-    gt_lat, gt_lon = target // num_lon, target % num_lon
-    lat_acc = (pred_lat == gt_lat).float().mean().item()
-    lon_acc = (pred_lon == gt_lon).float().mean().item()
-    lon_pm1 = ((pred_lon - gt_lon).abs() <= 1).float().mean().item()
-    return lat_acc, lon_acc, lon_pm1
-
-
-def build_gaussian_soft_target(gt_mode_idx, num_lat=5, num_lon=12,
-                               sigma_lat=0.7, sigma_lon=1.0, lat_valid=None):
-    """
-    Convert hard mode index [B] to 2D-Gaussian soft target [B, num_lat*num_lon].
-
-    The lat/lon grid is treated as two orthogonal axes; we put independent 1D
-    Gaussians on each, then take the outer product. Result is normalized per-sample.
-
-    lat_valid: optional bool [B, num_lat]. Padded (gecersiz) lateral rotalara kutle
-    KOYMAYIZ ve kalan kutleyi yeniden normalize ederiz. Boylece (a) modelden var olmayan
-    rotaya olasilik beklenmez, (b) eval'de o modlar -1e9'a maskelendiginde soft-CE patlamaz.
-    """
-    device = gt_mode_idx.device
-    B = gt_mode_idx.shape[0]
-    gt_lat = (gt_mode_idx // num_lon).float()                              # [B]
-    gt_lon = (gt_mode_idx % num_lon).float()                               # [B]
-
-    lat_grid = torch.arange(num_lat, device=device).float()                # [num_lat]
-    lat_prob = torch.exp(-((lat_grid[None, :] - gt_lat[:, None]) ** 2)
-                         / (2 * sigma_lat ** 2))                           # [B, num_lat]
-    if lat_valid is not None:
-        lat_prob = lat_prob * lat_valid.to(lat_prob.dtype)                 # gecersiz rotalari sifirla
-    lat_prob = lat_prob / lat_prob.sum(-1, keepdim=True).clamp_min(1e-9)
-
-    lon_grid = torch.arange(num_lon, device=device).float()                # [num_lon]
-    lon_prob = torch.exp(-((lon_grid[None, :] - gt_lon[:, None]) ** 2)
-                         / (2 * sigma_lon ** 2))                           # [B, num_lon]
-    lon_prob = lon_prob / lon_prob.sum(-1, keepdim=True)
-
-    soft = lat_prob.unsqueeze(2) * lon_prob.unsqueeze(1)                   # [B, num_lat, num_lon]
-    return soft.reshape(B, num_lat * num_lon)                              # [B, 60]
-
-
-def soft_ce_loss(scores, soft_target):
-    """Cross-entropy with a soft target distribution. scores: [B, C] logits."""
-    log_p = nn.functional.log_softmax(scores, dim=-1)
-    return -(soft_target * log_p).sum(-1).mean()
-
-
-def train_epoch(data_loader, gameformer, mode_selector, relevance_graph, optimizer, device,
-                sigma_lat, sigma_lon, num_neighbors, importance_beta, cost_weight, cost_temp):
-    losses, acc1, acc3, acc5 = [], [], [], []
-    lat_a, lon_a, lon_pm1_a = [], [], []
-    mode_selector.train()
-    relevance_graph.train()
-
-    with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
-        for batch in data_epoch:
-            inputs, ego_future, neighbors_future, c_lat_candidates = read_batch(batch, device)
-            gt_mode_idx, _, _ = get_expert_mode_index(ego_future, c_lat_candidates)
-            # Gecerli (padded olmayan) lateral rotalar -> soft target onlara kutle koymasin
-            lat_valid = (c_lat_candidates.abs().sum(dim=(2, 3)) > 1e-4)        # [B, num_lat]
-            soft_target = build_gaussian_soft_target(
-                gt_mode_idx, num_lat=5, num_lon=12,
-                sigma_lat=sigma_lat, sigma_lon=sigma_lon, lat_valid=lat_valid,
-            )
-
-            optimizer.zero_grad()
-            with torch.no_grad():
-                encoder_outputs = gameformer.encoder(inputs)
-                top1_fut, nbr_states, nbr_valid = extract_neighbor_top1_futures(
-                    gameformer, encoder_outputs, num_neighbors=num_neighbors
-                )
-
-            # SceneRelevanceGraph (trainable) -> rafine dugumler + onem dagilimi
-            # Faz 2: komsu tahmini gelecekleri de ver -> prediction-aware (gelecek-bilincli) node'lar
-            graph_out = relevance_graph(encoder_outputs, inputs, num_agents=num_neighbors + 1,
-                                        neighbor_futures=top1_fut, neighbor_states=nbr_states)
-
-            mode_scores, _ = mode_selector(
-                encoder_outputs['encoding'],
-                c_lat_candidates,
-                scene_mask=encoder_outputs['mask'],
-                neighbor_top1_futures=top1_fut,
-                neighbor_current_states=nbr_states,
-                neighbor_valid=nbr_valid,
-                graph_context=graph_out['context'],
-                graph_valid=graph_out['valid'],
-                importance=None,  # BIAS KAPALI: cross-transformer'a importance verilmiyor (readout sadece viz icin)
-            )
-            loss = soft_ce_loss(mode_scores, soft_target)
-            # Faz 3: cost-aware mode sinyali (refinement'in KENDI cost'lari: accel/jerk/speed_target) -> CE'ye EK
-            if cost_weight > 0:
-                mode_cost, mode_valid = compute_mode_costs(c_lat_candidates, inputs['ego_agent_past'])
-                cost_tgt = cost_soft_target(mode_cost, mode_valid, temperature=cost_temp)
-                loss = loss + cost_weight * soft_ce_loss(mode_scores, cost_tgt)
-
-            loss.backward()
-            optimizer.step()
-
-            losses.append(loss.item())
-            acc1.append(topk_correct(mode_scores, gt_mode_idx, 1).float().mean().item())
-            acc3.append(topk_correct(mode_scores, gt_mode_idx, 3).float().mean().item())
-            acc5.append(topk_correct(mode_scores, gt_mode_idx, 5).float().mean().item())
-            la, lo, lpm1 = latlon_acc(mode_scores, gt_mode_idx)
-            lat_a.append(la); lon_a.append(lo); lon_pm1_a.append(lpm1)
-            data_epoch.set_postfix(
-                loss=f"{np.mean(losses):.4f}",
-                top1=f"{np.mean(acc1):.4f}",
-                top3=f"{np.mean(acc3):.4f}",
-                top5=f"{np.mean(acc5):.4f}",
-                lat=f"{np.mean(lat_a):.4f}",
-                lon=f"{np.mean(lon_a):.4f}",
-                lon1=f"{np.mean(lon_pm1_a):.4f}",
-            )
-
-    return (float(np.mean(losses)), float(np.mean(acc1)), float(np.mean(acc3)), float(np.mean(acc5)),
-            float(np.mean(lat_a)), float(np.mean(lon_a)), float(np.mean(lon_pm1_a)))
-
-
-def valid_epoch(data_loader, gameformer, mode_selector, relevance_graph, device,
-                sigma_lat, sigma_lon, num_neighbors, importance_beta, cost_weight, cost_temp):
-    losses, acc1, acc3, acc5 = [], [], [], []
-    lat_a, lon_a, lon_pm1_a = [], [], []
-    mode_selector.eval()
-    relevance_graph.eval()
+def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
+               lambda_kld, lambda_ci, lambda_mask,
+               optimizer=None, desc="Training"):
+    train = optimizer is not None
+    causal.train() if train else causal.eval()
     gameformer.eval()
+    agg = defaultdict(list)
 
-    with tqdm(data_loader, desc="Validation", unit="batch") as data_epoch:
+    with tqdm(data_loader, desc=desc, unit="batch") as data_epoch:
         for batch in data_epoch:
-            inputs, ego_future, neighbors_future, c_lat_candidates = read_batch(batch, device)
-            gt_mode_idx, _, _ = get_expert_mode_index(ego_future, c_lat_candidates)
-            # Gecerli (padded olmayan) lateral rotalar -> soft target onlara kutle koymasin
-            lat_valid = (c_lat_candidates.abs().sum(dim=(2, 3)) > 1e-4)        # [B, num_lat]
-            soft_target = build_gaussian_soft_target(
-                gt_mode_idx, num_lat=5, num_lon=12,
-                sigma_lat=sigma_lat, sigma_lon=sigma_lon, lat_valid=lat_valid,
-            )
+            inputs, ego_future, _, _ = read_batch(batch, device)
 
             with torch.no_grad():
                 encoder_outputs = gameformer.encoder(inputs)
-                top1_fut, nbr_states, nbr_valid = extract_neighbor_top1_futures(
+                top1_fut, nbr_states, _ = extract_neighbor_top1_futures(
                     gameformer, encoder_outputs, num_neighbors=num_neighbors
                 )
-                graph_out = relevance_graph(encoder_outputs, inputs, num_agents=num_neighbors + 1,
-                                            neighbor_futures=top1_fut, neighbor_states=nbr_states)
-                mode_scores, _ = mode_selector(
-                    encoder_outputs['encoding'],
-                    c_lat_candidates,
-                    scene_mask=encoder_outputs['mask'],
-                    neighbor_top1_futures=top1_fut,
-                    neighbor_current_states=nbr_states,
-                    neighbor_valid=nbr_valid,
-                    graph_context=graph_out['context'],
-                    graph_valid=graph_out['valid'],
-                    importance=None,  # BIAS KAPALI: train ile tutarli (egitimde de None veriliyor)
-                )
-                loss = soft_ce_loss(mode_scores, soft_target)
-                if cost_weight > 0:
-                    mode_cost, mode_valid = compute_mode_costs(c_lat_candidates, inputs['ego_agent_past'])
-                    cost_tgt = cost_soft_target(mode_cost, mode_valid, temperature=cost_temp)
-                    loss = loss + cost_weight * soft_ce_loss(mode_scores, cost_tgt)
 
-            losses.append(loss.item())
-            acc1.append(topk_correct(mode_scores, gt_mode_idx, 1).float().mean().item())
-            acc3.append(topk_correct(mode_scores, gt_mode_idx, 3).float().mean().item())
-            acc5.append(topk_correct(mode_scores, gt_mode_idx, 5).float().mean().item())
-            la, lo, lpm1 = latlon_acc(mode_scores, gt_mode_idx)
-            lat_a.append(la); lon_a.append(lo); lon_pm1_a.append(lpm1)
+            with torch.set_grad_enabled(train):
+                out = causal(encoder_outputs, inputs, num_agents=num_neighbors + 1,
+                             neighbor_futures=top1_fut, neighbor_states=nbr_states)
+                loss, metrics = causal_loss_and_metrics(out, ego_future, lambda_kld,
+                                                         lambda_ci, lambda_mask)
+
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(causal.parameters(), 5.0)
+                optimizer.step()
+
+            for key, val in metrics.items():
+                agg[key].append(val)
             data_epoch.set_postfix(
-                loss=f"{np.mean(losses):.4f}",
-                top1=f"{np.mean(acc1):.4f}",
-                top3=f"{np.mean(acc3):.4f}",
-                top5=f"{np.mean(acc5):.4f}",
-                lat=f"{np.mean(lat_a):.4f}",
-                lon=f"{np.mean(lon_a):.4f}",
-                lon1=f"{np.mean(lon_pm1_a):.4f}",
+                loss=f"{np.mean(agg['loss']):.3f}", minADE=f"{np.mean(agg['minADE']):.3f}",
+                casacc=f"{np.mean(agg['casacc']):.3f}", cfdacc=f"{np.mean(agg['cfdacc']):.3f}",
+                peak=f"{np.mean(agg['mcas_peak']):.3f}", cfdpk=f"{np.mean(agg['mcfd_peak']):.3f}",
+                entgap=f"{np.mean(agg['entgap']):.3f}",
+                unif=f"{np.mean(agg['unif']):.3f}",
             )
 
-    return (float(np.mean(losses)), float(np.mean(acc1)), float(np.mean(acc3)), float(np.mean(acc5)),
-            float(np.mean(lat_a)), float(np.mean(lon_a)), float(np.mean(lon_pm1_a)))
+    return {key: float(np.mean(val)) for key, val in agg.items()}
 
 
 def model_training(args):
@@ -274,13 +218,10 @@ def model_training(args):
     gameformer = gameformer.to(args.device)
     freeze_gameformer(gameformer)
 
-    mode_selector = ModeSelector().to(args.device)
-    relevance_graph = SceneRelevanceGraph(layers=args.graph_layers).to(args.device)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes,
+).to(args.device)
 
-    optimizer = optim.AdamW(
-        list(mode_selector.parameters()) + list(relevance_graph.parameters()),
-        lr=args.learning_rate,
-    )
+    optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 12, 14, 16, 18], gamma=0.5)
 
     train_set = DrivingData(args.train_set + "/*.npz", args.num_neighbors)
@@ -291,87 +232,65 @@ def model_training(args):
 
     for epoch in range(args.train_epochs):
         logging.info(f"Epoch {epoch + 1}/{args.train_epochs}")
-        (train_loss, train_top1, train_top3, train_top5,
-         train_lat, train_lon, train_lon_pm1) = train_epoch(
-            train_loader, gameformer, mode_selector, relevance_graph, optimizer, args.device,
-            args.sigma_lat, args.sigma_lon, args.num_neighbors,
-            args.importance_beta, args.cost_weight, args.cost_temp,
-        )
-        (val_loss, val_top1, val_top3, val_top5,
-         val_lat, val_lon, val_lon_pm1) = valid_epoch(
-            valid_loader, gameformer, mode_selector, relevance_graph, args.device,
-            args.sigma_lat, args.sigma_lon, args.num_neighbors, args.importance_beta,
-            args.cost_weight, args.cost_temp,
-        )
+        train_m = _run_epoch(train_loader, gameformer, causal, args.device, args.num_neighbors,
+                             args.lambda_kld, args.lambda_ci, args.lambda_mask,
+                             optimizer=optimizer, desc="Training")
+        val_m = _run_epoch(valid_loader, gameformer, causal, args.device, args.num_neighbors,
+                           args.lambda_kld, args.lambda_ci, args.lambda_mask,
+                           optimizer=None, desc="Validation")
 
-        log = {
-            "epoch": epoch + 1,
-            "train-loss": train_loss,
-            "train-top1": train_top1,
-            "train-top3": train_top3,
-            "train-top5": train_top5,
-            "train-lat": train_lat,
-            "train-lon": train_lon,
-            "train-lon-pm1": train_lon_pm1,
-            "lr": optimizer.param_groups[0]["lr"],
-            "val-loss": val_loss,
-            "val-top1": val_top1,
-            "val-top3": val_top3,
-            "val-top5": val_top5,
-            "val-lat": val_lat,
-            "val-lon": val_lon,
-            "val-lon-pm1": val_lon_pm1,
-        }
+        log = {"epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]}
+        log.update({f"train-{k}": v for k, v in train_m.items()})
+        log.update({f"val-{k}": v for k, v in val_m.items()})
 
         log_file = f"./training_log/{args.name}/train_log.csv"
-        if epoch == 0:
-            with open(log_file, "w", newline="") as csv_file:
-                writer = csv.writer(csv_file)
+        write_header = epoch == 0
+        with open(log_file, "w" if write_header else "a", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            if write_header:
                 writer.writerow(log.keys())
-                writer.writerow(log.values())
-        else:
-            with open(log_file, "a", newline="") as csv_file:
-                writer = csv.writer(csv_file)
-                writer.writerow(log.values())
+            writer.writerow(log.values())
 
         logging.info(
-            f"train: top1={train_top1:.4f} lat={train_lat:.4f} lon={train_lon:.4f} lon±1={train_lon_pm1:.4f} | "
-            f"val: top1={val_top1:.4f} lat={val_lat:.4f} lon={val_lon:.4f} lon±1={val_lon_pm1:.4f}"
+            f"train: minADE={train_m['minADE']:.3f} casacc={train_m['casacc']:.3f} "
+            f"cfdacc={train_m['cfdacc']:.3f} peak={train_m['mcas_peak']:.3f} cfdpk={train_m['mcfd_peak']:.3f} | "
+            f"val: minADE={val_m['minADE']:.3f} casacc={val_m['casacc']:.3f} "
+            f"cfdacc={val_m['cfdacc']:.3f} peak={val_m['mcas_peak']:.3f} cfdpk={val_m['mcfd_peak']:.3f}"
         )
 
         scheduler.step()
 
         torch.save(
-            mode_selector.state_dict(),
-            f"training_log/{args.name}/mode_selector_epoch_{epoch + 1}_valACC_{val_top1:.4f}.pth",
+            causal.state_dict(),
+            f"training_log/{args.name}/causal_epoch_{epoch + 1}_minADE_{val_m['minADE']:.4f}.pth",
         )
-        torch.save(
-            relevance_graph.state_dict(),
-            f"training_log/{args.name}/relevance_graph_epoch_{epoch + 1}_valACC_{val_top1:.4f}.pth",
-        )
-        logging.info(f"Mode selector + relevance graph saved in training_log/{args.name}\n")
+        logging.info(f"CausalPlanner saved in training_log/{args.name}\n")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Training mode selector only")
+    parser = argparse.ArgumentParser(description="Training the ego-centric causal agent graph")
     parser.add_argument("--name", type=str, help='log name (default: "Exp1")', default="Exp1")
     parser.add_argument("--train_set", type=str, help="path to train data")
     parser.add_argument("--valid_set", type=str, help="path to validation data")
     parser.add_argument("--seed", type=int, help="fix random seed", default=3407)
     parser.add_argument("--encoder_layers", type=int, help="number of encoding layers", default=3)
     parser.add_argument("--decoder_levels", type=int, help="levels of reasoning", default=2)
-    parser.add_argument("--num_neighbors", type=int, help="number of neighbor agents to predict", default=10)
+    parser.add_argument("--num_neighbors", type=int, help="number of neighbor agents", default=10)
     parser.add_argument("--train_epochs", type=int, help="epochs of training", default=20)
     parser.add_argument("--batch_size", type=int, help="batch size (default: 32)", default=32)
     parser.add_argument("--learning_rate", type=float, help="learning rate (default: 1e-4)", default=1e-4)
     parser.add_argument("--device", type=str, help="run on which device (default: cuda)", default="cuda")
     parser.add_argument("--pretrained_path", type=str, help="Path to frozen GameFormer model", required=True)
-    parser.add_argument("--sigma_lat", type=float, help="Gaussian soft-target sigma over lat axis", default=0.7)
-    parser.add_argument("--sigma_lon", type=float, help="Gaussian soft-target sigma over lon axis", default=1.0)
-    parser.add_argument("--graph_layers", type=int, help="number of HeteroEdgeGATv2 layers", default=2)
-    parser.add_argument("--importance_beta", type=float, help="strength of importance attention bias", default=2.0)
-    parser.add_argument("--cost_weight", type=float, help="weight of cost-aware mode loss (refinement costs); 0=kapali (varsayilan: sadece Gaussian soft-label CE)", default=0.0)
-    parser.add_argument("--cost_temp", type=float, help="temperature for softmax(-cost) soft target over modes", default=1.0)
+    parser.add_argument("--graph_layers", type=int, help="number of ego-causal disentangler layers", default=3)
+    parser.add_argument("--modes", type=int, help="number of trajectory head modes K", default=6)
+    # Agirliklar Causal-Planner lightning_trainer.py:263-265 ile ayni:
+    #   loss = <traj> + 1.0*decision_loss + 0.5*decision_causal_inference_loss + 0.5*soft_mask_loss
+    parser.add_argument("--lambda_kld", type=float, default=1.0,
+                        help="CP decision_loss: CE(psi_cas, m*) [CP=1.0]")
+    parser.add_argument("--lambda_ci", type=float, default=0.5,
+                        help="CP decision_causal_inference_loss: KL(uniform||p_cfd)+0.1*(-H) [CP=0.5]")
+    parser.add_argument("--lambda_mask", type=float, default=0.5,
+                        help="CP soft_mask_loss: (comp+excl+norm) ajan + harita TOPLAMI [CP=0.5]")
     args = parser.parse_args()
 
     model_training(args)

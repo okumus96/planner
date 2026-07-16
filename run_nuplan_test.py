@@ -148,11 +148,12 @@ def build_simulation(experiment, planner, scenarios, output_dir, simulation_dir,
     return runner_reports
 
 
-def build_nuboard(scenario_builder, simulation_path):
+def build_nuboard(scenario_builder, simulation_path, port_number=5006):
     nuboard = NuBoard(
         nuboard_paths=simulation_path,
         scenario_builder=scenario_builder,
-        vehicle_parameters=get_pacifica_parameters()
+        vehicle_parameters=get_pacifica_parameters(),
+        port_number=port_number,
     )
 
     nuboard.run()
@@ -170,14 +171,35 @@ def main(args):
     aggregator_metric_dir = "aggregator_metric"
 
     # initialize planner
-    planner = Planner(
-        args.model_path,
-        args.device,
-        debug=args.debug,
-        debug_dir=f"{output_dir}/debug_plots",
-        debug_max_plots=args.debug_max_plots,
-        oracle_mode=args.oracle_mode,
-    )
+    if args.causal_path and args.deploy == 'pure':
+        from Planner.causal_planner_pure import CausalPurePlanner
+        planner = CausalPurePlanner(
+            backbone_path=args.model_path, causal_path=args.causal_path,
+            num_neighbors=args.num_neighbors, graph_layers=args.graph_layers,
+            modes=args.modes, device=args.device,
+        )
+        print(f"[PURE CAUSAL] backbone={args.model_path}  causal={args.causal_path}  (refiner YOK)")
+    elif args.causal_path:  # deploy == 'refiner'
+        from Planner.causal_refiner_planner import CausalRefinerPlanner
+        planner = CausalRefinerPlanner(
+            backbone_path=args.model_path, causal_path=args.causal_path,
+            num_neighbors=args.num_neighbors, graph_layers=args.graph_layers,
+            modes=args.modes,
+            use_causal=(not args.baseline), remove=args.remove, remove_k=args.remove_k,
+            plan_source=args.plan_source, device=args.device,
+        )
+        print(f"[CAUSAL+REFINER] causal={args.causal_path}  "
+              f"plan={'GameFormer' if args.baseline else 'CausalPlanner'}  remove={args.remove}x{args.remove_k}  "
+              f"plan_source={args.plan_source}")
+    else:
+        planner = Planner(
+            args.model_path,
+            args.device,
+            debug=args.debug,
+            debug_dir=f"{output_dir}/debug_plots",
+            debug_max_plots=args.debug_max_plots,
+            oracle_mode=args.oracle_mode,
+        )
     if args.oracle_mode:
         print("[M1] ORACLE MODE: ModeSelector bypass, mod uzman gelecekten secilecek.")
 
@@ -305,7 +327,7 @@ def main(args):
     if args.no_nuboard:
         print(f"[no_nuboard] Skipping nuBoard. Results: {output_dir}")
     else:
-        build_nuboard(builder, simulation_file)
+        build_nuboard(builder, simulation_file, port_number=args.nuboard_port)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run NuPlan test')
@@ -314,13 +336,33 @@ if __name__ == "__main__":
     parser.add_argument('--config', type=str, help='path to test scenario filter config YAML (e.g., test14-random.yaml)')
     parser.add_argument('--data_path', type=str, help='path to data')
     parser.add_argument('--map_path', type=str, help='path to nuplan maps')
-    parser.add_argument('--model_path', type=str, help='path to model')
+    parser.add_argument('--model_path', type=str, help='path to model (frozen GameFormer backbone)')
+    parser.add_argument('--causal_path', type=str, default=None,
+                        help='CausalPlanner ckpt -> PURE causal planner (refiner YOK). Verilirse model_path=backbone.')
+    parser.add_argument('--num_neighbors', type=int, default=10)
+    parser.add_argument('--graph_layers', type=int, default=3)
+    parser.add_argument('--modes', type=int, default=6)
+    parser.add_argument('--deploy', type=str, default='refiner', choices=['pure', 'refiner'],
+                        help='causal cikti: pure (refiner yok) | refiner (causal neural_plan -> refiner)')
+    parser.add_argument('--baseline', action='store_true',
+                        help='neural_plan icin CausalPlanner yerine GameFormer kullan (maske-yok baseline).')
+    parser.add_argument('--remove', type=str, default='none', choices=['none', 'high', 'low', 'random', 'cfd_high'],
+                        help='RemoveNonCausal-via-CLS: her frame M_cas gore ajan cikar. '
+                             'high=en causal (CLS dusmeli), low=en az causal (degismemeli), random=kontrol.')
+    parser.add_argument('--plan_source', type=str, default='cas', choices=['cas', 'cfd'],
+                        help="plan hangi dalin f'inden uretilsin: 'cas' (varsayilan, ANA plan) vs "
+                             "'cfd' (confounding graph'tan uret, HICBIR ajan silinmez, remove'dan bagimsiz — "
+                             "'confounding graph gercekten davranis-belirleyici mi?' testi).")
+    parser.add_argument('--remove_k', type=int, default=1, help='kac ajan cikarilacak (high/low top-k). default 1.')
     parser.add_argument('--device', type=str, default='cuda', help='device to run model on')
     parser.add_argument('--debug', action='store_true', help='save per-iteration debug trajectory plots')
     parser.add_argument('--debug_max_plots', type=int, default=200, help='maximum number of debug plots to save')
     parser.add_argument('--oracle_mode', action='store_true',
                         help='M1: bypass ModeSelector, pick mode from expert (log) future — mode-interface upper bound')
     parser.add_argument('--no_nuboard', action='store_true', help='do not launch nuBoard after simulation (batch runs)')
+    parser.add_argument('--nuboard_port', type=int, default=5006,
+                        help='nuBoard http port (default nuplan devkit default 5006) — verilmezse PARALEL '
+                             'kosular hepsi ayni portta cakisir; her koşuya FARKLI port ver')
     parser.add_argument('--scenarios_per_type', type=int, default=10, help='number of scenarios per type')
     parser.add_argument('--total_scenarios', default=None, help='limit total number of scenarios')
     parser.add_argument('--shuffle_scenarios', type=bool, default=False, help='shuffle scenarios')
