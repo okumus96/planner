@@ -23,7 +23,7 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 
 class CausalPurePlanner(AbstractPlanner):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
-                 device=None):
+                 plan_source='cas', device=None):
         self._future_horizon = T
         self._step_interval = DT
         self._backbone_path = backbone_path
@@ -31,11 +31,14 @@ class CausalPurePlanner(AbstractPlanner):
         self._num_neighbors = num_neighbors
         self._graph_layers = graph_layers
         self._modes = modes
+        # 'cas' (varsayilan, ANA plan) vs 'cfd': plani f_cfd'den uretir (refiner YOK, ciplak head).
+        assert plan_source in ('cas', 'cfd')
+        self._plan_source = plan_source
         use_cuda = (device in (None, 'cuda')) and torch.cuda.is_available()
         self._device = torch.device('cuda' if use_cuda else 'cpu')
 
     def name(self) -> str:
-        return "CausalPurePlanner"
+        return f"CausalPurePlanner[plan={self._plan_source}]"
 
     def observation_type(self):
         return DetectionsTracks
@@ -59,9 +62,11 @@ class CausalPurePlanner(AbstractPlanner):
         enc = self._gameformer.encoder(features)
         top1, nbr_states, _ = extract_neighbor_top1_futures(self._gameformer, enc, self._num_neighbors)
         out = self._causal(enc, features, num_agents=self._num_neighbors + 1,
-                           neighbor_futures=top1, neighbor_states=nbr_states)
-        traj = out['traj'][0, 0]                        # [M, 80, 4] (mu_x, mu_y, log_sig_x, log_sig_y)
-        best = int(out['score'][0, 0].argmax().item())
+                           neighbor_futures=top1, neighbor_states=nbr_states,
+                           also_cfd_plan=(self._plan_source == 'cfd'))
+        traj_key, score_key = ('traj_cfd', 'score_cfd') if self._plan_source == 'cfd' else ('traj', 'score')
+        traj = out[traj_key][0, 0]                      # [M, 80, 4] (mu_x, mu_y, log_sig_x, log_sig_y)
+        best = int(out[score_key][0, 0].argmax().item())
         xy = traj[best, :, :2].detach().cpu().numpy()   # [80, 2] ego-frame
         # heading, ardisik xy farkindan (head heading uretmiyor); ilk adim = ikinci adimla ayni
         diffs = np.diff(xy, axis=0)                      # [79, 2]

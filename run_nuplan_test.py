@@ -176,9 +176,10 @@ def main(args):
         planner = CausalPurePlanner(
             backbone_path=args.model_path, causal_path=args.causal_path,
             num_neighbors=args.num_neighbors, graph_layers=args.graph_layers,
-            modes=args.modes, device=args.device,
+            modes=args.modes, plan_source=args.plan_source, device=args.device,
         )
-        print(f"[PURE CAUSAL] backbone={args.model_path}  causal={args.causal_path}  (refiner YOK)")
+        print(f"[PURE CAUSAL] backbone={args.model_path}  causal={args.causal_path}  (refiner YOK)  "
+              f"plan_source={args.plan_source}")
     elif args.causal_path:  # deploy == 'refiner'
         from Planner.causal_refiner_planner import CausalRefinerPlanner
         planner = CausalRefinerPlanner(
