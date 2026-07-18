@@ -10,6 +10,10 @@ from GameFormer.predictor import GameFormer
 from GameFormer.data_utils import create_map_raster, create_ego_raster, create_agents_raster
 from .state_lattice_path_planner import LatticePlanner
 from GameFormer.ar_wrapper import *
+from GameFormer.train_utils import sort_candidates_by_lateral, get_expert_mode_index
+from GameFormer.relevance_graph import (SceneRelevanceGraph, plot_scene_graph, annotate_map_node_ids,
+                                        plot_bev_relevance, build_relevance_record, draw_relevance)
+import pickle
 from Planner.cubic_spline import calc_spline_course
 
 
@@ -20,7 +24,8 @@ from nuplan.planning.simulation.observation.idm.utils import path_to_linestring
 
 
 class Planner(AbstractPlanner):
-    def __init__(self, model_path, device=None, debug=False, debug_dir=None, debug_max_plots=50):
+    def __init__(self, model_path, device=None, debug=False, debug_dir=None, debug_max_plots=50,
+                 oracle_mode=False):
         self._max_path_length = MAX_LEN # [m]
         self._future_horizon = T # [s] 
         self._step_interval = DT # [s]
@@ -32,6 +37,19 @@ class Planner(AbstractPlanner):
         self._debug_max_plots = debug_max_plots
         self._debug_plot_count = 0
         self._debug_candidates_plot_count = 0
+        # SceneRelevanceGraph hard top-k secimi (None = soft bias). Inference'ta None disinda
+        # bir k verilirse en onemli k dugum disindakiler maskelenir.
+        self._graph_hard_topk = None
+        self._prev_importance = None  # son adimin grafik onem ciktisi (viz icin)
+        # Debug onem gorsellestirme: NORMALIZE onem (imp/max) bu esigin ustundekiler vurgulanir.
+        self._relevance_threshold = 0.65
+        self._relevance_records = []  # senaryo boyunca per-adim onem verisi (--debug ile kaydedilir)
+
+        # M1 ORACLE MODU: ModeSelector skorlarini BYPASS et, modu uzman (log) gelecekten sec.
+        # "Mod arayuzu, secim mukemmel olsa yeterli bilgi tasiyor mu?" sorusunu olcer.
+        # _oracle_scenario, run_nuplan_test.py'de her senaryo basinda set edilir.
+        self._oracle_mode = oracle_mode
+        self._oracle_scenario = None
 
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -68,6 +86,7 @@ class Planner(AbstractPlanner):
         # Her yeni senaryoda sayaçları sıfırla ki "--debug_max_plots 200" limiti HER senaryo için baştan başlasın
         self._debug_plot_count = 0
         self._debug_candidates_plot_count = 0
+        self._relevance_records = []  # yeni senaryo -> onem kaydini sifirla
 
     def _initialize_model(self):
         # 1. OMURGA (BACKBONE): Orijinal eğitilmiş GameFormer'ı yükle ve dondur
@@ -85,7 +104,21 @@ class Planner(AbstractPlanner):
         self.planner_head.load_state_dict(torch.load(self._model_path, map_location=self._device))
         self.planner_head.to(self._device)
         self.planner_head.eval()
-        
+
+        # 3. SAHNE ONEM GRAFIGI (opsiyonel): mode_selector ile birlikte egitildiyse, ayni
+        # klasordeki 'relevance_graph_*.pth' checkpoint'i otomatik yuklenir. Bulunamazsa
+        # mode_selector grafiksiz calisir (eski davranis).
+        self.relevance_graph = None
+        graph_path = self._model_path.replace("mode_selector", "relevance_graph")
+        if graph_path != self._model_path and os.path.exists(graph_path):
+            self.relevance_graph = SceneRelevanceGraph()
+            self.relevance_graph.load_state_dict(torch.load(graph_path, map_location=self._device))
+            self.relevance_graph.to(self._device)
+            self.relevance_graph.eval()
+            print(f"[Planner] SceneRelevanceGraph yuklendi: {graph_path}")
+        else:
+            print("[Planner] SceneRelevanceGraph checkpoint bulunamadi; mode_selector grafiksiz calisacak.")
+
     def _initialize_route_plan(self, route_roadblock_ids):
         self._route_roadblocks = []
 
@@ -718,7 +751,11 @@ class Planner(AbstractPlanner):
             return np.column_stack([rx, ry, ryaw, rk, v_max, occupancy]).astype(np.float32)
         
         # 5. HIZ VE IŞIK ENJEKSİYONU
-        max_speed = annotate_speed(ref_path_4d, chosen_speed_mps)
+        # Egrilik-tabanli (fizik) hiz profili: donus-sonrasi duz kesimde hiz geri toplanir
+        # -> ego_progress_along_expert_route ve ego_is_making_progress metriklerini iyilestirir.
+        # (Eski kor '3 m/s sabitle' davranisi annotate_speed'de duruyor; model-feature yollari
+        #  satir 172/240 hala onu kullaniyor, sadece SURULEN trajektori burada degisti.)
+        max_speed = annotate_speed_curvature(ref_path_4d, chosen_speed_mps)
         occupancy = np.zeros(shape=(ref_path_4d.shape[0], 1))
         
         for data in traffic_light_data:
@@ -818,6 +855,25 @@ class Planner(AbstractPlanner):
         plt.close(fig)
         self._debug_plot_count += 1
 
+    def _record_relevance(self, features, iteration=0, lat_idx=None, lon_idx=None):
+        """--debug: o adimin GAT onem verisini kompakt numpy record olarak biriktir ve
+        senaryo klasorune relevance_data.pkl olarak yaz. render_relevance_video.py bundan
+        senaryo videosu uretir. (Goruntu degil VERI kaydedilir.)"""
+        graph_out = getattr(self, '_prev_importance', None)
+        if (graph_out is None) or ('importance' not in graph_out):
+            return
+        rec = build_relevance_record(
+            features, graph_out,
+            extra={'iteration': int(iteration),
+                   'lat_idx': None if lat_idx is None else int(lat_idx),
+                   'lon_idx': None if lon_idx is None else int(lon_idx)},
+        )
+        self._relevance_records.append(rec)
+        out_dir = getattr(self, '_current_scenario_dir', self._debug_dir or "testing_log/debug_plots")
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, 'relevance_data.pkl'), 'wb') as f:
+            pickle.dump({'threshold': self._relevance_threshold, 'records': self._relevance_records}, f)
+
     def _save_candidates_debug_plot(self, features, candidates, best_idx=None, iteration=0,
                                      top3=None, num_lon=12):
         """
@@ -836,6 +892,9 @@ class Planner(AbstractPlanner):
         out_dir = os.path.join(out_dir, "candidates")
         os.makedirs(out_dir, exist_ok=True)
 
+        # Tek panel BEV; GAT onemi (esigi gecenler) dogrudan bu haritanin uzerine bindirilir
+        graph_out = getattr(self, '_prev_importance', None)
+        has_graph = (graph_out is not None) and ('importance' in graph_out)
         fig = plt.figure(figsize=(9, 9))
         ax = fig.add_subplot(111)
 
@@ -981,11 +1040,45 @@ class Planner(AbstractPlanner):
 
         ax.legend(handles=legend_handles, loc='best', fontsize=8)
 
+        # --- ONEM OVERLAY: normalize onemi esigi gecen eleman/ajanlar bu BEV uzerinde vurgulanir ---
+        if has_graph:
+            rec = build_relevance_record(features, graph_out)
+            n_pass = draw_relevance(ax, rec, threshold=self._relevance_threshold, draw_base=False)
+            ax.set_title(ax.get_title() + f'  | onem>={self._relevance_threshold:.2f}: {n_pass} eleman (kirmizi)')
+
         file_name = os.path.join(out_dir, f'debug_candidates_iter_{iteration:04d}.png')
         fig.savefig(file_name, dpi=120, bbox_inches='tight')
         plt.close(fig)
         self._debug_candidates_plot_count += 1
    
+    def _oracle_mode_index(self, ego_state, c_lat_candidates, iteration):
+        """M1: Uzman (log) gelecek yorungesinden GT modunu hesapla — egitimle AYNI
+        get_expert_mode_index mantigi. ModeSelector tamamen bypass edilir.
+
+        Not: closed-loop'ta ego logdan saptikca 'log gelecegi' yaklasik bir oracle olur;
+        open-loop / nonreactive icin birebir dogrudur.
+        Doner: (lat_idx, lon_idx)."""
+        it = 0 if iteration is None else int(iteration)
+        n = self._N_points
+        states = list(self._oracle_scenario.get_ego_future_trajectory(it, self._future_horizon, n))
+        if len(states) == 0:
+            return 0, 0
+        pts = np.array([[s.rear_axle.x, s.rear_axle.y] for s in states], dtype=np.float64)  # global
+        # Mevcut ego pozuna gore ego-frame'e cevir (egitim verisiyle ayni cerceve)
+        ex, ey, eh = ego_state.rear_axle.x, ego_state.rear_axle.y, ego_state.rear_axle.heading
+        rel = pts - np.array([ex, ey])
+        c, s = np.cos(eh), np.sin(eh)
+        ego_future_np = np.stack([rel[:, 0] * c + rel[:, 1] * s,
+                                  -rel[:, 0] * s + rel[:, 1] * c], axis=-1)                 # [n,2]
+        if len(ego_future_np) < n:  # senaryo sonuna yakin: son nokta ile doldur
+            pad = np.repeat(ego_future_np[-1:], n - len(ego_future_np), axis=0)
+            ego_future_np = np.concatenate([ego_future_np, pad], axis=0)
+
+        ego_future = torch.tensor(ego_future_np, dtype=torch.float32).unsqueeze(0)          # [1,80,2]
+        c_lat_t = torch.tensor(c_lat_candidates, dtype=torch.float32).unsqueeze(0)          # [1,5,T,6]
+        _, lat_idx, lon_idx = get_expert_mode_index(ego_future, c_lat_t)
+        return int(lat_idx.item()), int(lon_idx.item())
+
     def _plan(self, ego_state, history, traffic_light_data, observation, iteration=None):
         # Construct input features
         features = observation_adapter(history, traffic_light_data, self._map_api, self._route_roadblock_ids, self._device)
@@ -995,6 +1088,12 @@ class Planner(AbstractPlanner):
             ego_state,
             traffic_light_data,
             points_per_route=MAX_LEN * 10,
+        )
+        # Adaylari uzamsal sol->sag sirala (ordinal + frame'ler arasi kararli indeks).
+        # Egitimdeki DrivingData ile AYNI helper -> train/inference tutarli; lat_idx artik
+        # kararli bir fiziksel serite karsilik gelir (jitter + indeks-cache riski azalir).
+        c_lat_candidates, c_lat_candidates_global = sort_candidates_by_lateral(
+            c_lat_candidates, c_lat_candidates_global
         )
         #print(c_lat_candidates.shape)  # (N, Seq_Len, 6)
         #features['c_lat_candidates'] = torch.tensor(c_lat_candidates, dtype=torch.float32, device=self._device).unsqueeze(0)
@@ -1023,7 +1122,11 @@ class Planner(AbstractPlanner):
         )
 
         if c_lat_candidates is not None:
-            if run_selector:
+            if self._oracle_mode and (self._oracle_scenario is not None):
+                # M1 ORACLE: secimi uzman gelecekten al; selector hic calismaz.
+                lat_idx, lon_idx = self._oracle_mode_index(ego_state, c_lat_candidates, iteration)
+                self._prev_lat_idx, self._prev_lon_idx = lat_idx, lon_idx
+            elif run_selector:
                 with torch.no_grad():
                     encoder_outputs = self.backbone.encoder(features)
 
@@ -1040,6 +1143,19 @@ class Planner(AbstractPlanner):
                     nbr_states = encoder_outputs['actors'][:, 1:1 + N_NBR, -1]                # [B, N, 5]
                     nbr_valid = ~encoder_outputs['mask'][:, 1:1 + N_NBR]                      # [B, N]
 
+                    # SceneRelevanceGraph (varsa): rafine dugumler + onem dagilimini hesapla
+                    graph_kwargs = {}
+                    if self.relevance_graph is not None:
+                        graph_out = self.relevance_graph(encoder_outputs, features, num_agents=N_NBR + 1,
+                                                         return_attention=True,
+                                                         neighbor_futures=top1_fut, neighbor_states=nbr_states)
+                        graph_kwargs = dict(
+                            graph_context=graph_out['context'],
+                            graph_valid=graph_out['valid'],
+                            importance=None,  # BIAS KAPALI: cross-transformer'a importance verilmiyor
+                        )
+                        self._prev_importance = graph_out  # viz icin sakla
+
                     # c_lat_candidates: (N_lat, N_r, 6) -> [B, N_lat, N_r, feat]
                     c_lat_tensor = torch.tensor(c_lat_candidates, dtype=torch.float32, device=self._device).unsqueeze(0)
                     mode_scores, _ = self.planner_head(
@@ -1049,6 +1165,7 @@ class Planner(AbstractPlanner):
                         neighbor_top1_futures=top1_fut,
                         neighbor_current_states=nbr_states,
                         neighbor_valid=nbr_valid,
+                        **graph_kwargs,
                     )
                     # Top-3 modlari yakala (viz icin) — rank 0 = secilen
                     top3_scores, top3_idx = mode_scores.topk(3, dim=1)
@@ -1123,6 +1240,9 @@ class Planner(AbstractPlanner):
                 final_path=final_plan,
                 iteration=0 if iteration is None else iteration,
             )
+            # Per-adim onem verisini diske biriktir -> sonra render_relevance_video.py ile video
+            self._record_relevance(features, iteration=0 if iteration is None else iteration,
+                                   lat_idx=lat_idx, lon_idx=lon_idx)
 
         # Çıktıları numpy'a çevir (Eski kodlar)
         

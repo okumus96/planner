@@ -103,6 +103,31 @@ def annotate_speed(ref_path, speed_limit):
     return speed[:, None]
 
 
+def annotate_speed_curvature(ref_path, speed_limit, a_lat_max=2.5, a_lon_decel=2.0, v_min=3.0):
+    """
+    Egrilik-tabanli (fizik) hiz profili. Eski annotate_speed'in 'ilk donus noktasindan
+    sonuna kadar 3 m/s sabitle' davranisinin yerine her noktada izin verilen hizi
+    yanal-ivme limitinden hesaplar:  v <= sqrt(a_lat_max / |k|).
+      - Duz kesimde speed_limit'e kadar serbest -> donus bitince hiz GERI TOPLANIR (progress kazanci)
+      - Donuse girmeden once geriye-tarama ile yumusak yavaslama -> konfor/TTC/lat-accel korunur
+      - v_min: cok sik donuste bile minimum ilerleme garantisi (eski 3 m/s tabani)
+    """
+    xy = ref_path[:, :2]
+    k = np.abs(ref_path[:, 3])
+    seg = np.hypot(*np.diff(xy, axis=0).T)                 # segment uzunluklari [n-1]
+
+    # 1) Noktasal egrilik (yanal ivme) limiti
+    v = np.sqrt(a_lat_max / np.clip(k, 1e-3, None))
+    v = np.clip(v, v_min, speed_limit)
+
+    # 2) Donuse onceden hazirlanma: geriye dogru tarayip boyuna yavaslama limitini uygula
+    #    v[i]^2 <= v[i+1]^2 + 2*a_decel*ds  (konforlu fren ile donuse girer)
+    for i in range(len(v) - 2, -1, -1):
+        v[i] = min(v[i], np.sqrt(v[i + 1] ** 2 + 2 * a_lon_decel * seg[i]))
+
+    return v[:, None]
+
+
 def wrap_to_pi(theta):
     return (theta+np.pi) % (2*np.pi) - np.pi
 

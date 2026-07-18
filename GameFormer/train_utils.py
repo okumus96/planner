@@ -23,6 +23,37 @@ def set_seed(CUR_SEED):
     torch.backends.cudnn.benchmark = False
 
 
+def sort_candidates_by_lateral(c_lat_ego, c_lat_global=None):
+    """Aday lateral rotalari UZAMSAL sol->sag sirala (ordinal + frame'ler arasi kararli).
+
+    Adaylar ego-frame'de uretilir: feature[...,0]=ileri (rel_x), [...,1]=yanal (rel_y).
+    Her rotanin gecerli noktalarinin ortalama yanal offset'i (rel_y) anahtardir:
+    buyuk +y = sol, kucuk/-y = sag. AZALAN rel_y -> sol->sag siralama. Boylece indeks
+    BFS/ego-mesafesi yerine GEOMETRIYE baglanir; hem ordinal olur (Gaussian lat label
+    artik anlamli) hem de frame'ler arasi KARARLI olur (ayni fiziksel serit ~ ayni indeks
+    -> jitter ve indeks-cache riski azalir).
+
+    Padded (tamamen sifir) rotalar SONA atilir. c_lat_global verilirse AYNI permutasyon
+    uygulanir (planlamada kullanilan global rota ile skorlanan ego rota ayni indekste kalsin).
+
+    c_lat_ego:    np.ndarray [N_lat, T, F]   (ego-frame adaylar)
+    c_lat_global: np.ndarray [N_lat, T, F]   (opsiyonel; global-frame karsiliklari)
+    Doner: c_lat_global None ise ego_sirali; degilse (ego_sirali, global_sirali).
+    """
+    point_valid = np.abs(c_lat_ego).sum(axis=-1) > 1e-4              # [N, T]
+    route_valid = point_valid.any(axis=-1)                           # [N]
+    cnt = point_valid.sum(axis=-1).clip(min=1)                       # [N]
+    lat_off = (c_lat_ego[..., 1] * point_valid).sum(axis=-1) / cnt   # [N] ortalama yanal offset
+    # Azalan rel_y icin negatif anahtar; padded rotalar +inf ile sona
+    key = np.where(route_valid, -lat_off, np.inf)
+    order = np.argsort(key, kind='stable')                          # esitlikte orijinal sira korunur
+
+    ego_sorted = c_lat_ego[order]
+    if c_lat_global is None:
+        return ego_sorted
+    return ego_sorted, c_lat_global[order]
+
+
 class DrivingData(Dataset):
     def __init__(self, data_dir, n_neighbors):
         self.data_list = glob.glob(data_dir)
@@ -35,13 +66,21 @@ class DrivingData(Dataset):
         data = np.load(self.data_list[idx])
         ego = data['ego_agent_past']
         neighbors = data['neighbor_agents_past']
-        route_lanes = data['route_lanes'] 
+        route_lanes = data['route_lanes']
         map_lanes = data['lanes']
         map_crosswalks = data['crosswalks']
         ego_future_gt = data['ego_agent_future']
         neighbors_future_gt = data['neighbor_agents_future'][:self._n_neighbors]
         c_lat_candidates = data['c_lat_candidates']
         c_lat_candidates_global = data['c_lat_candidates_global'] if 'c_lat_candidates_global' in data else data['c_lat_candidates']
+
+        # Adaylari uzamsal sol->sag sirala (ordinal + kararli indeks). Etiket
+        # (get_expert_mode_index) geometri-argmin tabanli oldugundan bu re-sort'tan
+        # bagimsiz dogru kalir; sadece indeks numarasi degisir. plannerv2 inference'ta
+        # AYNI helper'i kullanir -> train/inference tutarli.
+        c_lat_candidates, c_lat_candidates_global = sort_candidates_by_lateral(
+            c_lat_candidates, c_lat_candidates_global
+        )
 
         return ego, neighbors, map_lanes, map_crosswalks, route_lanes, ego_future_gt, neighbors_future_gt, c_lat_candidates, c_lat_candidates_global
 

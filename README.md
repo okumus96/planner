@@ -89,3 +89,29 @@ If you find this repository useful for your research, please consider giving us 
     pages     = {3903-3913}
 }
 ```
+## NOTES
+
+1. Difference between Hard CE and soft gaussian label for mode selector. Cunku lon, lat binleri arasinda cok bir fark var ve bunu ogrenmesi cok zor. Ondan dolayi
+2. Normal gameformer is smooth trajectory uretmiyor. 
+3. Mode selector un kendisi ise hesitant bir sag bir sol serit seciyor nedense?
+
+
+Kendime Notlar. 2 temmuzda dondugunde korkma cekinme diye (iyisin durumun iyi) DO  NOT WORRY. 
+
+Oncelikle mode_selector tam anlamiyla calismiyor kirilgan bundan dolayi onu degistirmen gerekebilir. 
+Bunu RL, IRL, IL e cevirirsen bu sefer explainability kaybedebilirsin. 
+
+
+3 tane paper buldun recently, iki tanesi causal graph bulmak ile alakali bunu kullanarak kendi grafini gelistirebilirsin. 
+
+Digeri aslinda direkt sen ne yapiyorsan aynisi aslinda ama cok daha basit bi settings de nuplan falan kullanmiyor. 
+
+Son olark bu paperlar adverserial yontemler kullaniyor. GAIL, AIL, AIRL etc. Bunlarda bi secenek olabilir en azindan multi agent seetings de kullanilabilir.
+
+Son yaptigin plan /home/lt-hta-ai4/.claude/plans/i-want-to-have-sharded-stroustrup.md buna bakabilirsin. 
+
+Mo ya onerebilcegin bi idean var. Aslinda onun odd perspectifine kendi plannerini gotur. Mesela  nuscnee de modelle o hatayi, ben de onu nuplanda kullanayim ve bu dusus benim kritik agentlarim icin onemli mi? Eger oyle ise aktion al, eger oyle degilse keep continue... (Ama tabi causal graf daki ler benim icin onemli mi onu mu veriyor?) 
+
+Son olarak IRL vs kullanarak kendimize ekstra olarak rulelari vs tanimlayabiliriz. Bunu kullanarak sonrasinda da formal olarak verfiye edebiliriz degil mi? Buda ayri bi nokta...
+
+mode selector da problem var bunu nasil cozebiliriz? 

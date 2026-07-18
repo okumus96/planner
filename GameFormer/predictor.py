@@ -47,6 +47,7 @@ class Encoder(nn.Module):
         encoder_outputs = {
             'actors': actors,
             'encoding': encoding,
+            'agent_tokens': encoded_actors,  # FUSION ONCESI temiz per-ajan gommeleri (SceneRelevanceGraph node'lari icin)
             'mask': mask,
             'route_lanes': inputs['route_lanes'],
             'map_lanes': inputs['map_lanes'] # add this to get map data in physic based encocer
