@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from GameFormer.predictor import GameFormer
 from GameFormer.causal_graph import CausalPlanner
-from GameFormer.train_utils import DrivingData, imitation_loss, initLogging, set_seed
+from GameFormer.train_utils import DrivingData, initLogging, set_seed
 
 
 def extract_neighbor_top1_futures(gameformer, encoder_outputs, num_neighbors):
@@ -57,6 +57,166 @@ def freeze_gameformer(gameformer):
         parameter.requires_grad = False
 
 
+def traj_reg_loss(traj, scores, gt):
+    """CP-tarzi DETERMINISTIK trajectory loss: (x, y, cos, sin) uzerinde WTA smooth-L1.
+
+    traj:   [B, N, M, 80, 4] = (x, y, cos_h, sin_h)   (CausalEgoHead ciktisi)
+    scores: [B, N, M]
+    gt:     [B, N, 80, 3]    = (x, y, heading)
+    Eski GMM-NLL (mu, log_sig) YERINE: heading artik BIRINCIL cikti (cos/sin), 4 kanal birden
+    smooth-L1 ile denetlenir -> inference'ta sonlu-fark heading hack'i gerekmez. Mod secimi
+    (WTA) hala xy-ADE uzerinden. Doner (loss, best_mode) -- best_mode [B, N]."""
+    B, N = traj.shape[0], traj.shape[1]
+    dist = torch.norm(traj[..., :2] - gt[:, :, None, :, :2], dim=-1)         # [B, N, M, 80]
+    best_mode = torch.argmin(dist.mean(-1), dim=-1)                          # [B, N]
+    best_traj = traj[torch.arange(B)[:, None, None], torch.arange(N)[None, :, None],
+                     best_mode[:, :, None]].squeeze(2)                       # [B, N, 80, 4]
+
+    gt_h = gt[..., 2]
+    gt_4 = torch.cat([gt[..., :2],
+                      torch.stack([gt_h.cos(), gt_h.sin()], dim=-1)], dim=-1)  # [B, N, 80, 4]
+    reg_loss = F.smooth_l1_loss(best_traj, gt_4)
+
+    score_loss = F.cross_entropy(scores.permute(0, 2, 1), best_mode,
+                                 label_smoothing=0.2, reduction='none')        # [B, N]
+    score_loss = (score_loss * torch.ne(gt[:, :, 0, 0], 0)).mean()
+
+    return reg_loss + score_loss, best_mode
+
+
+# --- CP-tarzi 5-sinif manevra etiketi (get_decision.py port, SHAPELY YOK; length = segment normlari) ---
+# GT gelecek yorungesinin GEOMETRISINDEN uretilir (yay uzunlugu + max egrilik + isaret + heading farki).
+# psi'nin STABIL/anlamli hedefi -> m* (WTA kazanan mod, ogrenilemez) YERINE. Bedava (GT'den), etiket YOK.
+_MANEUVER = {'stationary': 0, 'straight': 1, 'turning_left': 2, 'turning_right': 3, 'U-turn_left': 4}
+NUM_MANEUVERS = 5
+
+
+def _resample_arc(xy, n):
+    """xy [M,2] -> yay-uzunlugu boyunca uniform n nokta (get_decision.resample_line ile ayni, np.interp)."""
+    seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    if cum[-1] < 1e-6:
+        return np.repeat(xy[:1], n, axis=0)
+    cum = cum / cum[-1]
+    t = np.linspace(0.0, 1.0, n)
+    return np.stack([np.interp(t, cum, xy[:, 0]), np.interp(t, cum, xy[:, 1])], axis=1)
+
+
+def _maneuver_one(xy, yaw):
+    """xy [M,2], yaw [M] (GT ego gelecek, ego-frame) -> 0..4 manevra sinifi (get_decision.py'a sadik).
+    Esikler: straight=0.03, turning=0.18 egrilik; heading-farki 0.2; yay-uzunlugu 3m (altinda stationary)."""
+    valid = ~np.all(xy == 0, axis=1)
+    xy, yaw = xy[valid], yaw[valid]
+    if len(xy) < 2:
+        return _MANEUVER['stationary']
+    length = float(np.linalg.norm(np.diff(xy, axis=0), axis=1).sum())
+    if length < 3.0:
+        return _MANEUVER['stationary']
+    pts = _resample_arc(xy, int(length))                     # ~1m aralik -> dusuk-hiz egrilik gurultusunu keser
+    tan = np.diff(pts, axis=0)
+    tan = tan / np.clip(np.linalg.norm(tan, axis=1, keepdims=True), 1e-8, None)
+    ang = np.arccos(np.clip((tan[:-1] * tan[1:]).sum(1), -1.0, 1.0))
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    curv = ang / np.clip(seg[:-1], 1e-8, None)
+    sign = np.sign(np.cross(tan[:-1], tan[1:]))
+    i = int(np.argmax(curv))
+    c = round(float(curv[i]), 2)
+    s = float(sign[i])
+    diff = round(float(abs(yaw[0] - yaw[-1])), 2)
+    # identifiy() ile ayni siniflandirma
+    turning = (0.03 < c < 0.18 and diff > 0.2) or (0.1 < c < 0.18)
+    uturn = c >= 0.18
+    if turning or uturn:
+        if s == 1.0:
+            ctx = 'U-turn_left' if uturn else 'turning_left'
+        elif s == -1.0:
+            ctx = 'turning_right'          # get_decision: sag U-turn -> turning'e dusurulur -> turning_right
+        else:
+            ctx = 'straight'               # isaretsiz (nadir) -> yon yok
+    else:
+        ctx = 'straight'
+    return _MANEUVER[ctx]
+
+
+def maneuver_labels(ego_future):
+    """ego_future [B,80,3] (x,y,heading) -> LongTensor [B] manevra etiketi (0..4), ayni cihazda."""
+    ef = ego_future.detach().cpu().numpy()
+    labs = [_maneuver_one(ef[b, :, :2], ef[b, :, 2]) for b in range(ef.shape[0])]
+    return torch.tensor(labs, dtype=torch.long, device=ego_future.device)
+
+
+# --- StatePerturbation POC (kapalı-döngü drift toparlama augmentation'ı) ---
+# Ego-frame sahneyi (gecmis + komsular + harita + GT gelecek) rastgele SE(2) ile kaydirir, ama ego'nun
+# ANLIK adimini planlama origin'inde (0,0,heading 0) SABIT tutar -> ego "yoldan sapmis" gorunur, hedef
+# (kaydirilmis GT gelecek) "geri don" der. Frozen encoder + egitilen head toparlamayi ogrenir.
+# SADECE girdi/target'a dokunur: disentangler, psi, manevra etiketi (SE(2)-degismez) etkilenmez.
+def _rot_trans(t, cos, sin, tx, ty, dtheta, has_vel):
+    """t [B, *mid, C] -> per-ornek SE(2): kanal(0,1)=xy rot+trans, (2)=heading +dtheta,
+    (3,4)=vx,vy rot (has_vel). Sadece GECERLI satir (abs-sum>eps); padding (0) DEGISMEZ."""
+    B, C = t.shape[0], t.shape[-1]
+    view = (B,) + (1,) * (t.dim() - 2)
+    co, si = cos.view(view), sin.view(view)
+    TX, TY, DT = tx.view(view), ty.view(view), dtheta.view(view)
+    out = t.clone()
+    valid = t.abs().sum(-1) > 1e-6                                   # [B, *mid]
+    x, y = t[..., 0], t[..., 1]
+    out[..., 0] = torch.where(valid, co * x - si * y + TX, x)
+    out[..., 1] = torch.where(valid, si * x + co * y + TY, y)
+    if C > 2:
+        h = t[..., 2]
+        hr = torch.atan2(torch.sin(h + DT), torch.cos(h + DT))
+        out[..., 2] = torch.where(valid, hr, h)
+    if has_vel and C > 4:
+        vx, vy = t[..., 3], t[..., 4]
+        out[..., 3] = torch.where(valid, co * vx - si * vy, vx)
+        out[..., 4] = torch.where(valid, si * vx + co * vy, vy)
+    return out
+
+
+def perturb_batch(inputs, ego_future, prob=0.5, max_lat=0.75, max_lon=1.0, max_yaw=0.35,
+                  max_dvel=1.0, collision_thresh=2.5):
+    """FULL StatePerturbation (CP augment()'ina sadik). Per-ornek olasilik `prob` ile ego-frame sahneyi
+    (+ GT gelecek) ayni SE(2) ile saptirir, ego anlik adimini origin'de sabitler. POC'a eklenenler:
+      - COLLISION-SAFETY: transform sonrasi ego-origin bir komsu ile cakisirsa (< collision_thresh m) o
+        ornekte perturbation IPTAL edilir -> carpisma-icine-toparlama ogretilmez.
+      - HIZ PERTURBATION: ego anlik forward hizi (vx) ±max_dvel saptirilir (clamp>=0) -> hiz-toparlama.
+    Doner (inputs, ego_future)."""
+    ep = inputs["ego_agent_past"]
+    B, dev = ep.shape[0], ep.device
+    do = (torch.rand(B, device=dev) < prob).float()
+    dtheta = (torch.rand(B, device=dev) * 2 - 1) * max_yaw * do
+    tx = (torch.rand(B, device=dev) * 2 - 1) * max_lon * do          # boylamsal (x)
+    ty = (torch.rand(B, device=dev) * 2 - 1) * max_lat * do          # yanal (y)
+    dvel = (torch.rand(B, device=dev) * 2 - 1) * max_dvel * do       # forward hiz sapmasi
+
+    # --- collision-safety: niyet edilen delta ile komsu ANLIK merkezlerini transform et; ego-origin'e
+    #     collision_thresh'ten yakin bir gecerli komsu varsa o ornekte perturbation'i sifirla (identity).
+    c0, s0 = torch.cos(dtheta).view(B, 1), torch.sin(dtheta).view(B, 1)
+    nb = inputs["neighbor_agents_past"][:, :, -1, :]                 # [B, N, C] son adim
+    nvalid = nb.abs().sum(-1) > 1e-6
+    nx, ny = nb[..., 0], nb[..., 1]
+    nxr = c0 * nx - s0 * ny + tx.view(B, 1)
+    nyr = s0 * nx + c0 * ny + ty.view(B, 1)
+    ndist = torch.sqrt(nxr * nxr + nyr * nyr + 1e-9)
+    unsafe = ((ndist < collision_thresh) & nvalid).any(-1)          # [B]
+    safe = (~unsafe).float()
+    dtheta, tx, ty, dvel = dtheta * safe, tx * safe, ty * safe, dvel * safe
+    cos, sin = torch.cos(dtheta), torch.sin(dtheta)
+
+    # --- SE(2): sahne (gecmis + komsu + harita) + GT gelecek AYNI transform ---
+    inputs["ego_agent_past"] = _rot_trans(ep, cos, sin, tx, ty, dtheta, has_vel=True)
+    inputs["neighbor_agents_past"] = _rot_trans(inputs["neighbor_agents_past"], cos, sin, tx, ty, dtheta, has_vel=True)
+    inputs["map_lanes"] = _rot_trans(inputs["map_lanes"], cos, sin, tx, ty, dtheta, has_vel=False)
+    inputs["map_crosswalks"] = _rot_trans(inputs["map_crosswalks"], cos, sin, tx, ty, dtheta, has_vel=False)
+    inputs["route_lanes"] = _rot_trans(inputs["route_lanes"], cos, sin, tx, ty, dtheta, has_vel=False)
+    ego_future = _rot_trans(ego_future, cos, sin, tx, ty, dtheta, has_vel=False)
+
+    # ego ANLIK adim -> planlama origin'i (pos=0, heading=0); forward hiz (vx) dvel ile saptirilir (>=0).
+    inputs["ego_agent_past"][:, -1, 0:3] = 0.0
+    inputs["ego_agent_past"][:, -1, 3] = (inputs["ego_agent_past"][:, -1, 3] + dvel).clamp(min=0.0)
+    return inputs, ego_future
+
+
 def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask):
     """Causal-Planner'a SADIK loss (ref: ~/Causal-Planner lightning_trainer.py). Backdoor/GRL YOK.
 
@@ -65,8 +225,8 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
              + 0.5 * decision_causal_inference_loss
              + 0.5 * soft_mask_loss
     Bizdeki karsiliklari (scenario_loss PLUTO'ya ozel, bizde yok):
-        L_TRAJ                  <- CP: agent_reg_loss + agent_cls_loss (bizde GMM WTA)
-        lambda_kld  * L_KLD     <- CP: decision_loss = CE(decision_causal, m*)          [1.0]
+        L_TRAJ                  <- CP: agent_reg_loss + agent_cls_loss (bizde 4-kanal WTA smooth-L1: x,y,cos,sin)
+        lambda_kld  * L_KLD     <- CP: decision_loss = CE(decision_causal, 5-sinif manevra)  [1.0]
         lambda_ci   * L_CI      <- CP: KL(uniform||p_cfd) + 0.1*(-H)                    [0.5]
         lambda_mask * L_MASK    <- CP: (comp+excl+norm)_other + (comp+excl+norm)_g2a    [0.5]
 
@@ -76,13 +236,13 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
       - ajan+harita TOPLANIYOR (onceden 0.5x ortalama) -> adv ~0.87 yerine ~1.6 (CP ile ayni olcek)
       - confound dali icin KL ana terim, entropy 0.1 agirlikli yardimci (onceden entropy tek basinaydi)
     Doner (loss, metrics_dict)."""
-    gt = ego_future[:, None]                                       # [B, 1, 80, 3]
-    l_traj, _, best_mode = imitation_loss(out['traj'], out['score'], gt)
-    m_star = best_mode[:, 0]                                       # [B] kazanan mod (ana head)
-    K = out['psi_cas'].shape[-1]
+    gt = ego_future[:, None]                                       # [B, 1, 80, 3] (x, y, heading)
+    l_traj, _ = traj_reg_loss(out['traj'], out['score'], gt)
+    dlab = maneuver_labels(ego_future)                            # [B] 5-sinif manevra (m* DEGIL -> stabil hedef)
+    K = out['psi_cas'].shape[-1]                                   # = NUM_MANEUVERS (5)
 
-    # --- decision_loss (CP): causal dal dogru modu bilsin ---
-    l_kld = F.cross_entropy(out['psi_cas'], m_star)
+    # --- decision_loss (CP): causal dal ego'nun MANEVRASINI bilsin (get_decision.py 5-sinif) ---
+    l_kld = F.cross_entropy(out['psi_cas'], dlab)
 
     # --- decision_causal_inference_loss (CP): KL(uniform || p_cfd) + 0.1*(-H) ---
     log_p_cfd = F.log_softmax(out['psi_cfd'], dim=-1)
@@ -120,8 +280,8 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
         fde = torch.norm(traj_xy[:, :, -1] - gt_xy[:, :, -1], dim=-1)  # [B, M]
         minfde = fde.gather(1, best[:, None]).mean().item()
 
-        cas_acc = (out['psi_cas'].argmax(-1) == m_star).float().mean().item()   # yuksek olmali
-        cfd_acc = (out['psi_cfd'].argmax(-1) == m_star).float().mean().item()   # ~1/K (bilgisiz olmali)
+        cas_acc = (out['psi_cas'].argmax(-1) == dlab).float().mean().item()   # yuksek olmali (manevra bilinir)
+        cfd_acc = (out['psi_cfd'].argmax(-1) == dlab).float().mean().item()   # ~1/K (bilgisiz olmali)
         nvb = out['nbr_valid']
         # M_cas komsular uzerinde dagilim -> mean yaniltici, PEAK'e bak.
         mcas_peak = out['M_cas'].masked_fill(~nvb, 0.0).max(-1).values.mean().item()   # en causal ajan
@@ -156,7 +316,8 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
 
 def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                lambda_kld, lambda_ci, lambda_mask,
-               optimizer=None, desc="Training"):
+               optimizer=None, desc="Training", perturb_prob=0.0,
+               perturb_dvel=1.0, perturb_collision_thresh=2.5):
     train = optimizer is not None
     causal.train() if train else causal.eval()
     gameformer.eval()
@@ -165,6 +326,12 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
     with tqdm(data_loader, desc=desc, unit="batch") as data_epoch:
         for batch in data_epoch:
             inputs, ego_future, _, _ = read_batch(batch, device)
+            # StatePerturbation: SADECE egitimde (val temiz olcum). Girdi+GT'yi ayni SE(2) ile saptirir.
+            # ABLASYON: perturb_dvel=0 -> hiz perturbation KAPALI; perturb_collision_thresh=0 -> safety KAPALI.
+            if train and perturb_prob > 0.0:
+                inputs, ego_future = perturb_batch(inputs, ego_future, prob=perturb_prob,
+                                                   max_dvel=perturb_dvel,
+                                                   collision_thresh=perturb_collision_thresh)
 
             with torch.no_grad():
                 encoder_outputs = gameformer.encoder(inputs)
@@ -234,7 +401,9 @@ def model_training(args):
         logging.info(f"Epoch {epoch + 1}/{args.train_epochs}")
         train_m = _run_epoch(train_loader, gameformer, causal, args.device, args.num_neighbors,
                              args.lambda_kld, args.lambda_ci, args.lambda_mask,
-                             optimizer=optimizer, desc="Training")
+                             optimizer=optimizer, desc="Training", perturb_prob=args.perturb_prob,
+                             perturb_dvel=args.perturb_dvel,
+                             perturb_collision_thresh=args.perturb_collision_thresh)
         val_m = _run_epoch(valid_loader, gameformer, causal, args.device, args.num_neighbors,
                            args.lambda_kld, args.lambda_ci, args.lambda_mask,
                            optimizer=None, desc="Validation")
@@ -286,11 +455,18 @@ if __name__ == "__main__":
     # Agirliklar Causal-Planner lightning_trainer.py:263-265 ile ayni:
     #   loss = <traj> + 1.0*decision_loss + 0.5*decision_causal_inference_loss + 0.5*soft_mask_loss
     parser.add_argument("--lambda_kld", type=float, default=1.0,
-                        help="CP decision_loss: CE(psi_cas, m*) [CP=1.0]")
+                        help="CP decision_loss: CE(psi_cas, 5-sinif manevra etiketi) [CP=1.0]")
     parser.add_argument("--lambda_ci", type=float, default=0.5,
                         help="CP decision_causal_inference_loss: KL(uniform||p_cfd)+0.1*(-H) [CP=0.5]")
     parser.add_argument("--lambda_mask", type=float, default=0.5,
                         help="CP soft_mask_loss: (comp+excl+norm) ajan + harita TOPLAMI [CP=0.5]")
+    parser.add_argument("--perturb_prob", type=float, default=0.0,
+                        help="StatePerturbation olasiligi (0=kapali). Kapali-dongu drift toparlama "
+                             "augmentation'i; SADECE egitimde uygulanir. POC icin 0.5 oner.")
+    parser.add_argument("--perturb_dvel", type=float, default=1.0,
+                        help="Ego anlik forward hiz perturbation genligi (m/s). 0=KAPALI (ablasyon).")
+    parser.add_argument("--perturb_collision_thresh", type=float, default=2.5,
+                        help="Collision-safety mesafe esigi (m). 0=safety KAPALI (ablasyon).")
     args = parser.parse_args()
 
     model_training(args)

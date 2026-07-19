@@ -222,7 +222,13 @@ class CausalEgoHead(nn.Module):
 
     Causal-Planner DOD gibi: decoder SADECE causal-graph ozelligini (f_cas) kullanir. Harita ARTIK
     f_cas icinde GATE'li olarak gelir (disentangler'daki g2a iliskisi) -> ayri agent-free harita
-    baglami YOK (yoksa harita-gate anlamsiz olurdu). GMMPredictor + imitation (WTA GMM).
+    baglami YOK (yoksa harita-gate anlamsiz olurdu).
+
+    CIKTI SEMANTIGI: GMMPredictor'in 4 kanali burada (x, y, cos_h, sin_h) olarak YENIDEN yorumlanir
+    (eski mu_x/mu_y/log_sig_x/log_sig_y DEGIL). Heading birincil cikti -> inference'ta sonlu-fark
+    hack'i yok; loss 4 kanali birden denetler (train_planner.traj_reg_loss). GMMPredictor SINIFI
+    degismez: frozen GameFormer decoder'inin AYRI GMMPredictor instance'lari etkilenmez (onlar hala
+    mu/log_sig uretir). Bu head'in kendi instance'i ise sifirdan (x,y,cos,sin) icin egitilir.
     """
 
     def __init__(self, dim=256, modes=6, dropout=0.1):
@@ -247,7 +253,7 @@ class CausalEgoHead(nn.Module):
 class CausalPlanner(nn.Module):
     """Ust modul: disentangler (A) + ego head (B) + adversarial psi head'leri (C)."""
 
-    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1):
+    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, num_maneuvers=5):
         super().__init__()
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout)
         self.head = CausalEgoHead(dim, modes, dropout)
@@ -255,7 +261,9 @@ class CausalPlanner(nn.Module):
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
         # trivial cozuyor (gradyan 0 -> f_cfd sekillenmez). Paylasinca head causal'i dogru tahmin etmek
         # ZORUNDA -> hile yapamaz -> uniform baskisi f_cfd FEATURE'larina akar -> entropy CANLI kalir.
-        self.psi = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, modes))
+        # Cikti = 5-sinif MANEVRA (CP get_decision.py: stationary/straight/turn_L/turn_R/U-turn_L),
+        # trajektori mod sayisi (modes) DEGIL -> stabil/ogrenilebilir hedef (WTA m* degil).
+        self.psi = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_maneuvers))
 
     def forward(self, encoder_outputs, inputs, num_agents,
                 neighbor_futures=None, neighbor_states=None, also_cfd_plan=False):

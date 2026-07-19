@@ -1,0 +1,27 @@
+_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
+_convert_: "all"
+
+# Use all scenario types available in the nuPlan mini split
+scenario_types: null
+
+scenario_tokens: null
+log_names: null
+map_names: null
+
+# Keep the experiment reduced but diverse
+num_scenarios_per_type: 5
+limit_total_scenarios: 200
+
+# Keep selected scenarios temporally separated
+timestamp_threshold_s: 15
+
+ego_displacement_minimum_m: null
+ego_start_speed_threshold: null
+ego_stop_speed_threshold: null
+speed_noise_tolerance: null
+
+expand_scenarios: false
+remove_invalid_goals: true
+
+# Randomize selection across each scenario type
+shuffle: true

@@ -4,3 +4,4 @@ __pycache__/
 *.csv
 testing_log/
 training_log/
+viz_out/

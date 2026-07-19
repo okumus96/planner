@@ -65,13 +65,12 @@ class CausalPurePlanner(AbstractPlanner):
                            neighbor_futures=top1, neighbor_states=nbr_states,
                            also_cfd_plan=(self._plan_source == 'cfd'))
         traj_key, score_key = ('traj_cfd', 'score_cfd') if self._plan_source == 'cfd' else ('traj', 'score')
-        traj = out[traj_key][0, 0]                      # [M, 80, 4] (mu_x, mu_y, log_sig_x, log_sig_y)
+        traj = out[traj_key][0, 0]                      # [M, 80, 4] (x, y, cos_h, sin_h)
         best = int(out[score_key][0, 0].argmax().item())
-        xy = traj[best, :, :2].detach().cpu().numpy()   # [80, 2] ego-frame
-        # heading, ardisik xy farkindan (head heading uretmiyor); ilk adim = ikinci adimla ayni
-        diffs = np.diff(xy, axis=0)                      # [79, 2]
-        heading = np.arctan2(diffs[:, 1], diffs[:, 0])
-        heading = np.concatenate([heading[:1], heading]) # [80]
+        best_traj = traj[best].detach().cpu().numpy()   # [80, 4] ego-frame
+        xy = best_traj[:, :2]                            # [80, 2]
+        # heading artik head'in BIRINCIL ciktisi (cos/sin) -> sonlu-fark hack'i YOK
+        heading = np.arctan2(best_traj[:, 3], best_traj[:, 2])  # [80]
         ego_plan = np.concatenate([xy, heading[:, None]], axis=1).astype(np.float32)  # [80, 3]
         states = transform_predictions_to_states(ego_plan, history.ego_states,
                                                  self._future_horizon, self._step_interval)
