@@ -23,6 +23,14 @@ karismadigi (offline ADE, aci-dongude simulasyon YOK) buyuk-N bir olcumle test e
     onceki closed-loop testlerdeki farki maskeliyor olabilir).
   Delta_branch ~ Delta_low  -> iki dal ham seviyede bile ayni plani uretiyor, sorun refiner degil,
     graph'in/loss'un kendisinde.
+
+EK (DISTANCE-MATCHED KONTROL, ROAR — Hooker et al. NeurIPS'19 elestirisine cevap): "high-M_cas ajani
+cikarinca plan degisiyor" bulgusu, o ajan basitce EN YAKIN oldugu icin de ayni sonucu verebilir (ki bu
+durumda M_cas sadece mesafeyi tekrar ediyor demektir, causal bilgi degil). Kontrol: high_j ile AYNI
+mesafe+goreli-hiz'a sahip ama FARKLI (dusuk) M_cas'li bir komsu ('matched_j') seçilip O cikarilir.
+  Delta_matched << Delta_high (matched_j high_j ile GEOMETRIK olarak esdeger olmasina ragmen) ->
+    M_cas mesafenin OTESINDE bilgi tasiyor -> iddia savunulabilir.
+  Delta_matched ~ Delta_high -> etki byk olcude mesafeden geliyor, M_cas mesafeyi tekrar ediyor.
 """
 
 import argparse
@@ -45,6 +53,20 @@ def _plan_and_mcas(causal, enc_out, inputs, Na, top1_fut, nbr_states):
     traj_cfd_xy = out['traj_cfd'][:, 0, :, :, :2]         # [B, K, 80, 2]
     best_cfd = out['score_cfd'][:, 0].argmax(-1)          # [B]  en yuksek skorlu mod (cfd)
     return out, traj_xy, best, traj_cfd_xy, best_cfd
+
+
+def _pick_distance_matched(rng, spd, valid, high_j, speed_weight=0.5):
+    """high_j'ye (mesafe, goreli hiz) olarak EN YAKIN, high_j'nin KENDISI OLMAYAN gecerli komsuyu sec.
+    rng/spd [B,N] metre / m/s. Doner: matched_j [B], match_gap [B] (eslesme kalitesi, kucuk=iyi)."""
+    range_high = rng.gather(1, high_j[:, None])            # [B,1]
+    speed_high = spd.gather(1, high_j[:, None])             # [B,1]
+    score = (rng - range_high).abs() + speed_weight * (spd - speed_high).abs()   # [B,N]
+    self_mask = torch.zeros_like(valid)
+    self_mask.scatter_(1, high_j[:, None], True)
+    score = score.masked_fill(~valid | self_mask, 1e9)
+    matched_j = score.argmin(-1)                             # [B]
+    match_gap = score.gather(1, matched_j[:, None]).squeeze(1)
+    return matched_j, match_gap
 
 
 @torch.no_grad()
@@ -76,11 +98,12 @@ def main(args):
     valid_set = DrivingData(args.valid_set + "/*.npz", args.num_neighbors)
     loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    stats = {k: [] for k in ['high', 'low', 'rand']}
-    switch = {k: [] for k in ['high', 'low', 'rand']}
+    stats = {k: [] for k in ['high', 'low', 'rand', 'matched']}
+    switch = {k: [] for k in ['high', 'low', 'rand', 'matched']}
     mcas_high, mcas_low, n_samples = [], [], 0
     pooled_m, pooled_d = [], []   # (removed-agent M_cas, plan shift) tum cikarimlar -> kalibrasyon
     branch_d, branch_d_agree, branch_d_disagree = [], [], []  # Delta_branch (cas vs cfd, cikarma YOK)
+    mcas_matched, range_high_l, range_matched_l = [], [], []  # distance-matched teshis
 
     for bi, batch in enumerate(loader):
         if bi >= args.num_batches:
@@ -124,7 +147,16 @@ def main(args):
         rnd = torch.rand_like(M_cas).masked_fill(~nbr_valid, -1.0)
         rand_j = rnd.argmax(-1)                     # rastgele gecerli komsu
 
-        for name, jj in [('high', high_j), ('low', low_j), ('rand', rand_j)]:
+        # DISTANCE-MATCHED: high_j ile ayni mesafe+goreli-hiz'da, FARKLI (dusuk) M_cas'li komsu
+        pos = enc_out['actors'][:, 1:Na, -1]        # [B, N, 5] = x, y, heading, vx, vy (ego-frame)
+        rng = torch.norm(pos[..., :2], dim=-1)       # [B, N] mesafe (m)
+        spd = torch.norm(pos[..., 3:5], dim=-1)      # [B, N] goreli hiz buyuklugu (m/s)
+        matched_j, _ = _pick_distance_matched(rng, spd, nbr_valid, high_j)
+        mcas_matched.append(M_cas.gather(1, matched_j[:, None]).squeeze(1)[usable].detach().cpu().numpy())
+        range_high_l.append(rng.gather(1, high_j[:, None]).squeeze(1)[usable].detach().cpu().numpy())
+        range_matched_l.append(rng.gather(1, matched_j[:, None]).squeeze(1)[usable].detach().cpu().numpy())
+
+        for name, jj in [('high', high_j), ('low', low_j), ('rand', rand_j), ('matched', matched_j)]:
             col = torch.where(usable, jj + 1, torch.full_like(jj, -1))   # komsu j -> sutun 1+j
             traj_i, score_i = _run_removed(causal, enc_out, inputs, Na, top1_fut, nbr_states, col)
             plan_i = traj_i[torch.arange(B, device=dev), best]           # ayni (baseline) modu karsilastir
@@ -145,6 +177,7 @@ def main(args):
         return np.concatenate(d) if len(d) else np.array([0.0])
 
     dh, dl, dr = cat(stats['high']), cat(stats['low']), cat(stats['rand'])
+    dm = cat(stats['matched'])
     db = cat(branch_d)
     db_agree = cat(branch_d_agree) if branch_d_agree else np.array([0.0])
     db_disagree = cat(branch_d_disagree) if branch_d_disagree else np.array([0.0])
@@ -154,8 +187,25 @@ def main(args):
     print(f"    remove HIGH-M_cas (causal)     : {dh.mean():.4f}  (median {np.median(dh):.4f})")
     print(f"    remove RANDOM agent            : {dr.mean():.4f}  (median {np.median(dr):.4f})")
     print(f"    remove LOW-M_cas (non-causal)  : {dl.mean():.4f}  (median {np.median(dl):.4f})")
+    print(f"    remove DISTANCE-MATCHED (low-M_cas, high_j ile ayni mesafe/hiz) : "
+          f"{dm.mean():.4f}  (median {np.median(dm):.4f})")
     ratio = dh.mean() / max(dl.mean(), 1e-6)
     print(f"\n  ratio Delta_high / Delta_low = {ratio:.1f}x   (buyuk = graph guvenilir)")
+
+    print(f"\n  --- DISTANCE-MATCHED KONTROL (ROAR / Hooker et al. NeurIPS'19 elestirisine cevap) ---")
+    rh, rm = cat(range_high_l), cat(range_matched_l)
+    ratio_matched = dh.mean() / max(dm.mean(), 1e-6)
+    print(f"    esleme kalitesi: mean |range_high - range_matched| = {np.abs(rh-rm).mean():.2f} m   "
+          f"(kucuk = matched_j GERCEKTEN high_j ile ayni mesafede)")
+    print(f"    mean M_cas: high={cat(mcas_high).mean():.3f}  matched={cat(mcas_matched).mean():.3f}   "
+          f"(matched'in DUSUK olmasi -> ayni mesafede farkli M_cas'e sahip bir cift bulduk)")
+    print(f"    ratio Delta_high / Delta_matched = {ratio_matched:.1f}x   "
+          f"(esdeger mesafede bile buyukse -> M_cas mesafenin OTESINDE bilgi tasiyor)")
+    if ratio_matched > 2.0:
+        print(f"    -> GECTI: ayni geometriye ragmen Delta_high >> Delta_matched, "
+              f"'sadece mesafe' itirazi CURUTULDU")
+    else:
+        print(f"    -> ZAYIF: Delta_high/Delta_matched dusuk, etki buyuk olcude MESAFEDEN geliyor olabilir")
 
     print(f"\n  --- Delta_branch (AJAN CIKARMADAN, f_cas yerine f_cfd'den plan; refiner YOK, sim YOK) ---")
     print(f"    Delta_branch (cas vs cfd, TUMU)         : {db.mean():.4f}  (median {np.median(db):.4f})  n={len(db)}")

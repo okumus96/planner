@@ -48,8 +48,11 @@ FUTURE_COLOR = "#1565C0"    # blue: causal agent's predicted future (contrast vs
 
 def select_mask(values, valid, mode, thr, topn):
     """Return a boolean 'selected' mask over elements, applying the SAME rule to agents and map.
-    mode='topn' -> top-`topn` valid elements by value; mode='threshold' -> value > thr among valid."""
+    mode='topn' -> top-`topn` valid elements by value; mode='threshold' -> value > thr among valid;
+    mode='none' -> hicbir eleman secilmez (sadece renklendirme, kutu/etiket/gelecek-cizgisi YOK)."""
     sel = np.zeros(values.shape, dtype=bool)
+    if mode == "none":
+        return sel
     idx = np.where(valid)[0]
     if len(idx) == 0:
         return sel
@@ -136,15 +139,22 @@ def plot_scene(ax, s, mode, thr, topn, branch="cas"):
     ax.plot(s["ego_plan"][:, 0], s["ego_plan"][:, 1], "--", color="#2ca02c", lw=1.8, zorder=7)
 
     agent_sel = select_mask(s["M_cas"][:s["N"]], s["valid"], mode, thr, topn)
+    # HARITA ile AYNI normalizasyon: renk = m / (sahne-ici max M_cas), boyle harita ile
+    # kiyaslanabilir olur (onceden ham/mutlak degerle boyaniyordu -> harita hep daha "kesin"
+    # gorunuyordu, gercekte agent/map peak'leri farkli olcekte -- bkz peak/uniform oranlari).
+    m_valid = s["M_cas"][s["valid"]]
+    m_vmax = float(m_valid.max()) if m_valid.size else 1.0
+    m_vmax = max(m_vmax, 1e-6)
     xs, ys = [s["ego"][0]], [s["ego"][1]]
     for j in range(s["N"]):
         if not s["valid"][j]:
             continue
         x, y, hd = s["pos"][j, 0], s["pos"][j, 1], s["pos"][j, 2]
-        m = float(s["M_cas"][j])
+        m = float(s["M_cas"][j])                 # HAM deger (etiket icin)
+        r = m / m_vmax                            # NORMALIZE deger (renk icin)
         causal = bool(agent_sel[j])
         _draw_agent(ax, x, y, hd, s["dims"][j, 0], s["dims"][j, 1], int(s["types"][j]),
-                    facecolor=CMAP(m), edgecolor=("black" if causal else "0.45"),
+                    facecolor=CMAP(r), edgecolor=("black" if causal else "0.45"),
                     lw=(2.4 if causal else 0.8), z=(8 if causal else 5))
         if causal:
             ax.text(x, y + 2.2, f"{m:.2f}", color="black", fontsize=7, ha="center",
@@ -212,8 +222,9 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
             if scenario != "any" and not scenario_match(man, scenario):
                 continue
             mca = M_cas[b].cpu().numpy(); vv = v.cpu().numpy()
-            if scenario == "any":
+            if scenario == "any" and mode != "none":
                 # 'any' -> keep interactive scenes: at least one SELECTED agent
+                # (mode='none' -> secim yok, bu filtre atlanir; TUM sahneler tutulur)
                 if not select_mask(mca[:num_neighbors], vv, mode, thr, topn).any():
                     continue
             polys = [arr[b, e].cpu().numpy() for arr in map_src for e in range(arr.shape[1])]
@@ -250,7 +261,12 @@ def main(args):
 
     scenes = collect_scenes(gameformer, causal, loader, args.num_neighbors, args.num_scenes, dev,
                             args.scenario, args.select, args.threshold, args.topn, branch=args.branch)
-    sel_desc = f"topn={args.topn}" if args.select == "topn" else f"threshold={args.threshold}"
+    if args.select == "none":
+        sel_desc = "yok (secim kapali, sadece normalize renklendirme)"
+    elif args.select == "topn":
+        sel_desc = f"topn={args.topn}"
+    else:
+        sel_desc = f"threshold={args.threshold}"
     print(f"collected {len(scenes)} scenes (scenario={args.scenario}, branch={args.branch}, "
           f"select={args.select} {sel_desc}).")
 
@@ -268,17 +284,23 @@ def main(args):
     mask_name = "M_cas" if args.branch == "cas" else "M_cfd"
     tag_word = "causal" if args.branch == "cas" else "confound"
     fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01,
-                 label=f"{mask_name}   (light = non-{tag_word}  ->  dark = {tag_word})")
+                 label=f"{mask_name}   SAHNE-ICI GORELI (light = dusuk  ->  dark = o sahnedeki en yuksek); "
+                       f"agent ve map AYNI olcekte, gercek/mutlak deger icin etiket sayisina bak")
 
-    sel_label = f"top-{args.topn}" if args.select == "topn" else f"M > {args.threshold:g}"
     handles = [
         Patch(facecolor="#222222", edgecolor="black", label="Ego"),
         Line2D([0], [0], color="#2ca02c", lw=1.8, ls="--",
                label=f"Ego plan (pred, from f_{args.branch})"),
-        Patch(facecolor=CMAP(0.9), edgecolor="black", lw=2.2, label=f"{tag_word.capitalize()} agent ({sel_label})"),
-        Line2D([0], [0], color=FUTURE_COLOR, lw=1.6, label=f"{tag_word.capitalize()} agent future traj."),
-        Line2D([0], [0], color=CMAP(0.95), lw=3.2, label=f"Map polyline (dark = high {mask_name}_map)"),
-        Line2D([0], [0], color=CMAP(0.25), lw=1.2, label="Map polyline (light = low)"),
+    ]
+    if args.select != "none":
+        sel_label = f"top-{args.topn}" if args.select == "topn" else f"M > {args.threshold:g}"
+        handles += [
+            Patch(facecolor=CMAP(0.9), edgecolor="black", lw=2.2, label=f"{tag_word.capitalize()} agent ({sel_label})"),
+            Line2D([0], [0], color=FUTURE_COLOR, lw=1.6, label=f"{tag_word.capitalize()} agent future traj."),
+        ]
+    handles += [
+        Line2D([0], [0], color=CMAP(0.95), lw=3.2, label=f"Map polyline (sahne-ici en yuksek {mask_name}_map)"),
+        Line2D([0], [0], color=CMAP(0.25), lw=1.2, label="Map polyline (sahne-ici dusuk)"),
         Patch(facecolor="0.7", edgecolor="0.4", label="Type: vehicle (rect)"),
         Line2D([0], [0], marker="o", ls="None", markerfacecolor="0.7", markeredgecolor="0.4",
                markersize=11, label="Type: pedestrian (circle)"),
@@ -303,8 +325,9 @@ if __name__ == "__main__":
     p.add_argument("--branch", type=str, default="cas", choices=["cas", "cfd"],
                    help="'cas' (varsayilan) = M_cas/M_cas_map + ANA plan (f_cas'ten, deploy edilen). "
                         "'cfd' = M_cfd/M_cfd_map + f_cfd'den uretilen plan (tani/ablasyon, hicbir ajan silinmez).")
-    p.add_argument("--select", type=str, default="topn", choices=["topn", "threshold"],
-                   help="selection rule applied IDENTICALLY to agents and map")
+    p.add_argument("--select", type=str, default="topn", choices=["topn", "threshold", "none"],
+                   help="selection rule applied IDENTICALLY to agents and map. "
+                        "'none' = hicbir eleman secilmez/kutulanmaz, sadece normalize renklendirme.")
     p.add_argument("--topn", type=int, default=1, help="for --select topn: top-N per relation")
     p.add_argument("--threshold", type=float, default=0.5, help="for --select threshold: M > T (same for both)")
     p.add_argument("--scenario", type=str, default="any",
