@@ -51,6 +51,83 @@ def _agent_types(neighbor_agents_past, num_neighbors):
     return torch.cat([ego_type, nbr_type.long()], dim=1)             # [B, 1+N]
 
 
+class _EdgeMLP(nn.Module):
+    """Edge-feature encoder: prenorm MLP (CP'nin edge_MLP'sine sadik: Linear->GELU->Linear, hidden=4x,
+    LayerNorm GIRISTE). Onceki tek-Linear (We_k_ag/We_v_ag) yerine -- kenar bilgisini (goreli poz)
+    zenginlestirir; FAZ 1'in "sig temsil" teshisinin bir parcasi."""
+
+    def __init__(self, in_dim, out_dim, hidden_mult=4, dropout=0.1):
+        super().__init__()
+        hidden = out_dim * hidden_mult
+        self.norm = nn.LayerNorm(in_dim)
+        self.fc1 = nn.Linear(in_dim, hidden)
+        self.fc2 = nn.Linear(hidden, out_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h = self.norm(x)
+        h = self.fc2(self.act(self.fc1(h)))
+        return self.dropout(h)
+
+
+class _FFN(nn.Module):
+    """SwiGLU-gated feed-forward (CP'nin PositionwiseFeedForward'ina sadik): kendi prenorm + residual'i
+    var, w2(SiLU(w1(x)) * w3(x)), hidden=4x. Attention SADECE token'lar ARASI dogrusal karisim yapar;
+    FFN her token'i KENDI icinde dogrusal-olmayan bicimde isler -- bu, EgoCausalLayer'da hic yoktu."""
+
+    def __init__(self, dim, hidden_mult=4, dropout=0.1):
+        super().__init__()
+        hidden = dim * hidden_mult
+        self.norm = nn.LayerNorm(dim)
+        self.w1 = nn.Linear(dim, hidden)
+        self.w2 = nn.Linear(hidden, dim)
+        self.w3 = nn.Linear(dim, hidden)
+        self.act = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        h = self.norm(x)
+        h = self.w2(self.act(self.w1(h)) * self.w3(h))
+        return self.dropout(h) + residual
+
+
+class _AgentEnrichLayer(nn.Module):
+    """FAZ 2 / Stage A: TAM (gate'siz) self-attention ajan<->ajan + cross-attention ajan->harita.
+    HER ajan node'u (ego DAHIL) guncellenir -- CP'nin AgentHetGNN/PolygonHetGNN on-fuzyon
+    katmanlarina karsilik gelir (hdgt_encoder.py: HgtEncoder.forward, num_of_gnn_layer=4 TAM
+    ungated fusion -> SONRA 1x AgentHetGNNCausal). CP'de "ego_clean" / sifir-sizinti garantisi
+    YOK (planning_model.py:407 self_node_fea_causal = agent_node_fea_causal[:,0], bu zaten
+    4 katman herkesi gormus olan a_n_hidden'dan geliyor) -- bu katman da ayni odunlesimi kabul
+    eder: buradan gecen h_ego artik TUM ajanlari gate'siz gormus olur. ego_clean (Stage A'dan
+    ONCEKI ham ego) ayrica saklanip head'e HALA temiz gidiyor (bkz EgoCausalDisentangler.forward).
+    Interpretability burada onemli DEGIL (M_cas/M_cfd SADECE Stage B'de/EgoCausalLayer'da
+    hesaplanir); amac SADECE zengin, cok-atlamali baglam kurmak. Harita bu ilk versiyonda STATIK
+    kalir (agent->map cross-attn var, map<-agent guncellemesi YOK -- harita zaten guclu olcup
+    onceligi dusuk, bkz peak/uniform=7.33x agent'in 1.92x'ine karsi)."""
+
+    def __init__(self, dim=256, heads=8, dropout=0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = _FFN(dim, dropout=dropout)
+
+    def forward(self, h_agents, agents_key_padding_mask, h_map, map_key_padding_mask):
+        """h_agents [B,Na,D] (ego+komsular, HEPSI guncellenir); agents_key_padding_mask [B,Na]
+        bool (True=gecersiz/padded); h_map [B,S,D] (bu katmanda STATIK); map_key_padding_mask [B,S]."""
+        h2 = self.norm1(h_agents)
+        attn_out, _ = self.self_attn(h2, h2, h2, key_padding_mask=agents_key_padding_mask)
+        h_agents = h_agents + attn_out
+        h3 = self.norm2(h_agents)
+        cross_out, _ = self.cross_attn(h3, h_map, h_map, key_padding_mask=map_key_padding_mask)
+        h_agents = h_agents + cross_out
+        h_agents = self.ffn(h_agents)
+        return h_agents
+
+
 class EgoCausalLayer(nn.Module):
     """Ego-oriented DUAL-RELATION causal katmani (Causal-Planner CGD'sine sadik, hdgt_encoder.py).
     Ego query IKI iliskiye attend eder:
@@ -66,14 +143,14 @@ class EgoCausalLayer(nn.Module):
         super().__init__()
         assert dim % heads == 0
         self.dim, self.heads, self.dh = dim, heads, dim // heads
-        # 'other' (ajan) iliskisi
+        # 'other' (ajan) iliskisi. Edge projeksiyonlari FAZ1: duz Linear -> prenorm _EdgeMLP.
         self.Wq_ag = nn.Linear(dim, dim); self.Wk_ag = nn.Linear(dim, dim); self.Wv_ag = nn.Linear(dim, dim)
-        self.We_k_ag = nn.Linear(edge_dim, dim); self.We_v_ag = nn.Linear(edge_dim, dim)
+        self.We_k_ag = _EdgeMLP(edge_dim, dim, dropout=dropout); self.We_v_ag = _EdgeMLP(edge_dim, dim, dropout=dropout)
         self.attn_cas = nn.Parameter(torch.empty(heads, self.dh))     # ajan causal attn vektoru
         self.attn_cfd = nn.Parameter(torch.empty(heads, self.dh))
         # 'g2a' (harita) iliskisi
         self.Wq_mp = nn.Linear(dim, dim); self.Wk_mp = nn.Linear(dim, dim); self.Wv_mp = nn.Linear(dim, dim)
-        self.We_k_mp = nn.Linear(edge_dim, dim); self.We_v_mp = nn.Linear(edge_dim, dim)
+        self.We_k_mp = _EdgeMLP(edge_dim, dim, dropout=dropout); self.We_v_mp = _EdgeMLP(edge_dim, dim, dropout=dropout)
         self.attn_cas_mp = nn.Parameter(torch.empty(heads, self.dh))  # harita causal attn vektoru
         self.attn_cfd_mp = nn.Parameter(torch.empty(heads, self.dh))
         for p in (self.attn_cas, self.attn_cfd, self.attn_cas_mp, self.attn_cfd_mp):
@@ -86,7 +163,13 @@ class EgoCausalLayer(nn.Module):
         self.out_fc_cfd = nn.Linear(3 * dim, dim)
         self.norm_cas = nn.LayerNorm(dim)
         self.norm_cfd = nn.LayerNorm(dim)
-        # ego node guncelleme (katmanlar arasi)
+        # FAZ 1: FFN eklendi (CP'de var, bizde yoktu -- attention SADECE token'lar arasi dogrusal
+        # karisim yapar, FFN her token'i KENDI icinde dogrusal-olmayan isler). Kendi prenorm+residual'i var.
+        self.ffn_cas = _FFN(dim, dropout=dropout)
+        self.ffn_cfd = _FFN(dim, dropout=dropout)
+        # ego node guncelleme (katmanlar arasi). SADECE f_cas ile guncellenir -- f_cfd karisirsa
+        # bir onceki katmanin confound bilgisi h_ego uzerinden bir SONRAKI katmanin f_cas'ina sizar
+        # (CP'de bu sizinti yolu YOK: CP causal-split katmanini TEK KEZ uygular, zincirlemez).
         self.update = nn.GRUCell(dim, dim)
         self.norm = nn.LayerNorm(dim)
         self.leaky = nn.LeakyReLU(0.2)
@@ -94,7 +177,8 @@ class EgoCausalLayer(nn.Module):
 
     def _attend(self, q1, k, ek, msg, valid, attn_cas, attn_cfd):
         """q1 [B,1,H,dh]; k/ek/msg [B,Nk,H,dh]; valid [B,Nk] bool. AYRI softmax causal/confound.
-        Doner: cas [B,D], cfd [B,D], M_cas [B,Nk], M_cfd [B,Nk] (head-ort)."""
+        Doner: cas [B,D], cfd [B,D], M_cas [B,Nk], M_cfd [B,Nk] (head-ort),
+        ent_cas_mean/ent_cas_headmean/ent_cfd_mean/ent_cfd_headmean [B] (elestiri #3, bkz asagi)."""
         B = k.shape[0]
         s = self.leaky(q1 + k + ek)                          # [B,Nk,H,dh]
         a_cas = (s * attn_cas).sum(-1)                        # [B,Nk,H]
@@ -105,10 +189,37 @@ class EgoCausalLayer(nn.Module):
         M_cfd_h = torch.softmax(a_cfd.masked_fill(invalid, neg_inf), dim=1).masked_fill(invalid, 0.0)
         cas = (M_cas_h.unsqueeze(-1) * msg).sum(dim=1).reshape(B, self.dim)   # [B,D]
         cfd = (M_cfd_h.unsqueeze(-1) * msg).sum(dim=1).reshape(B, self.dim)
-        return cas, cfd, M_cas_h.mean(-1), M_cfd_h.mean(-1)
 
-    def forward(self, h_ego, h_nbr, edge_ego, nbr_valid, h_map, edge_map, map_valid):
-        """h_ego [B,D]; h_nbr [B,N,D], edge_ego [B,N,De], nbr_valid [B,N];
+        # ELESTIRI #3: TOPLAMA (yukarida) her head'in KENDI M_cas_h agirligini kullanir, ama
+        # rapor edilen M_cas = M_cas_h.mean(-1) (head-ortalamasi). Head'ler farkli komsuya tepe
+        # yapiyorsa ortalama duzlesir (entropy(mean) YUKSEK) ama her head kendi icinde keskin
+        # kalabilir (mean(entropy_head) DUSUK) -- ikisini ayri logla, entgap=(mean-headmean)
+        # buyukse M_cas gorsellestirmesi/mcas_peak head-anlasmazligini gizliyor demektir.
+        eps = 1e-12
+        M_cas_mean = M_cas_h.mean(-1)                                              # [B,Nk]
+        M_cfd_mean = M_cfd_h.mean(-1)
+        ent_cas_mean = -(M_cas_mean.clamp(min=eps).log() * M_cas_mean).sum(-1)      # [B], NATS (ham)
+        ent_cas_headmean = (-(M_cas_h.clamp(min=eps).log() * M_cas_h).sum(1)).mean(-1)   # [B]
+        ent_cfd_mean = -(M_cfd_mean.clamp(min=eps).log() * M_cfd_mean).sum(-1)
+        ent_cfd_headmean = (-(M_cfd_h.clamp(min=eps).log() * M_cfd_h).sum(1)).mean(-1)
+
+        # NORMALIZASYON (elestiri): maksimum entropi log(n_valid), n_valid sahneden sahneye
+        # (2-40) degisir. Ham nats'i batch uzerinden ortalamak kalabalik sahneleri (buyuk log(n))
+        # seyrek sahnelere (kucuk log(n)) baskin kilar -- gap/ent HER SEYİ log(n_valid)'e bolerek
+        # [0,1] araligina (uniform=1, tam tepe=0) normalize ediyoruz, batch-agnostik kiyaslanabilir.
+        n_valid = valid.sum(-1).clamp(min=1).float()                                # [B]
+        log_n = n_valid.clamp(min=2).log()          # n_valid=1 -> entropi zaten 0, payda guvenli
+        ent_cas_mean = ent_cas_mean / log_n
+        ent_cas_headmean = ent_cas_headmean / log_n
+        ent_cfd_mean = ent_cfd_mean / log_n
+        ent_cfd_headmean = ent_cfd_headmean / log_n
+
+        return (cas, cfd, M_cas_mean, M_cfd_mean,
+                ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean)
+
+    def forward(self, h_ego, h_nbr, nbr_clean, edge_ego, nbr_valid, h_map, edge_map, map_valid):
+        """h_ego [B,D]; h_nbr [B,N,D] (Stage A sonrasi, ZENGIN -- VALUE icin), nbr_clean [B,N,D]
+        (Stage A ONCESI, ham ajan kimligi -- KEY icin, bkz asagi), edge_ego [B,N,De], nbr_valid [B,N];
         h_map [B,S,D], edge_map [B,S,De] (polygon->ego), map_valid [B,S].
         Doner: h_ego_new, f_cas, f_cfd, M_cas(ajan), M_cfd(ajan), M_cas_mp(harita), M_cfd_mp(harita)."""
         B, N = h_nbr.shape[0], h_nbr.shape[1]
@@ -117,10 +228,14 @@ class EgoCausalLayer(nn.Module):
 
         # --- ajan iliskisi (other) ---
         q_ag = self.Wq_ag(h_ego).view(B, 1, H, dh)
-        k_ag = self.Wk_ag(h_nbr).view(B, N, H, dh)
+        # KEY = nbr_clean (Stage A'dan ETKILENMEMIS ham ajan-j kimligi) -> M_cas[j]/M_cfd[j] artik
+        # "j'nin Stage-A-sonrasi slotu" degil GERCEKTEN "ajan j" uzerinden skorlanir (harita zaten Stage
+        # A'da guncellenmiyor, ayni sorun g2a'da yok). VALUE hala h_nbr (zengin, Stage A sonrasi icerik).
+        k_ag = self.Wk_ag(nbr_clean).view(B, N, H, dh)
         ek_ag = self.We_k_ag(edge_ego).view(B, N, H, dh)
         msg_ag = self.Wv_ag(h_nbr).view(B, N, H, dh) + self.We_v_ag(edge_ego).view(B, N, H, dh)
-        ag_cas, ag_cfd, M_cas_ag, M_cfd_ag = self._attend(
+        (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag,
+         ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean) = self._attend(
             q_ag, k_ag, ek_ag, msg_ag, nbr_valid, self.attn_cas, self.attn_cfd)
 
         # --- harita iliskisi (g2a) ---
@@ -128,17 +243,22 @@ class EgoCausalLayer(nn.Module):
         k_mp = self.Wk_mp(h_map).view(B, S, H, dh)
         ek_mp = self.We_k_mp(edge_map).view(B, S, H, dh)
         msg_mp = self.Wv_mp(h_map).view(B, S, H, dh) + self.We_v_mp(edge_map).view(B, S, H, dh)
-        mp_cas, mp_cfd, M_cas_mp, M_cfd_mp = self._attend(
+        (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp,
+         ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean) = self._attend(
             q_mp, k_mp, ek_mp, msg_mp, map_valid, self.attn_cas_mp, self.attn_cfd_mp)
 
         # --- birlestirme (Eq 6): [self ; ajan ; harita] ---
         self_fea = self.self_fc(h_ego)                                        # [B,D]
         f_cas = self.norm_cas(self.out_fc_cas(torch.cat([self_fea, ag_cas, mp_cas], dim=-1)) + h_ego)
         f_cfd = self.norm_cfd(self.out_fc_cfd(torch.cat([self_fea, ag_cfd, mp_cfd], dim=-1)))
+        f_cas = self.ffn_cas(f_cas)      # FAZ 1: kendi prenorm+residual'iyla ek dogrusal-olmayan isleme
+        f_cfd = self.ffn_cfd(f_cfd)
         f_cas = self.dropout(f_cas)
         f_cfd = self.dropout(f_cfd)
-        h_ego_new = self.norm(self.update(f_cas + f_cfd, h_ego))
-        return h_ego_new, f_cas, f_cfd, M_cas_ag, M_cfd_ag, M_cas_mp, M_cfd_mp
+        h_ego_new = self.norm(self.update(f_cas, h_ego))       # f_cfd DAHIL DEGIL -> sonraki katmana sizmaz
+        return (h_ego_new, f_cas, f_cfd, M_cas_ag, M_cfd_ag, M_cas_mp, M_cfd_mp,
+                ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
+                ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean)
 
 
 class EgoCausalDisentangler(nn.Module):
@@ -149,7 +269,7 @@ class EgoCausalDisentangler(nn.Module):
     gunceller, komsular sabit kalir. Son katmanin f_cas/f_cfd + M_cas/M_cfd ciktisi kullanilir.
     """
 
-    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1):
+    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, enrich_layers=3):
         super().__init__()
         self.future_encoder = FutureEncoder()
         self.future_fuse = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU())
@@ -161,9 +281,17 @@ class EgoCausalDisentangler(nn.Module):
         self.crosswalk_encoder = PolylineEncoder(3, dim)
         self.route_encoder = PolylineEncoder(3, dim)
         self.map_norm = nn.LayerNorm(dim)
+        # FAZ 2 / Stage A: zengin, gate'siz on-fuzyon (CP'nin 4x AgentHetGNN/PolygonHetGNN'ine
+        # sadik; bkz _AgentEnrichLayer docstring). Stage B (asagidaki self.layers) DEGISMEDI.
+        self.enrich_layers = nn.ModuleList([
+            _AgentEnrichLayer(dim, heads, dropout) for _ in range(enrich_layers)
+        ])
         self.layers = nn.ModuleList([
             EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(layers)
         ])
+        # elestiri: nbr_clean (Stage B'nin KEY kaynagi) cok sig (sadece LN) -- token-basina (cross-token
+        # karisim YOK) FFN ile derinlik ekle, "sadece ajan j" garantisi bozulmadan.
+        self.nbr_clean_mlp = _FFN(dim, dropout=dropout)
 
     def forward(self, agent_feat, agent_valid, agent_pose, agent_types, inputs,
                 neighbor_futures=None, neighbor_states=None):
@@ -182,8 +310,16 @@ class EgoCausalDisentangler(nn.Module):
         edge = build_edge_features(agent_pose)                                         # [B,Na,Na,De]
         edge_ego = edge[:, 0, 1:]                                                      # komsu j -> ego: [B,N,De]
 
-        h_ego = h[:, 0]                                                                # [B,D]
-        h_nbr = h[:, 1:]                                                               # [B,N,D]
+        ego_clean = h[:, 0]           # STAGE A'DAN ONCE sakla -- HICBIR ZAMAN kirlenmeyecek,
+                                        # head'e bunu veririz (bkz return + _AgentEnrichLayer docstring)
+        nbr_clean_raw = h[:, 1:]      # STAGE A'DAN ONCE, HAM (LN(agent_feat+type_emb), tek katman) --
+                                        # SADECE cos-benzerlik teshisi bunun uzerinden (Stage A ne kadar
+                                        # degistiriyor, bkz asagi h_nbr karsilastirmasi)
+        # ELESTIRI: nbr_clean cok sigdi (LN disinda transform yok) -- Q tarafi (h_ego) Stage A+FFN+GRU'dan
+        # gecmis derin bir sey, K tarafi 1 LayerNorm = derinlik uyumsuzlugu. Duzeltme: token-basina
+        # (cross-token karisim YOK, sadece Linear/FFN -> "sadece ajan j" garantisi bozulmaz) FFN ile
+        # derinlik ekle. _FFN zaten SwiGLU-gated prenorm+residual, N boyutunda tamamen bagimsiz calisir.
+        nbr_clean = self.nbr_clean_mlp(nbr_clean_raw)   # Stage B'nin KEY'i (Wk_ag girdisi) artik BU
         nbr_valid = agent_valid[:, 1:]                                                 # [B,N]
 
         # --- HARITA polygonlari: kendi encoder'larimizla token (agent-free) + polygon->ego kenari ---
@@ -202,18 +338,59 @@ class EgoCausalDisentangler(nn.Module):
         map_edge_full = build_edge_features(torch.cat([agent_pose[:, 0:1], map_pose], dim=1))  # [B,1+S,1+S,De]
         edge_map = map_edge_full[:, 0, 1:]                                              # [B,S,De]
 
+        # --- STAGE A: zengin, gate'siz on-fuzyon (CP'nin AgentHetGNN/PolygonHetGNN'ine sadik) ---
+        # TUM ajan node'lari (ego DAHIL) birbirini + haritayi gate'siz gorur. h_map bu asamada
+        # STATIK kalir (agent->map cross-attn var, map<-agent guncellemesi YOK). ego_clean
+        # (yukarida saklandi) buradan ETKILENMEZ -> head'e hala temiz gider.
+        agents_key_padding = ~agent_valid                                              # [B,Na]
+        map_key_padding = ~map_valid                                                   # [B,S]
+        h_rich = h
+        for enrich in self.enrich_layers:
+            h_rich = enrich(h_rich, agents_key_padding, h_map, map_key_padding)
+
+        h_ego = h_rich[:, 0]                                                           # [B,D] ARTIK ZENGIN
+        h_nbr = h_rich[:, 1:]                                                          # [B,N,D] ARTIK ZENGIN
+
+        # ELESTIRI teshisi: Stage A slot-j'nin kimligini ne kadar koruyor? cos(nbr_clean_raw[j], h_nbr[j])
+        # -- ~1.0 => Stage A neredeyse hicbir sey degistirmiyor (3 katman bosa), ~0.0-0.3 => key(kimlik)
+        # ile value(icerik) arasinda ciddi kopukluk (M_cas dogru ajani secip yanlis/karisik icerik
+        # topluyor olabilir). Sadece izleme -- gradyana girmez.
+        with torch.no_grad():
+            cos_sim = F.cosine_similarity(nbr_clean_raw, h_nbr, dim=-1)                    # [B,N]
+            nv_f = nbr_valid.float()
+            nbr_identity_cos = (cos_sim * nv_f).sum(-1) / nv_f.sum(-1).clamp(min=1)         # [B]
+
+        # --- STAGE B: mevcut causal-split, KEY artik nbr_clean'den (ajan-kimligi fix, #1) ---
         f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = None
+        ent_cas_mean = ent_cas_headmean = ent_cfd_mean = ent_cfd_headmean = None
+        ent_cas_mp_mean = ent_cas_mp_headmean = ent_cfd_mp_mean = ent_cfd_mp_headmean = None
         for layer in self.layers:
-            h_ego, f_cas, f_cfd, M_cas, M_cfd, M_cas_mp, M_cfd_mp = layer(
-                h_ego, h_nbr, edge_ego, nbr_valid, h_map, edge_map, map_valid)
+            (h_ego, f_cas, f_cfd, M_cas, M_cfd, M_cas_mp, M_cfd_mp,
+             ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
+             ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean) = layer(
+                h_ego, h_nbr, nbr_clean, edge_ego, nbr_valid, h_map, edge_map, map_valid)
 
         return {
             'f_cas': f_cas, 'f_cfd': f_cfd, 'M_cas': M_cas, 'M_cfd': M_cfd,
             'M_cas_map': M_cas_mp, 'M_cfd_map': M_cfd_mp, 'map_valid': map_valid,
-            # ego_feat: katmanlar boyunca f_cas+f_cfd ile guncellenen ego (mask hesabi icin, ICSEL).
-            # ego_clean: guncellenmemis ego node'u (SADECE ego'nun kendi gecmisi + tip; komsu/confounding
-            # bilgisi YOK). Trajectory head bunu kullanir -> confounding ajan trajectory'ye SIZMAZ.
-            'ego_feat': h_ego, 'ego_clean': h[:, 0], 'nbr_valid': nbr_valid,
+            # elestiri #3: M_cas/M_cfd'nin (head-ortalamasi) entropisi vs head-basina entropinin
+            # ortalamasi (normalize: /log(n_valid), batch-agnostik) -- ikisi arasindaki fark,
+            # head'lerin farkli komsulara/polygonlara tepe yapip yapmadigini gosterir. Harita icin de
+            # ayni tesihs tutuluyor: peak/uniform=7.33x iddiasi head-anlasmazligi artefakti mi diye.
+            'M_cas_ent': ent_cas_mean, 'M_cas_headent': ent_cas_headmean,
+            'M_cfd_ent': ent_cfd_mean, 'M_cfd_headent': ent_cfd_headmean,
+            'M_cas_map_ent': ent_cas_mp_mean, 'M_cas_map_headent': ent_cas_mp_headmean,
+            'M_cfd_map_ent': ent_cfd_mp_mean, 'M_cfd_map_headent': ent_cfd_mp_headmean,
+            # ego_feat: Stage A (zengin, gate'siz) + Stage B (SADECE f_cas) ile guncellenen ego (ICSEL).
+            # ego_clean: Stage A'DAN ONCE saklanan, HICBIR ZAMAN guncellenmeyen ham ego (SADECE ego'nun
+            # kendi gecmisi + tip). Trajectory head bunu kullanir. NOT (FAZ 2): Stage A artik h_ego'yu
+            # (ego_feat/f_cas'in kaynagi) tum ajanlari gate'siz gormus hale getiriyor -- CP'nin kendisi
+            # de boyle (bkz _AgentEnrichLayer docstring); "sifir sizinti" garantisi SADECE ego_clean
+            # icin gecerli, f_cas artik degil.
+            'ego_feat': h_ego, 'ego_clean': ego_clean, 'nbr_valid': nbr_valid,
+            # elestiri: Stage A slot-kimlik korunumu teshisi (bkz yukari) -- ~1 => Stage A bosa,
+            # ~0 => key/value kopuk.
+            'nbr_identity_cos': nbr_identity_cos,
         }
 
 
@@ -286,8 +463,14 @@ class CausalPlanner(nn.Module):
             'M_cas': dis['M_cas'], 'M_cfd': dis['M_cfd'],                # ajan causal/confound [B,N]
             'M_cas_map': dis['M_cas_map'], 'M_cfd_map': dis['M_cfd_map'],  # harita causal/confound [B,S]
             'map_valid': dis['map_valid'],
+            # elestiri #3: M_cas/M_cfd head-ortalamasi vs head-basina entropi (bkz EgoCausalDisentangler)
+            'M_cas_ent': dis['M_cas_ent'], 'M_cas_headent': dis['M_cas_headent'],
+            'M_cfd_ent': dis['M_cfd_ent'], 'M_cfd_headent': dis['M_cfd_headent'],
+            'M_cas_map_ent': dis['M_cas_map_ent'], 'M_cas_map_headent': dis['M_cas_map_headent'],
+            'M_cfd_map_ent': dis['M_cfd_map_ent'], 'M_cfd_map_headent': dis['M_cfd_map_headent'],
             'f_cas': f_cas, 'f_cfd': f_cfd,
             'nbr_valid': dis['nbr_valid'],
+            'nbr_identity_cos': dis['nbr_identity_cos'],   # elestiri: Stage A kimlik-korunum teshisi
             'psi_cas': self.psi(f_cas),            # PAYLASILAN head -> m* (L_KLD, informative)
             'psi_cfd': self.psi(f_cfd),            # AYNI head -> uniform (L_ENT); hile yapamaz -> entropy canli
         }

@@ -135,6 +135,26 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
         n_valid = nvb.sum(-1).clamp(min=1).float()                                     # [B]
         unif = (1.0 / n_valid).mean().item()
 
+        # ELESTIRI #3 (causal_graph.py _attend): rapor edilen M_cas = head-ortalamasi, ama toplama
+        # her head'in KENDI agirligini kullanir. mcas_ent = entropy(mean-head M_cas)/log(n_valid)
+        # (mcas_peak'in dayandigi ayni dagilim, NORMALIZE -- ham nats degil, [0,1] araliginda);
+        # mcas_headent = mean(entropy(M_cas_h))/log(n_valid) (her head KENDI icinde ne kadar keskin).
+        # mcas_ent >> mcas_headent ise head'ler FARKLI komsulara tepe yapiyor ve mean/mcas_peak bunu
+        # gizleyip duz gosteriyor demektir. Ayni tesihs harita (g2a) icin de tutuluyor: peak/uniform
+        # =7.33x iddiasinin head-anlasmazligi artefakti olup olmadigini gorebilmek icin.
+        mcas_ent = out['M_cas_ent'].mean().item()
+        mcas_headent = out['M_cas_headent'].mean().item()
+        mcfd_ent = out['M_cfd_ent'].mean().item()
+        mcfd_headent = out['M_cfd_headent'].mean().item()
+        mcas_map_ent = out['M_cas_map_ent'].mean().item()
+        mcas_map_headent = out['M_cas_map_headent'].mean().item()
+        mcfd_map_ent = out['M_cfd_map_ent'].mean().item()
+        mcfd_map_headent = out['M_cfd_map_headent'].mean().item()
+
+        # ELESTIRI: Stage A slot-kimlik korunumu -- cos(nbr_clean_raw, h_nbr), ~1 => Stage A bosa,
+        # ~0 => KEY(kimlik)/VALUE(icerik) kopuk, M_cas yanlis temelde seciyor olabilir.
+        nbr_id_cos = out['nbr_identity_cos'].mean().item()
+
         # ENTROPI MAKASI (CP lightning_trainer.py:232-236 ile ayni mantik): causal dal PEAKED
         # (dusuk entropi, decision_loss ile denetleniyor), confound dal UNIFORM (yuksek entropi).
         # Ayrisma = aradaki makas. casent'i olcmeden makasi goremiyorduk; asil izlenecek sayi bu.
@@ -150,6 +170,11 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
         'minADE': minade, 'minFDE': minfde, 'casacc': cas_acc, 'cfdacc': cfd_acc,
         'mcas_peak': mcas_peak, 'mcas_map_peak': mcas_map_peak, 'qbar': q_bar,
         'mcfd_peak': mcfd_peak, 'unif': unif,
+        'mcas_ent': mcas_ent, 'mcas_headent': mcas_headent,
+        'mcfd_ent': mcfd_ent, 'mcfd_headent': mcfd_headent,
+        'mcas_map_ent': mcas_map_ent, 'mcas_map_headent': mcas_map_headent,
+        'mcfd_map_ent': mcfd_map_ent, 'mcfd_map_headent': mcfd_map_headent,
+        'nbr_id_cos': nbr_id_cos,
     }
     return loss, metrics
 
@@ -218,10 +243,10 @@ def model_training(args):
     gameformer = gameformer.to(args.device)
     freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes,
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, dropout=args.dropout,
 ).to(args.device)
 
-    optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate)
+    optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 12, 14, 16, 18], gamma=0.5)
 
     train_set = DrivingData(args.train_set + "/*.npz", args.num_neighbors)
@@ -253,9 +278,15 @@ def model_training(args):
 
         logging.info(
             f"train: minADE={train_m['minADE']:.3f} casacc={train_m['casacc']:.3f} "
-            f"cfdacc={train_m['cfdacc']:.3f} peak={train_m['mcas_peak']:.3f} cfdpk={train_m['mcfd_peak']:.3f} | "
+            f"cfdacc={train_m['cfdacc']:.3f} peak={train_m['mcas_peak']:.3f} cfdpk={train_m['mcfd_peak']:.3f} "
+            f"hgap={train_m['mcas_ent'] - train_m['mcas_headent']:.3f} "
+            f"hgap_mp={train_m['mcas_map_ent'] - train_m['mcas_map_headent']:.3f} "
+            f"idcos={train_m['nbr_id_cos']:.3f} | "
             f"val: minADE={val_m['minADE']:.3f} casacc={val_m['casacc']:.3f} "
-            f"cfdacc={val_m['cfdacc']:.3f} peak={val_m['mcas_peak']:.3f} cfdpk={val_m['mcfd_peak']:.3f}"
+            f"cfdacc={val_m['cfdacc']:.3f} peak={val_m['mcas_peak']:.3f} cfdpk={val_m['mcfd_peak']:.3f} "
+            f"hgap={val_m['mcas_ent'] - val_m['mcas_headent']:.3f} "
+            f"hgap_mp={val_m['mcas_map_ent'] - val_m['mcas_map_headent']:.3f} "
+            f"idcos={val_m['nbr_id_cos']:.3f}"
         )
 
         scheduler.step()
@@ -279,6 +310,8 @@ if __name__ == "__main__":
     parser.add_argument("--train_epochs", type=int, help="epochs of training", default=20)
     parser.add_argument("--batch_size", type=int, help="batch size (default: 32)", default=32)
     parser.add_argument("--learning_rate", type=float, help="learning rate (default: 1e-4)", default=1e-4)
+    parser.add_argument("--weight_decay", type=float, help="AdamW weight decay (default: 0.01)", default=0.01)
+    parser.add_argument("--dropout", type=float, help="CausalPlanner dropout (default: 0.1)", default=0.1)
     parser.add_argument("--device", type=str, help="run on which device (default: cuda)", default="cuda")
     parser.add_argument("--pretrained_path", type=str, help="Path to frozen GameFormer model", required=True)
     parser.add_argument("--graph_layers", type=int, help="number of ego-causal disentangler layers", default=3)
