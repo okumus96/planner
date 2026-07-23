@@ -151,11 +151,7 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
         mcfd_map_ent = out['M_cfd_map_ent'].mean().item()
         mcfd_map_headent = out['M_cfd_map_headent'].mean().item()
 
-        # ELESTIRI: Stage A slot-kimlik korunumu -- cos(nbr_clean_raw, h_nbr), ~1 => Stage A bosa,
-        # ~0 => KEY(kimlik)/VALUE(icerik) kopuk, M_cas yanlis temelde seciyor olabilir.
-        nbr_id_cos = out['nbr_identity_cos'].mean().item()
-
-        # ELESTIRI: katman-basina cos(f_cas, h_ego) -- bypass (+h_ego residual, #1 ertelendi) + GRU-fix
+        # katman-basina cos(f_cas, h_ego) -- bypass (+h_ego residual) + GRU-fix
         # etkilesimi: h_ego zinciri neredeyse identity olabilir. ~1'e yakinsa gate (M_cas-agirlikli
         # toplama) o katmanda marjinal/olu demektir, M_cas gorsellestirmesi dekoratif olur.
         gate_cos_per_layer = out['gate_cos'].mean(0)          # [L] -- batch uzerinden ortalama, katman ayri
@@ -180,7 +176,6 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
         'mcfd_ent': mcfd_ent, 'mcfd_headent': mcfd_headent,
         'mcas_map_ent': mcas_map_ent, 'mcas_map_headent': mcas_map_headent,
         'mcfd_map_ent': mcfd_map_ent, 'mcfd_map_headent': mcfd_map_headent,
-        'nbr_id_cos': nbr_id_cos,
         'gate_cos_last': gate_cos_last,
     }
     for i, v in enumerate(gate_cos_per_layer.tolist()):
@@ -252,8 +247,7 @@ def model_training(args):
     gameformer = gameformer.to(args.device)
     freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, dropout=args.dropout,
-).to(args.device)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, dropout=args.dropout).to(args.device)
 
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 12, 14, 16, 18], gamma=0.5)
@@ -290,12 +284,12 @@ def model_training(args):
             f"cfdacc={train_m['cfdacc']:.3f} peak={train_m['mcas_peak']:.3f} cfdpk={train_m['mcfd_peak']:.3f} "
             f"hgap={train_m['mcas_ent'] - train_m['mcas_headent']:.3f} "
             f"hgap_mp={train_m['mcas_map_ent'] - train_m['mcas_map_headent']:.3f} "
-            f"idcos={train_m['nbr_id_cos']:.3f} gcos={train_m['gate_cos_last']:.3f} | "
+            f"gcos={train_m['gate_cos_last']:.3f} | "
             f"val: minADE={val_m['minADE']:.3f} casacc={val_m['casacc']:.3f} "
             f"cfdacc={val_m['cfdacc']:.3f} peak={val_m['mcas_peak']:.3f} cfdpk={val_m['mcfd_peak']:.3f} "
             f"hgap={val_m['mcas_ent'] - val_m['mcas_headent']:.3f} "
             f"hgap_mp={val_m['mcas_map_ent'] - val_m['mcas_map_headent']:.3f} "
-            f"idcos={val_m['nbr_id_cos']:.3f} gcos={val_m['gate_cos_last']:.3f}"
+            f"gcos={val_m['gate_cos_last']:.3f}"
         )
 
         scheduler.step()
