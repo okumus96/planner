@@ -182,9 +182,8 @@ class EgoCausalLayer(nn.Module):
         return (cas, cfd, M_cas_mean, M_cfd_mean,
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean)
 
-    def forward(self, h_ego, h_nbr, nbr_clean, edge_ego, nbr_valid, h_map, edge_map, map_valid):
-        """h_ego [B,D]; h_nbr [B,N,D] (VALUE icin), nbr_clean [B,N,D] (KEY icin, MLP-derinlikli ama
-        cross-token karisimsiz -> "ajan j" kimligi korunur), edge_ego [B,N,De], nbr_valid [B,N];
+    def forward(self, h_ego, h_nbr, edge_ego, nbr_valid, h_map, edge_map, map_valid):
+        """h_ego [B,D]; h_nbr [B,N,D] (K=V ayni kaynak), edge_ego [B,N,De], nbr_valid [B,N];
         h_map [B,S,D], edge_map [B,S,De] (polygon->ego), map_valid [B,S].
         Doner: h_ego_new, f_cas, f_cfd, M_cas(ajan), M_cfd(ajan), M_cas_mp(harita), M_cfd_mp(harita)."""
         B, N = h_nbr.shape[0], h_nbr.shape[1]
@@ -193,7 +192,7 @@ class EgoCausalLayer(nn.Module):
 
         # --- ajan iliskisi (other) ---
         q_ag = self.Wq_ag(h_ego).view(B, 1, H, dh)
-        k_ag = self.Wk_ag(nbr_clean).view(B, N, H, dh)   # KEY = nbr_clean (ajan-j kimligi)
+        k_ag = self.Wk_ag(h_nbr).view(B, N, H, dh)
         ek_ag = self.We_k_ag(edge_ego).view(B, N, H, dh)
         msg_ag = self.Wv_ag(h_nbr).view(B, N, H, dh) + self.We_v_ag(edge_ego).view(B, N, H, dh)
         (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag,
@@ -252,8 +251,6 @@ class EgoCausalDisentangler(nn.Module):
         self.layers = nn.ModuleList([
             EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(layers)
         ])
-        # nbr_clean (Stage B'nin KEY kaynagi) icin token-basina (cross-token karisim YOK) FFN derinligi.
-        self.nbr_clean_mlp = _FFN(dim, dropout=dropout)
 
     def forward(self, agent_feat, agent_valid, agent_pose, agent_types, inputs,
                 neighbor_futures=None, neighbor_states=None):
@@ -292,8 +289,7 @@ class EgoCausalDisentangler(nn.Module):
         edge_map = map_edge_full[:, 0, 1:]                                              # [B,S,De]
 
         h_ego = h[:, 0]                                                                # [B,D]
-        h_nbr = h[:, 1:]                                                               # [B,N,D] temiz per-ajan
-        nbr_clean = self.nbr_clean_mlp(h_nbr)   # Stage B KEY'i: token-basina derinlik (cross-token karisim YOK)
+        h_nbr = h[:, 1:]                                                               # [B,N,D] temiz per-ajan (K=V)
 
         # --- STAGE B: ego-merkezli causal-split (ajan + harita, causal/confound) ---
         f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = None
@@ -305,7 +301,7 @@ class EgoCausalDisentangler(nn.Module):
              ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
              ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
              gate_cos) = layer(
-                h_ego, h_nbr, nbr_clean, edge_ego, nbr_valid, h_map, edge_map, map_valid)
+                h_ego, h_nbr, edge_ego, nbr_valid, h_map, edge_map, map_valid)
             gate_cos_layers.append(gate_cos)
         gate_cos_stack = torch.stack(gate_cos_layers, dim=1)   # [B, L] -- L=len(self.layers)
 
