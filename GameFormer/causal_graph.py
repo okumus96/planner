@@ -255,10 +255,16 @@ class EgoCausalLayer(nn.Module):
         f_cfd = self.ffn_cfd(f_cfd)
         f_cas = self.dropout(f_cas)
         f_cfd = self.dropout(f_cfd)
+        # ELESTIRI: f_cas'ta '+h_ego' bypass'i (#1, ertelendi) VAR; GRU-fix f_cfd'yi girdiden cikarinca
+        # GRU artik ~GRU(h_ego+kucuk_delta, h_ego) goruyor -- h_ego zinciri neredeyse identity olabilir,
+        # gate'in (M_cas-agirlikli toplama) katkisi buna gore KUCUK kalabilir. Sadece izleme.
+        with torch.no_grad():
+            gate_cos = F.cosine_similarity(f_cas, h_ego, dim=-1)       # [B] -- ~1 => gate marjinal/olu
         h_ego_new = self.norm(self.update(f_cas, h_ego))       # f_cfd DAHIL DEGIL -> sonraki katmana sizmaz
         return (h_ego_new, f_cas, f_cfd, M_cas_ag, M_cfd_ag, M_cas_mp, M_cfd_mp,
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
-                ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean)
+                ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
+                gate_cos)
 
 
 class EgoCausalDisentangler(nn.Module):
@@ -364,11 +370,15 @@ class EgoCausalDisentangler(nn.Module):
         f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = None
         ent_cas_mean = ent_cas_headmean = ent_cfd_mean = ent_cfd_headmean = None
         ent_cas_mp_mean = ent_cas_mp_headmean = ent_cfd_mp_mean = ent_cfd_mp_headmean = None
+        gate_cos_layers = []          # elestiri: katman-basina cos(f_cas, h_ego), bypass/GRU-fix etkilesimi
         for layer in self.layers:
             (h_ego, f_cas, f_cfd, M_cas, M_cfd, M_cas_mp, M_cfd_mp,
              ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
-             ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean) = layer(
+             ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
+             gate_cos) = layer(
                 h_ego, h_nbr, nbr_clean, edge_ego, nbr_valid, h_map, edge_map, map_valid)
+            gate_cos_layers.append(gate_cos)
+        gate_cos_stack = torch.stack(gate_cos_layers, dim=1)   # [B, L] -- L=len(self.layers)
 
         return {
             'f_cas': f_cas, 'f_cfd': f_cfd, 'M_cas': M_cas, 'M_cfd': M_cfd,
@@ -391,6 +401,9 @@ class EgoCausalDisentangler(nn.Module):
             # elestiri: Stage A slot-kimlik korunumu teshisi (bkz yukari) -- ~1 => Stage A bosa,
             # ~0 => key/value kopuk.
             'nbr_identity_cos': nbr_identity_cos,
+            # elestiri: katman-basina cos(f_cas, h_ego) [B,L] -- ~1'e yakinsa gate marjinal/olu,
+            # bypass+GRU-fix h_ego zincirini neredeyse identity yapmis olabilir.
+            'gate_cos': gate_cos_stack,
         }
 
 
@@ -471,6 +484,7 @@ class CausalPlanner(nn.Module):
             'f_cas': f_cas, 'f_cfd': f_cfd,
             'nbr_valid': dis['nbr_valid'],
             'nbr_identity_cos': dis['nbr_identity_cos'],   # elestiri: Stage A kimlik-korunum teshisi
+            'gate_cos': dis['gate_cos'],                   # elestiri: katman-basina cos(f_cas, h_ego)
             'psi_cas': self.psi(f_cas),            # PAYLASILAN head -> m* (L_KLD, informative)
             'psi_cfd': self.psi(f_cfd),            # AYNI head -> uniform (L_ENT); hile yapamaz -> entropy canli
         }
