@@ -338,7 +338,7 @@ if __name__ == "__main__":
     p.add_argument("--num_neighbors", type=int, default=10)
     p.add_argument("--encoder_layers", type=int, default=3)
     p.add_argument("--decoder_levels", type=int, default=2)
-    p.add_argument("--graph_layers", type=int, default=3)
+    p.add_argument("--graph_layers", type=int, default=1)
     p.add_argument("--modes", type=int, default=6)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--out", type=str, default="causal_bev.png")

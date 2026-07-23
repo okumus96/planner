@@ -132,11 +132,6 @@ class EgoCausalLayer(nn.Module):
         # karisim yapar, FFN her token'i KENDI icinde dogrusal-olmayan isler). Kendi prenorm+residual'i var.
         self.ffn_cas = _FFN(dim, dropout=dropout)
         self.ffn_cfd = _FFN(dim, dropout=dropout)
-        # ego node guncelleme (katmanlar arasi). SADECE f_cas ile guncellenir -- f_cfd karisirsa
-        # bir onceki katmanin confound bilgisi h_ego uzerinden bir SONRAKI katmanin f_cas'ina sizar
-        # (CP'de bu sizinti yolu YOK: CP causal-split katmanini TEK KEZ uygular, zincirlemez).
-        self.update = nn.GRUCell(dim, dim)
-        self.norm = nn.LayerNorm(dim)
         self.leaky = nn.LeakyReLU(0.2)
         self.dropout = nn.Dropout(dropout)
 
@@ -216,12 +211,11 @@ class EgoCausalLayer(nn.Module):
         f_cfd = self.ffn_cfd(f_cfd)
         f_cas = self.dropout(f_cas)
         f_cfd = self.dropout(f_cfd)
-        # ELESTIRI: f_cas'ta '+h_ego' bypass'i (#1, ertelendi) VAR; GRU-fix f_cfd'yi girdiden cikarinca
-        # GRU artik ~GRU(h_ego+kucuk_delta, h_ego) goruyor -- h_ego zinciri neredeyse identity olabilir,
-        # gate'in (M_cas-agirlikli toplama) katkisi buna gore KUCUK kalabilir. Sadece izleme.
+        # cos(f_cas, h_ego) -- ~1 => gate marjinal (h_ego bypass'i baskin), dusuk => gate canli.
         with torch.no_grad():
-            gate_cos = F.cosine_similarity(f_cas, h_ego, dim=-1)       # [B] -- ~1 => gate marjinal/olu
-        h_ego_new = self.norm(self.update(f_cas, h_ego))       # f_cfd DAHIL DEGIL -> sonraki katmana sizmaz
+            gate_cos = F.cosine_similarity(f_cas, h_ego, dim=-1)       # [B]
+        # ego'yu katmanlar arasi f_cas ile tasi (GRU YOK; f_cfd DAHIL DEGIL -> confound sizmaz).
+        h_ego_new = f_cas
         return (h_ego_new, f_cas, f_cfd, M_cas_ag, M_cfd_ag, M_cas_mp, M_cfd_mp,
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
                 ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
