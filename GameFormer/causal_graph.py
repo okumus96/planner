@@ -108,8 +108,12 @@ class EgoCausalLayer(nn.Module):
         super().__init__()
         assert dim % heads == 0
         self.dim, self.heads, self.dh = dim, heads, dim // heads
-        # 'other' (ajan) iliskisi. Edge projeksiyonlari FAZ1: duz Linear -> prenorm _EdgeMLP.
-        self.Wq_ag = nn.Linear(dim, dim); self.Wk_ag = nn.Linear(dim, dim); self.Wv_ag = nn.Linear(dim, dim)
+        # 'other' (ajan) iliskisi. Query HEP ego (tek), ama KEY/VALUE komsu-tipine gore AYRI (CP
+        # wks["other_*"]/wvs["other"] = 4 tiplik ModuleList; tip = okunulan komsunun tipi). Bizde target
+        # hep ego oldugu icin query/output/self_fc tek kalir, SADECE komsu-tarafi K/V tip-basina.
+        self.Wq_ag = nn.Linear(dim, dim)
+        self.Wk_ag = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_AGENT_TYPES)])
+        self.Wv_ag = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_AGENT_TYPES)])
         self.We_k_ag = _EdgeMLP(edge_dim, dim, dropout=dropout); self.We_v_ag = _EdgeMLP(edge_dim, dim, dropout=dropout)
         self.attn_cas = nn.Parameter(torch.empty(heads, self.dh))     # ajan causal attn vektoru
         self.attn_cfd = nn.Parameter(torch.empty(heads, self.dh))
@@ -177,19 +181,27 @@ class EgoCausalLayer(nn.Module):
         return (cas, cfd, M_cas_mean, M_cfd_mean,
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean)
 
-    def forward(self, h_ego, h_nbr, edge_ego, nbr_valid, h_map, edge_map, map_valid):
-        """h_ego [B,D]; h_nbr [B,N,D] (K=V ayni kaynak), edge_ego [B,N,De], nbr_valid [B,N];
-        h_map [B,S,D], edge_map [B,S,De] (polygon->ego), map_valid [B,S].
+    @staticmethod
+    def _per_type(mods, x, types):
+        """x [B,N,D], types [B,N] long, mods = T tiplik ModuleList -> her token'a KENDI tipinin
+        Linear'ini uygula (CP wks/wvs["other"][t] mantigi). Tumu hesaplanip tip'e gore toplanir."""
+        stacked = torch.stack([m(x) for m in mods], dim=2)                  # [B,N,T,D]
+        idx = types.clamp(min=0, max=len(mods) - 1)[:, :, None, None].expand(-1, -1, 1, x.shape[-1])
+        return stacked.gather(2, idx).squeeze(2)                            # [B,N,D]
+
+    def forward(self, h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid):
+        """h_ego [B,D]; h_nbr [B,N,D] (K=V ayni kaynak), nbr_types [B,N] long (komsu tipi -> tip-basina
+        K/V), edge_ego [B,N,De], nbr_valid [B,N]; h_map [B,S,D], edge_map [B,S,De] (polygon->ego), map_valid [B,S].
         Doner: h_ego_new, f_cas, f_cfd, M_cas(ajan), M_cfd(ajan), M_cas_mp(harita), M_cfd_mp(harita)."""
         B, N = h_nbr.shape[0], h_nbr.shape[1]
         S = h_map.shape[1]
         H, dh = self.heads, self.dh
 
-        # --- ajan iliskisi (other) ---
+        # --- ajan iliskisi (other): KEY/VALUE komsu-tipine gore AYRI (CP tip-basina wks/wvs) ---
         q_ag = self.Wq_ag(h_ego).view(B, 1, H, dh)
-        k_ag = self.Wk_ag(h_nbr).view(B, N, H, dh)
+        k_ag = self._per_type(self.Wk_ag, h_nbr, nbr_types).view(B, N, H, dh)
         ek_ag = self.We_k_ag(edge_ego).view(B, N, H, dh)
-        msg_ag = self.Wv_ag(h_nbr).view(B, N, H, dh) + self.We_v_ag(edge_ego).view(B, N, H, dh)
+        msg_ag = self._per_type(self.Wv_ag, h_nbr, nbr_types).view(B, N, H, dh) + self.We_v_ag(edge_ego).view(B, N, H, dh)
         (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag,
          ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean) = self._attend(
             q_ag, k_ag, ek_ag, msg_ag, nbr_valid, self.attn_cas, self.attn_cfd)
@@ -265,6 +277,7 @@ class EgoCausalDisentangler(nn.Module):
 
         ego_clean = h[:, 0]           # head'e verilen temiz ego (SADECE ego'nun kendi gecmisi + tip)
         nbr_valid = agent_valid[:, 1:]                                                 # [B,N]
+        nbr_types = agent_types[:, 1:]                                                 # [B,N] tip-basina K/V
 
         # --- HARITA polygonlari: kendi encoder'larimizla token (agent-free) + polygon->ego kenari ---
         lanes = inputs['map_lanes'][..., :3].float()
@@ -295,7 +308,7 @@ class EgoCausalDisentangler(nn.Module):
              ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
              ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
              gate_cos) = layer(
-                h_ego, h_nbr, edge_ego, nbr_valid, h_map, edge_map, map_valid)
+                h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid)
             gate_cos_layers.append(gate_cos)
         gate_cos_stack = torch.stack(gate_cos_layers, dim=1)   # [B, L] -- L=len(self.layers)
 
