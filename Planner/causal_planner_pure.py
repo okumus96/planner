@@ -23,7 +23,7 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 
 class CausalPurePlanner(AbstractPlanner):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
-                 plan_source='cas', device=None):
+                 plan_source='cas', nbr_enrich=0, device=None):
         self._future_horizon = T
         self._step_interval = DT
         self._backbone_path = backbone_path
@@ -31,6 +31,7 @@ class CausalPurePlanner(AbstractPlanner):
         self._num_neighbors = num_neighbors
         self._graph_layers = graph_layers
         self._modes = modes
+        self._nbr_enrich = nbr_enrich
         # 'cas' (varsayilan, ANA plan) vs 'cfd': plani f_cfd'den uretir (refiner YOK, ciplak head).
         assert plan_source in ('cas', 'cfd')
         self._plan_source = plan_source
@@ -51,7 +52,7 @@ class CausalPurePlanner(AbstractPlanner):
         self._gameformer.load_state_dict(torch.load(self._backbone_path, map_location=self._device))
         self._gameformer.to(self._device).eval()
         # causal head (trained module)
-        self._causal = CausalPlanner(layers=self._graph_layers, modes=self._modes)
+        self._causal = CausalPlanner(layers=self._graph_layers, modes=self._modes, nbr_enrich=self._nbr_enrich)
         self._causal.load_state_dict(torch.load(self._causal_path, map_location=self._device))
         self._causal.to(self._device).eval()
 

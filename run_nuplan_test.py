@@ -176,7 +176,7 @@ def main(args):
         planner = CausalPurePlanner(
             backbone_path=args.model_path, causal_path=args.causal_path,
             num_neighbors=args.num_neighbors, graph_layers=args.graph_layers,
-            modes=args.modes, plan_source=args.plan_source, device=args.device,
+            modes=args.modes, plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, device=args.device,
         )
         print(f"[PURE CAUSAL] backbone={args.model_path}  causal={args.causal_path}  (refiner YOK)  "
               f"plan_source={args.plan_source}")
@@ -187,7 +187,7 @@ def main(args):
             num_neighbors=args.num_neighbors, graph_layers=args.graph_layers,
             modes=args.modes,
             use_causal=(not args.baseline), remove=args.remove, remove_k=args.remove_k,
-            plan_source=args.plan_source, device=args.device,
+            plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, device=args.device,
         )
         print(f"[CAUSAL+REFINER] causal={args.causal_path}  "
               f"plan={'GameFormer' if args.baseline else 'CausalPlanner'}  remove={args.remove}x{args.remove_k}  "
@@ -342,6 +342,7 @@ if __name__ == "__main__":
                         help='CausalPlanner ckpt -> PURE causal planner (refiner YOK). Verilirse model_path=backbone.')
     parser.add_argument('--num_neighbors', type=int, default=10)
     parser.add_argument('--graph_layers', type=int, default=3)
+    parser.add_argument('--nbr_enrich', type=int, default=0)
     parser.add_argument('--modes', type=int, default=6)
     parser.add_argument('--deploy', type=str, default='refiner', choices=['pure', 'refiner'],
                         help='causal cikti: pure (refiner yok) | refiner (causal neural_plan -> refiner)')

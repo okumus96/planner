@@ -93,6 +93,46 @@ class _FFN(nn.Module):
         return self.dropout(h) + residual
 
 
+class _NbrMapEnrichLayer(nn.Module):
+    """CP scene-embedding'in (a2g) KIMLIK-KORUYAN hali: HER komsu (ego DEGIL) haritaya (polygon)
+    attend edip KENDI yol/serit baglamini kazanir. AJAN->HARITA SADECE -> ajan->ajan karisim YOK,
+    komsu kimligi korunur (M_cas hala "ajan j" uzerinden anlamli). Boylece komsular "serit-farkinda"
+    olur -> causal-vs-confounding ayrimi (CP: ayni-serit-onundeki=causal, karsi-serit=confounding)
+    mumkun olur. Harita STATIK (map<-agent guncellemesi YOK). Ego'ya DOKUNULMAZ -> gate marjinallesmez.
+    Kenar-farkindalikli (GATv2-tarzi), komsu->harita goreli geometri skora girer."""
+
+    def __init__(self, dim=256, heads=8, edge_dim=EDGE_FEATURE_DIM, dropout=0.1):
+        super().__init__()
+        assert dim % heads == 0
+        self.dim, self.heads, self.dh = dim, heads, dim // heads
+        self.Wq = nn.Linear(dim, dim)      # komsu query (her komsu ayri)
+        self.Wk = nn.Linear(dim, dim)      # harita key
+        self.Wv = nn.Linear(dim, dim)      # harita value
+        self.We_k = _EdgeMLP(edge_dim, dim, dropout=dropout)
+        self.We_v = _EdgeMLP(edge_dim, dim, dropout=dropout)
+        self.attn = nn.Parameter(torch.empty(heads, self.dh)); nn.init.xavier_uniform_(self.attn)
+        self.norm = nn.LayerNorm(dim)
+        self.ffn = _FFN(dim, dropout=dropout)
+        self.leaky = nn.LeakyReLU(0.2)
+
+    def forward(self, h_nbr, h_map, edge_nbr_map, map_valid):
+        """h_nbr [B,N,D] (her komsu bir query, HEPSI guncellenir); h_map [B,S,D] (STATIK key/value);
+        edge_nbr_map [B,N,S,De] (harita(kaynak)->komsu(hedef) goreli geometri); map_valid [B,S]."""
+        B, N = h_nbr.shape[0], h_nbr.shape[1]
+        S = h_map.shape[1]
+        H, dh = self.heads, self.dh
+        q = self.Wq(h_nbr).view(B, N, 1, H, dh)
+        k = self.Wk(h_map).view(B, 1, S, H, dh)
+        ek = self.We_k(edge_nbr_map).view(B, N, S, H, dh)
+        v = self.Wv(h_map).view(B, 1, S, H, dh) + self.We_v(edge_nbr_map).view(B, N, S, H, dh)
+        s = self.leaky(q + k + ek)                                      # [B,N,S,H,dh]
+        a = (s * self.attn).sum(-1)                                     # [B,N,S,H]
+        invalid = ~map_valid[:, None, :, None]                          # [B,1,S,1]
+        M = torch.softmax(a.masked_fill(invalid, torch.finfo(a.dtype).min), dim=2).masked_fill(invalid, 0.0)
+        ctx = (M.unsqueeze(-1) * v).sum(dim=2).reshape(B, N, H * dh)     # [B,N,D] her komsuya harita baglami
+        return self.ffn(self.norm(h_nbr + ctx))                         # [B,N,D] serit-farkinda komsular
+
+
 class EgoCausalLayer(nn.Module):
     """Ego-oriented DUAL-RELATION causal katmani (Causal-Planner CGD'sine sadik, hdgt_encoder.py).
     Ego query IKI iliskiye attend eder:
@@ -242,7 +282,7 @@ class EgoCausalDisentangler(nn.Module):
     gunceller, komsular sabit kalir. Son katmanin f_cas/f_cfd + M_cas/M_cfd ciktisi kullanilir.
     """
 
-    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1):
+    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0):
         super().__init__()
         self.future_encoder = FutureEncoder()
         self.future_fuse = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU())
@@ -254,6 +294,11 @@ class EgoCausalDisentangler(nn.Module):
         self.crosswalk_encoder = PolylineEncoder(3, dim)
         self.route_encoder = PolylineEncoder(3, dim)
         self.map_norm = nn.LayerNorm(dim)
+        # KOMSU->HARITA enrichment (CP scene-embedding a2g, kimlik-koruyan): causal split'ten ONCE her
+        # komsuya serit/yol baglami kazandirir. nbr_enrich=0 => mevcut davranis (enrichment YOK).
+        self.nbr_enrich = nn.ModuleList([
+            _NbrMapEnrichLayer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(nbr_enrich)
+        ])
         self.layers = nn.ModuleList([
             EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(layers)
         ])
@@ -297,6 +342,14 @@ class EgoCausalDisentangler(nn.Module):
 
         h_ego = h[:, 0]                                                                # [B,D]
         h_nbr = h[:, 1:]                                                               # [B,N,D] temiz per-ajan (K=V)
+
+        # --- KOMSU->HARITA ENRICHMENT (causal split ONCESI): her komsu serit/yol baglami kazanir ---
+        # Ego'ya DOKUNULMAZ (gate marjinallesmesin). Ajan->ajan YOK (kimlik korunur). Harita STATIK.
+        if len(self.nbr_enrich) > 0:
+            nbr_map_edge = build_edge_features(torch.cat([agent_pose[:, 1:], map_pose], dim=1))  # [B,N+S,N+S,De]
+            edge_nbr_map = nbr_map_edge[:, :N, N:]                                      # [B,N,S,De] harita->komsu
+            for enrich in self.nbr_enrich:
+                h_nbr = enrich(h_nbr, h_map, edge_nbr_map, map_valid)
 
         # --- STAGE B: ego-merkezli causal-split (ajan + harita, causal/confound) ---
         f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = None
@@ -360,9 +413,9 @@ class CausalEgoHead(nn.Module):
 class CausalPlanner(nn.Module):
     """Ust modul: disentangler (A) + ego head (B) + adversarial psi head'leri (C)."""
 
-    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1):
+    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0):
         super().__init__()
-        self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout)
+        self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich)
         self.head = CausalEgoHead(dim, modes, dropout)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
