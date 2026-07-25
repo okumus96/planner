@@ -57,6 +57,66 @@ def freeze_gameformer(gameformer):
         parameter.requires_grad = False
 
 
+# --- CP-tarzi 5-sinif manevra etiketi (get_decision.py port) ---
+# psi'nin STABIL/anlamli hedefi: m* (WTA kazanan mod, egitim boyunca KAYAR, ogrenilemez) YERINE
+# GT ego-future'dan turetilen SABIT manevra etiketi. Bedava (GT'den), per-agent label YOK.
+_MANEUVER = {'stationary': 0, 'straight': 1, 'turning_left': 2, 'turning_right': 3, 'U-turn_left': 4}
+NUM_MANEUVERS = 5
+
+
+def _resample_arc(xy, n):
+    """xy [M,2] -> yay-uzunlugu boyunca uniform n nokta (get_decision.resample_line ile ayni, np.interp)."""
+    seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    if cum[-1] < 1e-6:
+        return np.repeat(xy[:1], n, axis=0)
+    cum = cum / cum[-1]
+    t = np.linspace(0.0, 1.0, n)
+    return np.stack([np.interp(t, cum, xy[:, 0]), np.interp(t, cum, xy[:, 1])], axis=1)
+
+
+def _maneuver_one(xy, yaw):
+    """xy [M,2], yaw [M] (GT ego gelecek, ego-frame) -> 0..4 manevra sinifi (get_decision.py'a sadik).
+    Esikler: straight=0.03, turning=0.18 egrilik; heading-farki 0.2; yay-uzunlugu 3m (altinda stationary)."""
+    valid = ~np.all(xy == 0, axis=1)
+    xy, yaw = xy[valid], yaw[valid]
+    if len(xy) < 2:
+        return _MANEUVER['stationary']
+    length = float(np.linalg.norm(np.diff(xy, axis=0), axis=1).sum())
+    if length < 3.0:
+        return _MANEUVER['stationary']
+    pts = _resample_arc(xy, int(length))                     # ~1m aralik -> dusuk-hiz egrilik gurultusunu keser
+    tan = np.diff(pts, axis=0)
+    tan = tan / np.clip(np.linalg.norm(tan, axis=1, keepdims=True), 1e-8, None)
+    ang = np.arccos(np.clip((tan[:-1] * tan[1:]).sum(1), -1.0, 1.0))
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    curv = ang / np.clip(seg[:-1], 1e-8, None)
+    sign = np.sign(np.cross(tan[:-1], tan[1:]))
+    i = int(np.argmax(curv))
+    c = round(float(curv[i]), 2)
+    s = float(sign[i])
+    diff = round(float(abs(yaw[0] - yaw[-1])), 2)
+    turning = (0.03 < c < 0.18 and diff > 0.2) or (0.1 < c < 0.18)
+    uturn = c >= 0.18
+    if turning or uturn:
+        if s == 1.0:
+            ctx = 'U-turn_left' if uturn else 'turning_left'
+        elif s == -1.0:
+            ctx = 'turning_right'          # get_decision: sag U-turn -> turning'e dusurulur -> turning_right
+        else:
+            ctx = 'straight'
+    else:
+        ctx = 'straight'
+    return _MANEUVER[ctx]
+
+
+def maneuver_labels(ego_future):
+    """ego_future [B,80,3] (x,y,heading) -> LongTensor [B] manevra etiketi (0..4), ayni cihazda."""
+    ef = ego_future.detach().cpu().numpy()
+    labs = [_maneuver_one(ef[b, :, :2], ef[b, :, 2]) for b in range(ef.shape[0])]
+    return torch.tensor(labs, dtype=torch.long, device=ego_future.device)
+
+
 def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask):
     """Causal-Planner'a SADIK loss (ref: ~/Causal-Planner lightning_trainer.py). Backdoor/GRL YOK.
 
@@ -78,10 +138,10 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
     Doner (loss, metrics_dict)."""
     gt = ego_future[:, None]                                       # [B, 1, 80, 3]
     l_traj, _, best_mode = imitation_loss(out['traj'], out['score'], gt)
-    m_star = best_mode[:, 0]                                       # [B] kazanan mod (ana head)
-    K = out['psi_cas'].shape[-1]
+    m_star = maneuver_labels(ego_future)                          # [B] SABIT GT-manevra etiketi (0..4)
+    K = out['psi_cas'].shape[-1]                                   # = NUM_MANEUVERS
 
-    # --- decision_loss (CP): causal dal dogru modu bilsin ---
+    # --- decision_loss (CP): causal dal GT manevrasini bilsin (m* = kararsiz WTA mod DEGIL) ---
     l_kld = F.cross_entropy(out['psi_cas'], m_star)
 
     # --- decision_causal_inference_loss (CP): KL(uniform || p_cfd) + 0.1*(-H) ---

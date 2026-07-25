@@ -391,20 +391,28 @@ class CausalEgoHead(nn.Module):
     baglami YOK (yoksa harita-gate anlamsiz olurdu). GMMPredictor + imitation (WTA GMM).
     """
 
-    def __init__(self, dim=256, modes=6, dropout=0.1):
+    def __init__(self, dim=256, modes=6, dropout=0.1, num_maneuvers=5):
         super().__init__()
         self.dim, self.modes = dim, modes
         self.mode_query = nn.Embedding(modes, dim)
+        # DOD (CP III-C): tahmin edilen manevra karari (b* = argmax psi_cas) decoder query'sine besleniyor.
+        # decision_emb[b*] her mode query ile birlesip MLP'den gecer -> q_enh = MLP([q_mode; theta_b*]).
+        self.decision_emb = nn.Embedding(num_maneuvers, dim)
+        self.q_enh = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU(), nn.Linear(dim, dim))
         self.cross = CrossTransformer(dim=dim, dropout=dropout)
         self.predictor = GMMPredictor(modalities=modes)
 
-    def forward(self, f_cas, ego_token):
+    def forward(self, f_cas, ego_token, b_star=None):
         # ego_token = TEMIZ ego (ego_clean): confounding sizintisi olmasin diye. Head'e sahne bilgisi
         # SADECE f_cas (causal-gated ajan+harita) uzerinden girer; f_cfd trajectory'ye hic dokunmaz.
         B = f_cas.shape[0]
         ctx = torch.cat([f_cas[:, None], ego_token[:, None]], dim=1)             # [B,2,D]
         ctx_pad = torch.zeros(B, 2, dtype=torch.bool, device=f_cas.device)       # ikisi de gecerli
         q = self.mode_query.weight[None].expand(B, -1, -1)                       # [B,M,D]
+        if b_star is not None:
+            # DOD: her mode query'ye tahmin edilen manevra kararini (embedding) besle.
+            dec = self.decision_emb(b_star)[:, None].expand(-1, self.modes, -1)  # [B,M,D]
+            q = self.q_enh(torch.cat([q, dec], dim=-1))                          # [B,M,D] karar-hizali query
         content = self.cross(q, ctx, ctx, mask=ctx_pad)                          # [B,M,D]
         traj, score = self.predictor(content.unsqueeze(1))                       # [B,1,M,80,4], [B,1,M]
         return traj, score
@@ -413,15 +421,16 @@ class CausalEgoHead(nn.Module):
 class CausalPlanner(nn.Module):
     """Ust modul: disentangler (A) + ego head (B) + adversarial psi head'leri (C)."""
 
-    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0):
+    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, num_maneuvers=5):
         super().__init__()
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich)
-        self.head = CausalEgoHead(dim, modes, dropout)
+        self.head = CausalEgoHead(dim, modes, dropout, num_maneuvers=num_maneuvers)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
         # trivial cozuyor (gradyan 0 -> f_cfd sekillenmez). Paylasinca head causal'i dogru tahmin etmek
         # ZORUNDA -> hile yapamaz -> uniform baskisi f_cfd FEATURE'larina akar -> entropy CANLI kalir.
-        self.psi = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, modes))
+        # Cikti = 5-sinif MANEVRA (CP get_decision.py) -- SABIT/ogrenilebilir hedef (WTA m* DEGIL).
+        self.psi = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_maneuvers))
 
     def forward(self, encoder_outputs, inputs, num_agents,
                 neighbor_futures=None, neighbor_states=None, also_cfd_plan=False):
@@ -435,16 +444,19 @@ class CausalPlanner(nn.Module):
                                 neighbor_futures=neighbor_futures, neighbor_states=neighbor_states)
         f_cas, f_cfd = dis['f_cas'], dis['f_cfd']
 
-        # ANA plan: head'e TEMIZ ego (ego_clean) + SADECE f_cas girer. f_cas artik gate'li ajan+harita
-        # tasir -> trajectory yalnizca causal ajanlar+harita+ego'ya bagli. Inference bunu kullanir.
-        traj, score = self.head(f_cas, dis['ego_clean'])                # [B,1,M,80,4], [B,1,M]
+        # DOD: psi'yi head'den ONCE hesapla; tahmin edilen manevra karari (b*) decoder query'sine besle.
+        psi_cas = self.psi(f_cas)
+        psi_cfd = self.psi(f_cfd)
+        b_star = psi_cas.argmax(-1)                                      # [B] (argmax non-diff -> psi'ye sizmaz)
 
-        # Tanı/ablasyon amaçlı: f_cfd'den de bir plan üret (aynı EĞİTİLMİŞ head ile). Varsayılan KAPALI
-        # -> eğitimde ekstra hesap/gradyan yok, mevcut davranış birebir korunur. AÇILDIĞINDA: "confounding
-        # graph gerçekten davranış-belirleyici bilgi taşıyor mu?" sorusunu closed-loop'ta test eder.
+        # ANA plan: head'e TEMIZ ego (ego_clean) + SADECE f_cas + karar-embedding girer. f_cas artik
+        # gate'li ajan+harita tasir -> trajectory yalnizca causal ajanlar+harita+ego+karara bagli.
+        traj, score = self.head(f_cas, dis['ego_clean'], b_star)        # [B,1,M,80,4], [B,1,M]
+
+        # Tanı/ablasyon amaçlı: f_cfd'den de bir plan üret (aynı EĞİTİLMİŞ head ile). Varsayılan KAPALI.
         traj_cfd = score_cfd = None
         if also_cfd_plan:
-            traj_cfd, score_cfd = self.head(f_cfd, dis['ego_clean'])
+            traj_cfd, score_cfd = self.head(f_cfd, dis['ego_clean'], psi_cfd.argmax(-1))
 
         out = {
             'traj': traj, 'score': score,
@@ -460,7 +472,7 @@ class CausalPlanner(nn.Module):
             'f_cas': f_cas, 'f_cfd': f_cfd,
             'nbr_valid': dis['nbr_valid'],
             'gate_cos': dis['gate_cos'],                   # katman-basina cos(f_cas, h_ego)
-            'psi_cas': self.psi(f_cas),            # PAYLASILAN head -> m* (L_KLD, informative)
-            'psi_cfd': self.psi(f_cfd),            # AYNI head -> uniform (L_ENT); hile yapamaz -> entropy canli
+            'psi_cas': psi_cas,                    # PAYLASILAN head -> manevra (L_KLD, informative)
+            'psi_cfd': psi_cfd,                    # AYNI head -> uniform (L_ENT); hile yapamaz -> entropy canli
         }
         return out
