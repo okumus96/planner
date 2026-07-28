@@ -57,7 +57,7 @@ def freeze_gameformer(gameformer):
         parameter.requires_grad = False
 
 
-def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask):
+def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask, lambda_conflict=0.0):
     """Causal-Planner'a SADIK loss (ref: ~/Causal-Planner lightning_trainer.py). Backdoor/GRL YOK.
 
     CP'nin toplami:
@@ -109,7 +109,17 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
     l_mask = l_comp + l_excl + l_norm                               # CP: other_soft_mask + g2a_soft_mask
 
     nv_f = out['nbr_valid'].float()
-    loss = l_traj + lambda_kld * l_kld + lambda_ci * l_ci + lambda_mask * l_mask
+
+    # --- L_conflict (self-supervised): M_cas'in BEKLENEN conflict-mesafesini cezalandir -> attention'i
+    # yakin/cakisan ajanlara iter. penalty = 3 mesafe feature'inin ortalamasi (uzak=yuksek); M_cas softmax
+    # oldugu icin Sum_j M_cas_j*penalty_j = E_{M_cas}[penalty]. Bias'in aksine bu bir LOSS -> E1'in eksik
+    # gradyanini verir. conflict feature detached (grad sadece M_cas uzerinden akar).
+    l_conflict = torch.tensor(0.0, device=l_traj.device)
+    if lambda_conflict > 0.0 and out.get('conflict') is not None:
+        penalty = out['conflict'][..., :3].mean(-1)                 # [B,N] uzak=yuksek
+        l_conflict = (out['M_cas'] * penalty).sum(-1).mean()        # E_{M_cas}[penalty], batch ort
+
+    loss = l_traj + lambda_kld * l_kld + lambda_ci * l_ci + lambda_mask * l_mask + lambda_conflict * l_conflict
 
     with torch.no_grad():
         traj_xy = out['traj'][:, 0, :, :, :2]                     # [B, M, 80, 2]
@@ -167,7 +177,7 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
     metrics = {
         'loss': loss.item(), 'traj': l_traj.item(), 'kld': l_kld.item(),
         'kl': l_kl.item(), 'ent': ent.item(), 'casent': casent, 'entgap': entgap,
-        'ci': l_ci.item(), 'mask': l_mask.item(),
+        'ci': l_ci.item(), 'mask': l_mask.item(), 'conflict': l_conflict.item(),
         'comp': l_comp.item(), 'excl': l_excl.item(), 'norm': l_norm.item(),
         'minADE': minade, 'minFDE': minfde, 'casacc': cas_acc, 'cfdacc': cfd_acc,
         'mcas_peak': mcas_peak, 'mcas_map_peak': mcas_map_peak, 'qbar': q_bar,
@@ -184,7 +194,7 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
 
 
 def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
-               lambda_kld, lambda_ci, lambda_mask,
+               lambda_kld, lambda_ci, lambda_mask, lambda_conflict=0.0,
                optimizer=None, desc="Training"):
     train = optimizer is not None
     causal.train() if train else causal.eval()
@@ -205,7 +215,7 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                 out = causal(encoder_outputs, inputs, num_agents=num_neighbors + 1,
                              neighbor_futures=top1_fut, neighbor_states=nbr_states)
                 loss, metrics = causal_loss_and_metrics(out, ego_future, lambda_kld,
-                                                         lambda_ci, lambda_mask)
+                                                         lambda_ci, lambda_mask, lambda_conflict)
 
             if train:
                 optimizer.zero_grad()
@@ -248,7 +258,8 @@ def model_training(args):
     freeze_gameformer(gameformer)
 
     causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, dropout=args.dropout,
-                           nbr_enrich=args.nbr_enrich).to(args.device)
+                           nbr_enrich=args.nbr_enrich, conflict_feats=args.conflict_feats,
+                           conflict_bias=args.conflict_bias).to(args.device)
 
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 12, 14, 16, 18], gamma=0.5)
@@ -262,10 +273,10 @@ def model_training(args):
     for epoch in range(args.train_epochs):
         logging.info(f"Epoch {epoch + 1}/{args.train_epochs}")
         train_m = _run_epoch(train_loader, gameformer, causal, args.device, args.num_neighbors,
-                             args.lambda_kld, args.lambda_ci, args.lambda_mask,
+                             args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_conflict,
                              optimizer=optimizer, desc="Training")
         val_m = _run_epoch(valid_loader, gameformer, causal, args.device, args.num_neighbors,
-                           args.lambda_kld, args.lambda_ci, args.lambda_mask,
+                           args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_conflict,
                            optimizer=None, desc="Validation")
 
         log = {"epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]}
@@ -320,6 +331,8 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_path", type=str, help="Path to frozen GameFormer model", required=True)
     parser.add_argument("--graph_layers", type=int, help="number of ego-causal disentangler layers", default=1)
     parser.add_argument("--nbr_enrich", type=int, help="neighbor->map enrichment layers before split (0 = KAPALI)", default=0)
+    parser.add_argument("--conflict_feats", type=int, help="ajan edge'ine future-conflict feature ekle (0=KAPALI)", default=0)
+    parser.add_argument("--conflict_bias", type=int, help="causal logit'e explicit conflict cezasi (uzak ajani bastir; 0=KAPALI)", default=0)
     parser.add_argument("--modes", type=int, help="number of trajectory head modes K", default=6)
     # Agirliklar Causal-Planner lightning_trainer.py:263-265 ile ayni:
     #   loss = <traj> + 1.0*decision_loss + 0.5*decision_causal_inference_loss + 0.5*soft_mask_loss
@@ -329,6 +342,8 @@ if __name__ == "__main__":
                         help="CP decision_causal_inference_loss: KL(uniform||p_cfd)+0.1*(-H) [CP=0.5]")
     parser.add_argument("--lambda_mask", type=float, default=0.5,
                         help="CP soft_mask_loss: (comp+excl+norm) ajan + harita TOPLAMI [CP=0.5]")
+    parser.add_argument("--lambda_conflict", type=float, default=0.0,
+                        help="L_conflict: M_cas'in beklenen conflict-mesafesini cezalandir (uzak ajani it; 0=KAPALI)")
     args = parser.parse_args()
 
     model_training(args)
