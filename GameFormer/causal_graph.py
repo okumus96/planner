@@ -148,21 +148,20 @@ class EgoCausalLayer(nn.Module):
         super().__init__()
         assert dim % heads == 0
         self.dim, self.heads, self.dh = dim, heads, dim // heads
-        # 'other' (ajan) iliskisi. Query HEP ego (tek), ama KEY/VALUE komsu-tipine gore AYRI (CP
-        # wks["other_*"]/wvs["other"] = 4 tiplik ModuleList; tip = okunulan komsunun tipi). Bizde target
-        # hep ego oldugu icin query/output/self_fc tek kalir, SADECE komsu-tarafi K/V tip-basina.
+        # 'other' (ajan) iliskisi. Query HEP ego (tek); VALUE komsu-tipine gore AYRI (cas/cfd ORTAK value).
+        # #1: cas ve cfd icin AYRI KEY (CP wks["other_causal/confound"][t]) -> ayrimi KEY yapar, TEK attn.
         self.Wq_ag = nn.Linear(dim, dim)
-        self.Wk_ag = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_AGENT_TYPES)])
-        self.Wv_ag = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_AGENT_TYPES)])
+        self.Wk_cas_ag = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_AGENT_TYPES)])   # causal key (per-tip)
+        self.Wk_cfd_ag = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_AGENT_TYPES)])   # confound key (per-tip)
+        self.Wv_ag = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_AGENT_TYPES)])       # value ORTAK
         self.We_k_ag = _EdgeMLP(edge_dim, dim, dropout=dropout); self.We_v_ag = _EdgeMLP(edge_dim, dim, dropout=dropout)
-        self.attn_cas = nn.Parameter(torch.empty(heads, self.dh))     # ajan causal attn vektoru
-        self.attn_cfd = nn.Parameter(torch.empty(heads, self.dh))
-        # 'g2a' (harita) iliskisi
-        self.Wq_mp = nn.Linear(dim, dim); self.Wk_mp = nn.Linear(dim, dim); self.Wv_mp = nn.Linear(dim, dim)
+        self.attn_ag = nn.Parameter(torch.empty(heads, self.dh))      # TEK scoring vektoru (ayrimi key yapar)
+        # 'g2a' (harita) iliskisi. Ayri cas/cfd key (paylasimli, harita tipsiz), tek value, tek attn.
+        self.Wq_mp = nn.Linear(dim, dim); self.Wv_mp = nn.Linear(dim, dim)
+        self.Wk_cas_mp = nn.Linear(dim, dim); self.Wk_cfd_mp = nn.Linear(dim, dim)
         self.We_k_mp = _EdgeMLP(edge_dim, dim, dropout=dropout); self.We_v_mp = _EdgeMLP(edge_dim, dim, dropout=dropout)
-        self.attn_cas_mp = nn.Parameter(torch.empty(heads, self.dh))  # harita causal attn vektoru
-        self.attn_cfd_mp = nn.Parameter(torch.empty(heads, self.dh))
-        for p in (self.attn_cas, self.attn_cfd, self.attn_cas_mp, self.attn_cfd_mp):
+        self.attn_mp = nn.Parameter(torch.empty(heads, self.dh))
+        for p in (self.attn_ag, self.attn_mp):
             nn.init.xavier_uniform_(p)
         # birlestirme (Eq 6): [self ; ajan ; harita] -> f_cas / f_cfd
         self.self_fc = nn.Sequential(nn.Linear(dim, dim), nn.ReLU())
@@ -179,14 +178,15 @@ class EgoCausalLayer(nn.Module):
         self.leaky = nn.LeakyReLU(0.2)
         self.dropout = nn.Dropout(dropout)
 
-    def _attend(self, q1, k, ek, msg, valid, attn_cas, attn_cfd):
-        """q1 [B,1,H,dh]; k/ek/msg [B,Nk,H,dh]; valid [B,Nk] bool. AYRI softmax causal/confound.
-        Doner: cas [B,D], cfd [B,D], M_cas [B,Nk], M_cfd [B,Nk] (head-ort),
-        ent_cas_mean/ent_cas_headmean/ent_cfd_mean/ent_cfd_headmean [B] (elestiri #3, bkz asagi)."""
-        B = k.shape[0]
-        s = self.leaky(q1 + k + ek)                          # [B,Nk,H,dh]
-        a_cas = (s * attn_cas).sum(-1)                        # [B,Nk,H]
-        a_cfd = (s * attn_cfd).sum(-1)
+    def _attend(self, q1, k_cas, k_cfd, ek, msg, valid, attn_cas, attn_cfd):
+        """q1 [B,1,H,dh]; k_cas/k_cfd/ek/msg [B,Nk,H,dh]; valid [B,Nk] bool. AYRI softmax causal/confound.
+        #1: cas/cfd AYRI KEY (CP wks["other_causal/confound"]) -> ayrimi KEY yapar; attn_cas==attn_cfd (tek
+        scoring). Doner: cas/cfd [B,D], M_cas/M_cfd [B,Nk] (head-ort), ent'ler [B]."""
+        B = k_cas.shape[0]
+        s_cas = self.leaky(q1 + k_cas + ek)                  # [B,Nk,H,dh]
+        s_cfd = self.leaky(q1 + k_cfd + ek)
+        a_cas = (s_cas * attn_cas).sum(-1)                   # [B,Nk,H]
+        a_cfd = (s_cfd * attn_cfd).sum(-1)
         invalid = ~valid[:, :, None]                          # [B,Nk,1]
         neg_inf = torch.finfo(a_cas.dtype).min
         M_cas_h = torch.softmax(a_cas.masked_fill(invalid, neg_inf), dim=1).masked_fill(invalid, 0.0)
@@ -237,23 +237,25 @@ class EgoCausalLayer(nn.Module):
         S = h_map.shape[1]
         H, dh = self.heads, self.dh
 
-        # --- ajan iliskisi (other): KEY/VALUE komsu-tipine gore AYRI (CP tip-basina wks/wvs) ---
+        # --- ajan iliskisi (other): AYRI cas/cfd KEY (per-tip), ORTAK value, TEK attn (#1, CP-tarzi) ---
         q_ag = self.Wq_ag(h_ego).view(B, 1, H, dh)
-        k_ag = self._per_type(self.Wk_ag, h_nbr, nbr_types).view(B, N, H, dh)
+        kcas_ag = self._per_type(self.Wk_cas_ag, h_nbr, nbr_types).view(B, N, H, dh)
+        kcfd_ag = self._per_type(self.Wk_cfd_ag, h_nbr, nbr_types).view(B, N, H, dh)
         ek_ag = self.We_k_ag(edge_ego).view(B, N, H, dh)
         msg_ag = self._per_type(self.Wv_ag, h_nbr, nbr_types).view(B, N, H, dh) + self.We_v_ag(edge_ego).view(B, N, H, dh)
         (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag,
          ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean) = self._attend(
-            q_ag, k_ag, ek_ag, msg_ag, nbr_valid, self.attn_cas, self.attn_cfd)
+            q_ag, kcas_ag, kcfd_ag, ek_ag, msg_ag, nbr_valid, self.attn_ag, self.attn_ag)
 
-        # --- harita iliskisi (g2a) ---
+        # --- harita iliskisi (g2a): AYRI cas/cfd KEY (paylasimli), ORTAK value, TEK attn ---
         q_mp = self.Wq_mp(h_ego).view(B, 1, H, dh)
-        k_mp = self.Wk_mp(h_map).view(B, S, H, dh)
+        kcas_mp = self.Wk_cas_mp(h_map).view(B, S, H, dh)
+        kcfd_mp = self.Wk_cfd_mp(h_map).view(B, S, H, dh)
         ek_mp = self.We_k_mp(edge_map).view(B, S, H, dh)
         msg_mp = self.Wv_mp(h_map).view(B, S, H, dh) + self.We_v_mp(edge_map).view(B, S, H, dh)
         (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp,
          ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean) = self._attend(
-            q_mp, k_mp, ek_mp, msg_mp, map_valid, self.attn_cas_mp, self.attn_cfd_mp)
+            q_mp, kcas_mp, kcfd_mp, ek_mp, msg_mp, map_valid, self.attn_mp, self.attn_mp)
 
         # --- birlestirme (Eq 6): [self ; ajan ; harita] ---
         self_fea = self.self_fc(h_ego)                                        # [B,D]
