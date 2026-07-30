@@ -103,27 +103,34 @@ class _NbrMapEnrichLayer(nn.Module):
     mumkun olur. Harita STATIK (map<-agent guncellemesi YOK). Ego'ya DOKUNULMAZ -> gate marjinallesmez.
     Kenar-farkindalikli (GATv2-tarzi), komsu->harita goreli geometri skora girer."""
 
-    def __init__(self, dim=256, heads=8, edge_dim=EDGE_FEATURE_DIM, dropout=0.1):
+    def __init__(self, dim=256, heads=8, edge_dim=EDGE_FEATURE_DIM, dropout=0.1, sepkey=False):
         super().__init__()
         assert dim % heads == 0
         self.dim, self.heads, self.dh = dim, heads, dim // heads
-        self.Wq = nn.Linear(dim, dim)      # komsu query (her komsu ayri)
-        self.Wk = nn.Linear(dim, dim)      # harita key
+        self.sepkey = sepkey   # E-a: komsu QUERY + FFN per-komsu-tipi (CP AgentHetGNN wqs[t]/out_ffn[t])
+        if sepkey:
+            self.Wq = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_AGENT_TYPES)])  # per-tip query
+            self.ffn = nn.ModuleList([_FFN(dim, dropout=dropout) for _ in range(NUM_AGENT_TYPES)])
+        else:
+            self.Wq = nn.Linear(dim, dim)      # komsu query (paylasimli)
+            self.ffn = _FFN(dim, dropout=dropout)
+        self.Wk = nn.Linear(dim, dim)      # harita key (paylasimli -- harita tipsiz)
         self.Wv = nn.Linear(dim, dim)      # harita value
         self.We_k = _EdgeMLP(edge_dim, dim, dropout=dropout)
         self.We_v = _EdgeMLP(edge_dim, dim, dropout=dropout)
         self.attn = nn.Parameter(torch.empty(heads, self.dh)); nn.init.xavier_uniform_(self.attn)
         self.norm = nn.LayerNorm(dim)
-        self.ffn = _FFN(dim, dropout=dropout)
         self.leaky = nn.LeakyReLU(0.2)
 
-    def forward(self, h_nbr, h_map, edge_nbr_map, map_valid):
+    def forward(self, h_nbr, h_map, edge_nbr_map, map_valid, nbr_types=None):
         """h_nbr [B,N,D] (her komsu bir query, HEPSI guncellenir); h_map [B,S,D] (STATIK key/value);
-        edge_nbr_map [B,N,S,De] (harita(kaynak)->komsu(hedef) goreli geometri); map_valid [B,S]."""
+        edge_nbr_map [B,N,S,De] (harita(kaynak)->komsu(hedef) goreli geometri); map_valid [B,S];
+        nbr_types [B,N] (sepkey acikken per-tip query/ffn icin)."""
         B, N = h_nbr.shape[0], h_nbr.shape[1]
         S = h_map.shape[1]
         H, dh = self.heads, self.dh
-        q = self.Wq(h_nbr).view(B, N, 1, H, dh)
+        q_in = EgoCausalLayer._per_type(self.Wq, h_nbr, nbr_types) if self.sepkey else self.Wq(h_nbr)
+        q = q_in.view(B, N, 1, H, dh)
         k = self.Wk(h_map).view(B, 1, S, H, dh)
         ek = self.We_k(edge_nbr_map).view(B, N, S, H, dh)
         v = self.Wv(h_map).view(B, 1, S, H, dh) + self.We_v(edge_nbr_map).view(B, N, S, H, dh)
@@ -132,7 +139,8 @@ class _NbrMapEnrichLayer(nn.Module):
         invalid = ~map_valid[:, None, :, None]                          # [B,1,S,1]
         M = torch.softmax(a.masked_fill(invalid, torch.finfo(a.dtype).min), dim=2).masked_fill(invalid, 0.0)
         ctx = (M.unsqueeze(-1) * v).sum(dim=2).reshape(B, N, H * dh)     # [B,N,D] her komsuya harita baglami
-        return self.ffn(self.norm(h_nbr + ctx))                         # [B,N,D] serit-farkinda komsular
+        out = self.norm(h_nbr + ctx)
+        return EgoCausalLayer._per_type(self.ffn, out, nbr_types) if self.sepkey else self.ffn(out)
 
 
 class EgoCausalLayer(nn.Module):
@@ -294,7 +302,7 @@ class EgoCausalDisentangler(nn.Module):
     gunceller, komsular sabit kalir. Son katmanin f_cas/f_cfd + M_cas/M_cfd ciktisi kullanilir.
     """
 
-    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, sep_temp=0):
+    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, sep_temp=0, nbr_sepkey=0):
         super().__init__()
         self.future_encoder = FutureEncoder()
         self.future_fuse = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU())
@@ -309,7 +317,7 @@ class EgoCausalDisentangler(nn.Module):
         # KOMSU->HARITA enrichment (CP scene-embedding a2g, kimlik-koruyan): causal split'ten ONCE her
         # komsuya serit/yol baglami kazandirir. nbr_enrich=0 => mevcut davranis (enrichment YOK).
         self.nbr_enrich = nn.ModuleList([
-            _NbrMapEnrichLayer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(nbr_enrich)
+            _NbrMapEnrichLayer(dim, heads, EDGE_FEATURE_DIM, dropout, sepkey=bool(nbr_sepkey)) for _ in range(nbr_enrich)
         ])
         self.layers = nn.ModuleList([
             EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout, sep_temp=bool(sep_temp)) for _ in range(layers)
@@ -361,7 +369,7 @@ class EgoCausalDisentangler(nn.Module):
             nbr_map_edge = build_edge_features(torch.cat([agent_pose[:, 1:], map_pose], dim=1))  # [B,N+S,N+S,De]
             edge_nbr_map = nbr_map_edge[:, :N, N:]                                      # [B,N,S,De] harita->komsu
             for enrich in self.nbr_enrich:
-                h_nbr = enrich(h_nbr, h_map, edge_nbr_map, map_valid)
+                h_nbr = enrich(h_nbr, h_map, edge_nbr_map, map_valid, nbr_types=nbr_types)
 
         # --- STAGE B: ego-merkezli causal-split (ajan + harita, causal/confound) ---
         f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = None
@@ -425,10 +433,10 @@ class CausalEgoHead(nn.Module):
 class CausalPlanner(nn.Module):
     """Ust modul: disentangler (A) + ego head (B) + adversarial psi head'leri (C)."""
 
-    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, sep_temp=0):
+    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, sep_temp=0, nbr_sepkey=0):
         super().__init__()
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
-                                                  sep_temp=sep_temp)
+                                                  sep_temp=sep_temp, nbr_sepkey=nbr_sepkey)
         self.head = CausalEgoHead(dim, modes, dropout)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
