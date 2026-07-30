@@ -91,7 +91,8 @@ def main(args):
     gameformer = gameformer.to(dev)
     freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich).to(dev)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich,
+                           sep_temp=args.sep_temp).to(dev)
     causal.load_state_dict(torch.load(args.causal_path, map_location=dev))
     causal.eval()
 
@@ -257,6 +258,7 @@ if __name__ == "__main__":
     p.add_argument("--decoder_levels", type=int, default=2)
     p.add_argument("--graph_layers", type=int, default=1)
     p.add_argument("--nbr_enrich", type=int, default=0)
+    p.add_argument("--sep_temp", type=int, default=0)
     p.add_argument("--modes", type=int, default=6)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_batches", type=int, default=15)

@@ -26,6 +26,8 @@ Tasarim notlari:
     anlamsizlasir; ayni gerekce agent_tokens icin de kodda mevcut).
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -144,10 +146,11 @@ class EgoCausalLayer(nn.Module):
     Harita SADECE bu gate uzerinden trajectory'ye girer (f_cas) -> harita-gate'i anlamli.
     """
 
-    def __init__(self, dim=256, heads=8, edge_dim=EDGE_FEATURE_DIM, dropout=0.1):
+    def __init__(self, dim=256, heads=8, edge_dim=EDGE_FEATURE_DIM, dropout=0.1, sep_temp=False):
         super().__init__()
         assert dim % heads == 0
         self.dim, self.heads, self.dh = dim, heads, dim // heads
+        self.sep_temp = sep_temp   # #3: sayi-adaptif temperature (CP log_32(n+1)); varsayilan KAPALI
         # 'other' (ajan) iliskisi. Query HEP ego (tek); VALUE komsu-tipine gore AYRI (cas/cfd ORTAK value).
         # #1: cas ve cfd icin AYRI KEY (CP wks["other_causal/confound"][t]) -> ayrimi KEY yapar, TEK attn.
         self.Wq_ag = nn.Linear(dim, dim)
@@ -187,6 +190,13 @@ class EgoCausalLayer(nn.Module):
         s_cfd = self.leaky(q1 + k_cfd + ek)
         a_cas = (s_cas * attn_cas).sum(-1)                   # [B,Nk,H]
         a_cfd = (s_cfd * attn_cfd).sum(-1)
+        # #3 (varsayilan KAPALI, --sep_temp): sayi-adaptif temperature (CP: attn *= log_32(n+1)); n = gecerli
+        # anahtar sayisi. Kalabalik (n>31) keskinlestir, seyrek (n<31) yumusat. Bizde ~10 ajanda YUMUSATIYOR
+        # (fayda vermedi, o yuzden default kapali).
+        if self.sep_temp:
+            n_valid = valid.sum(-1).clamp(min=1).float()[:, None, None]    # [B,1,1]
+            temp = torch.log1p(n_valid) / math.log(32.0)
+            a_cas = a_cas * temp; a_cfd = a_cfd * temp
         invalid = ~valid[:, :, None]                          # [B,Nk,1]
         neg_inf = torch.finfo(a_cas.dtype).min
         M_cas_h = torch.softmax(a_cas.masked_fill(invalid, neg_inf), dim=1).masked_fill(invalid, 0.0)
@@ -284,7 +294,7 @@ class EgoCausalDisentangler(nn.Module):
     gunceller, komsular sabit kalir. Son katmanin f_cas/f_cfd + M_cas/M_cfd ciktisi kullanilir.
     """
 
-    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0):
+    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, sep_temp=0):
         super().__init__()
         self.future_encoder = FutureEncoder()
         self.future_fuse = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU())
@@ -302,7 +312,7 @@ class EgoCausalDisentangler(nn.Module):
             _NbrMapEnrichLayer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(nbr_enrich)
         ])
         self.layers = nn.ModuleList([
-            EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(layers)
+            EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout, sep_temp=bool(sep_temp)) for _ in range(layers)
         ])
 
     def forward(self, agent_feat, agent_valid, agent_pose, agent_types, inputs,
@@ -415,9 +425,10 @@ class CausalEgoHead(nn.Module):
 class CausalPlanner(nn.Module):
     """Ust modul: disentangler (A) + ego head (B) + adversarial psi head'leri (C)."""
 
-    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0):
+    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, sep_temp=0):
         super().__init__()
-        self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich)
+        self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
+                                                  sep_temp=sep_temp)
         self.head = CausalEgoHead(dim, modes, dropout)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
