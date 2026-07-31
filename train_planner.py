@@ -248,7 +248,8 @@ def model_training(args):
     freeze_gameformer(gameformer)
 
     causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, dropout=args.dropout,
-                           nbr_enrich=args.nbr_enrich, sep_temp=args.sep_temp, nbr_sepkey=args.nbr_sepkey, ego_enrich=args.ego_enrich, ego_res_raw=args.ego_res_raw).to(args.device)
+                           nbr_enrich=args.nbr_enrich, sep_temp=args.sep_temp, nbr_sepkey=args.nbr_sepkey, ego_enrich=args.ego_enrich, ego_res_raw=args.ego_res_raw,
+                           full_enrich=args.full_enrich).to(args.device)
 
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 12, 14, 16, 18], gamma=0.5)
@@ -324,6 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("--nbr_sepkey", type=int, help="E-a: enrichment query+ffn per-komsu-tipi (0=KAPALI)", default=0)
     parser.add_argument("--ego_enrich", type=int, help="E-c: ego de enrichment'a girsin (ego->harita; 0=KAPALI)", default=0)
     parser.add_argument("--ego_res_raw", type=int, help="E-c hibrit: residual'a HAM ego (query zengin; 0=KAPALI)", default=0)
+    parser.add_argument("--full_enrich", type=int, help="FULL CP enrichment: bidirectional all-node + evrilen edge (kac katman; 0=KAPALI)", default=0)
     parser.add_argument("--modes", type=int, help="number of trajectory head modes K", default=6)
     # Agirliklar Causal-Planner lightning_trainer.py:263-265 ile ayni:
     #   loss = <traj> + 1.0*decision_loss + 0.5*decision_causal_inference_loss + 0.5*soft_mask_loss

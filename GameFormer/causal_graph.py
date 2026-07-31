@@ -143,6 +143,89 @@ class _NbrMapEnrichLayer(nn.Module):
         return EgoCausalLayer._per_type(self.ffn, out, nbr_types) if self.sepkey else self.ffn(out)
 
 
+class _EdgeAttn(nn.Module):
+    """Edge-farkindalikli GATv2 attention. K/V EVRILEN EDGE'den (CP: a_e_hidden/g_e_hidden), Q hedef
+    NODE'dan. h_q [B,Nq,D] (hedef/query), e [B,Nq,Nk,D] (kv(kaynak)->q(hedef) evrilen edge), valid_kv
+    [B,Nk] -> mesaj [B,Nq,D]. CP mesajlarinin K/V'si edge'den gelir (kaynak-node+geometri tasir)."""
+
+    def __init__(self, dim, heads, dropout=0.1):
+        super().__init__()
+        assert dim % heads == 0
+        self.dim, self.heads, self.dh = dim, heads, dim // heads
+        self.Wq = nn.Linear(dim, dim)
+        self.Wk = nn.Linear(dim, dim)   # K = edge'den
+        self.Wv = nn.Linear(dim, dim)   # V = edge'den
+        self.attn = nn.Parameter(torch.empty(heads, self.dh)); nn.init.xavier_uniform_(self.attn)
+        self.leaky = nn.LeakyReLU(0.2)
+
+    def forward(self, h_q, e, valid_kv):
+        B, Nq, Nk = h_q.shape[0], h_q.shape[1], e.shape[2]
+        H, dh = self.heads, self.dh
+        q = self.Wq(h_q).view(B, Nq, 1, H, dh)
+        k = self.Wk(e).view(B, Nq, Nk, H, dh)
+        v = self.Wv(e).view(B, Nq, Nk, H, dh)
+        s = self.leaky(q + k)                                  # [B,Nq,Nk,H,dh]
+        a = (s * self.attn).sum(-1)                            # [B,Nq,Nk,H]
+        invalid = ~valid_kv[:, None, :, None]
+        M = torch.softmax(a.masked_fill(invalid, torch.finfo(a.dtype).min), dim=2).masked_fill(invalid, 0.0)
+        return (M.unsqueeze(-1) * v).sum(dim=2).reshape(B, Nq, self.dim)   # [B,Nq,D]
+
+
+class _EdgeUpdate(nn.Module):
+    """CP edge evrimi: e_yeni = e + edge_MLP([hedef-node ; e ; kaynak-node]). Edge her katman iki-ucun
+    guncel node'unu + eski kendini tasiyarak rafine olur (residual)."""
+
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.mlp = _EdgeMLP(3 * dim, dim, dropout=dropout)
+
+    def forward(self, e, h_dst, h_src):
+        Nk, Nq = e.shape[2], e.shape[1]
+        dst = h_dst[:, :, None, :].expand(-1, -1, Nk, -1)      # [B,Nq,Nk,D]
+        src = h_src[:, None, :, :].expand(-1, Nq, -1, -1)
+        return e + self.mlp(torch.cat([dst, e, src], dim=-1))
+
+
+class _FullEnrichLayer(nn.Module):
+    """CP HgtEncoder katmani (bidirectional all-node + EVRILEN edge) -- faithful YAPISAL uyarlama (GATv2
+    attention, paylasimli agirlik). Sira: ONCE harita<-ajan (m_agent), SONRA ajan<-[self; diger ajanlar;
+    harita]; ikisi de ESKI node/edge durumunu okur (es-zamanli, CP HgtEncoder). Edge'ler (aa/am/ma) her
+    katman evrilir. Ego DAHIL tum ajanlar guncellenir (CP: AV de zenginlesir)."""
+
+    def __init__(self, dim, heads, dropout=0.1):
+        super().__init__()
+        # AJAN guncelleme: [self ; diger ajanlar (aa) ; harita (am)]
+        self.a_other = _EdgeAttn(dim, heads, dropout)   # ajan <- diger ajanlar
+        self.a_map = _EdgeAttn(dim, heads, dropout)     # ajan <- harita
+        self.a_self = nn.Sequential(nn.Linear(dim, dim), nn.ReLU())
+        self.a_out = nn.Linear(3 * dim, dim)
+        self.a_ffn = _FFN(dim, dropout=dropout)
+        # HARITA guncelleme: harita <- ajanlar (ma)
+        self.m_agent = _EdgeAttn(dim, heads, dropout)
+        self.m_out = nn.Linear(dim, dim)
+        self.m_ffn = _FFN(dim, dropout=dropout)
+        # EDGE evrimi
+        self.upd_aa = _EdgeUpdate(dim, dropout)
+        self.upd_am = _EdgeUpdate(dim, dropout)
+        self.upd_ma = _EdgeUpdate(dim, dropout)
+
+    def forward(self, h_ag, ag_valid, h_map, map_valid, e_aa, e_am, e_ma):
+        # --- HARITA guncelle (once; ESKI ajanlari okur) ---
+        m_ctx = self.m_agent(h_map, e_ma, ag_valid)
+        h_map_new = self.m_ffn(self.m_out(m_ctx) + h_map)
+        # --- AJAN guncelle (ESKI haritayi okur) ---
+        self_fea = self.a_self(h_ag)
+        other = self.a_other(h_ag, e_aa, ag_valid)
+        mapc = self.a_map(h_ag, e_am, map_valid)
+        a_upd = self.a_out(torch.cat([self_fea, other, mapc], dim=-1)) + h_ag   # residual
+        h_ag_new = self.a_ffn(a_upd)
+        # --- EDGE evrimi (ESKI node'lardan) ---
+        e_aa_new = self.upd_aa(e_aa, h_ag, h_ag)
+        e_am_new = self.upd_am(e_am, h_ag, h_map)
+        e_ma_new = self.upd_ma(e_ma, h_map, h_ag)
+        return h_ag_new, h_map_new, e_aa_new, e_am_new, e_ma_new
+
+
 class EgoCausalLayer(nn.Module):
     """Ego-oriented DUAL-RELATION causal katmani (Causal-Planner CGD'sine sadik, hdgt_encoder.py).
     Ego query IKI iliskiye attend eder:
@@ -306,7 +389,7 @@ class EgoCausalDisentangler(nn.Module):
     """
 
     def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, sep_temp=0, nbr_sepkey=0, ego_enrich=0,
-                 ego_res_raw=0):
+                 ego_res_raw=0, full_enrich=0):
         super().__init__()
         self.ego_enrich = ego_enrich   # E-c: ego DE enrichment'a girsin (ego->harita) -> residual+query zenginlesir
         self.ego_res_raw = ego_res_raw # E-c hibrit: residual'a HAM ego (query zengin) -> gate cokmesin
@@ -325,6 +408,14 @@ class EgoCausalDisentangler(nn.Module):
         self.nbr_enrich = nn.ModuleList([
             _NbrMapEnrichLayer(dim, heads, EDGE_FEATURE_DIM, dropout, sepkey=bool(nbr_sepkey)) for _ in range(nbr_enrich)
         ])
+        # FULL CP ENRICHMENT (bidirectional all-node + evrilen edge): nbr_enrich yerine. full_enrich>0 ise
+        # ego DAHIL tum ajanlar + harita cift-yonlu zenginlesir, edge'ler her katman evrilir. Edge state'ler
+        # geometriden init edilir (edge_init_*).
+        self.full_enrich = nn.ModuleList([_FullEnrichLayer(dim, heads, dropout) for _ in range(full_enrich)])
+        if full_enrich > 0:
+            self.edge_init_aa = _EdgeMLP(EDGE_FEATURE_DIM, dim, dropout=dropout)   # ajan->ajan edge init
+            self.edge_init_am = _EdgeMLP(EDGE_FEATURE_DIM, dim, dropout=dropout)   # harita->ajan edge init
+            self.edge_init_ma = _EdgeMLP(EDGE_FEATURE_DIM, dim, dropout=dropout)   # ajan->harita edge init
         self.layers = nn.ModuleList([
             EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout, sep_temp=bool(sep_temp)) for _ in range(layers)
         ])
@@ -389,6 +480,19 @@ class EgoCausalDisentangler(nn.Module):
                 for enrich in self.nbr_enrich:
                     h_nbr = enrich(h_nbr, h_map, edge_nbr_map, map_valid, nbr_types=nbr_types)
 
+        # --- FULL CP ENRICHMENT (bidirectional all-node + evrilen edge): ego DAHIL. ---
+        if len(self.full_enrich) > 0:
+            am_full = build_edge_features(torch.cat([agent_pose, map_pose], dim=1))         # [B,Na+S,Na+S,De]
+            e_aa = self.edge_init_aa(edge)                                                  # [B,Na,Na,D] ajan<-ajan
+            e_am = self.edge_init_am(am_full[:, :Na, Na:])                                  # [B,Na,S,D]  ajan<-harita
+            e_ma = self.edge_init_ma(am_full[:, Na:, :Na])                                  # [B,S,Na,D]  harita<-ajan
+            h_ag, h_map_e = h, h_map
+            for layer in self.full_enrich:
+                h_ag, h_map_e, e_aa, e_am, e_ma = layer(h_ag, agent_valid, h_map_e, map_valid, e_aa, e_am, e_ma)
+            h_map = h_map_e                                                                 # zenginlesmis harita separation'a
+            h_ego = h_ag[:, 0]                                                              # ego DE zenginlesti (gate: gcos'a bak)
+            h_nbr = h_ag[:, 1:]
+
         # --- STAGE B: ego-merkezli causal-split (ajan + harita, causal/confound) ---
         f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = None
         ent_cas_mean = ent_cas_headmean = ent_cfd_mean = ent_cfd_headmean = None
@@ -452,10 +556,11 @@ class CausalEgoHead(nn.Module):
 class CausalPlanner(nn.Module):
     """Ust modul: disentangler (A) + ego head (B) + adversarial psi head'leri (C)."""
 
-    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, sep_temp=0, nbr_sepkey=0, ego_enrich=0, ego_res_raw=0):
+    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, sep_temp=0, nbr_sepkey=0, ego_enrich=0, ego_res_raw=0, full_enrich=0):
         super().__init__()
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
-                                                  sep_temp=sep_temp, nbr_sepkey=nbr_sepkey, ego_enrich=ego_enrich, ego_res_raw=ego_res_raw)
+                                                  sep_temp=sep_temp, nbr_sepkey=nbr_sepkey, ego_enrich=ego_enrich, ego_res_raw=ego_res_raw,
+                                                  full_enrich=full_enrich)
         self.head = CausalEgoHead(dim, modes, dropout)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
