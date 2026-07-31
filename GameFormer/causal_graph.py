@@ -247,7 +247,7 @@ class EgoCausalLayer(nn.Module):
         idx = types.clamp(min=0, max=len(mods) - 1)[:, :, None, None].expand(-1, -1, 1, x.shape[-1])
         return stacked.gather(2, idx).squeeze(2)                            # [B,N,D]
 
-    def forward(self, h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid):
+    def forward(self, h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid, h_ego_res=None):
         """h_ego [B,D]; h_nbr [B,N,D] (K=V ayni kaynak), nbr_types [B,N] long (komsu tipi -> tip-basina
         K/V), edge_ego [B,N,De], nbr_valid [B,N]; h_map [B,S,D], edge_map [B,S,De] (polygon->ego), map_valid [B,S].
         Doner: h_ego_new, f_cas, f_cfd, M_cas(ajan), M_cfd(ajan), M_cas_mp(harita), M_cfd_mp(harita)."""
@@ -276,16 +276,19 @@ class EgoCausalLayer(nn.Module):
             q_mp, kcas_mp, kcfd_mp, ek_mp, msg_mp, map_valid, self.attn_mp, self.attn_mp)
 
         # --- birlestirme (Eq 6): [self ; ajan ; harita] ---
+        # h_ego_res: residual/bypass icin AYRI ego (hibrit E-c: query=zengin ego, residual=HAM ego ->
+        # bypass zayif kalir, gate cokmez). Verilmezse h_ego (mevcut davranis).
+        res = h_ego if h_ego_res is None else h_ego_res
         self_fea = self.self_fc(h_ego)                                        # [B,D]
-        f_cas = self.norm_cas(self.out_fc_cas(torch.cat([self_fea, ag_cas, mp_cas], dim=-1)) + h_ego)
+        f_cas = self.norm_cas(self.out_fc_cas(torch.cat([self_fea, ag_cas, mp_cas], dim=-1)) + res)
         f_cfd = self.norm_cfd(self.out_fc_cfd(torch.cat([self_fea, ag_cfd, mp_cfd], dim=-1)))
         f_cas = self.ffn_cas(f_cas)      # FAZ 1: kendi prenorm+residual'iyla ek dogrusal-olmayan isleme
         f_cfd = self.ffn_cfd(f_cfd)
         f_cas = self.dropout(f_cas)
         f_cfd = self.dropout(f_cfd)
-        # cos(f_cas, h_ego) -- ~1 => gate marjinal (h_ego bypass'i baskin), dusuk => gate canli.
+        # cos(f_cas, res) -- ~1 => gate marjinal (bypass baskin), dusuk => gate canli. res = gercek bypass.
         with torch.no_grad():
-            gate_cos = F.cosine_similarity(f_cas, h_ego, dim=-1)       # [B]
+            gate_cos = F.cosine_similarity(f_cas, res, dim=-1)         # [B]
         # ego'yu katmanlar arasi f_cas ile tasi (GRU YOK; f_cfd DAHIL DEGIL -> confound sizmaz).
         h_ego_new = f_cas
         return (h_ego_new, f_cas, f_cfd, M_cas_ag, M_cfd_ag, M_cas_mp, M_cfd_mp,
@@ -302,8 +305,11 @@ class EgoCausalDisentangler(nn.Module):
     gunceller, komsular sabit kalir. Son katmanin f_cas/f_cfd + M_cas/M_cfd ciktisi kullanilir.
     """
 
-    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, sep_temp=0, nbr_sepkey=0):
+    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, sep_temp=0, nbr_sepkey=0, ego_enrich=0,
+                 ego_res_raw=0):
         super().__init__()
+        self.ego_enrich = ego_enrich   # E-c: ego DE enrichment'a girsin (ego->harita) -> residual+query zenginlesir
+        self.ego_res_raw = ego_res_raw # E-c hibrit: residual'a HAM ego (query zengin) -> gate cokmesin
         self.future_encoder = FutureEncoder()
         self.future_fuse = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU())
         self.type_embedding = nn.Embedding(NUM_AGENT_TYPES, dim)
@@ -363,13 +369,25 @@ class EgoCausalDisentangler(nn.Module):
         h_ego = h[:, 0]                                                                # [B,D]
         h_nbr = h[:, 1:]                                                               # [B,N,D] temiz per-ajan (K=V)
 
-        # --- KOMSU->HARITA ENRICHMENT (causal split ONCESI): her komsu serit/yol baglami kazanir ---
-        # Ego'ya DOKUNULMAZ (gate marjinallesmesin). Ajan->ajan YOK (kimlik korunur). Harita STATIK.
+        # --- HARITA ENRICHMENT (causal split ONCESI): serit/yol baglami kazandirir. Ajan->ajan YOK.
         if len(self.nbr_enrich) > 0:
-            nbr_map_edge = build_edge_features(torch.cat([agent_pose[:, 1:], map_pose], dim=1))  # [B,N+S,N+S,De]
-            edge_nbr_map = nbr_map_edge[:, :N, N:]                                      # [B,N,S,De] harita->komsu
-            for enrich in self.nbr_enrich:
-                h_nbr = enrich(h_nbr, h_map, edge_nbr_map, map_valid, nbr_types=nbr_types)
+            if self.ego_enrich:
+                # E-c: EGO DE haritayi okur -> ego+komsular hep zenginlesir. h_ego artik zengin ->
+                # separation'da hem query hem residual zenginlesmis egodan gelir (CP gibi). gate marjinal
+                # olma riski -> gcos'a bakilir.
+                am_full = build_edge_features(torch.cat([agent_pose, map_pose], dim=1))     # [B,Na+S,Na+S,De]
+                edge_all_map = am_full[:, :N + 1, N + 1:]                                   # [B,Na,S,De] harita->ajan(hepsi)
+                h_all = h
+                for enrich in self.nbr_enrich:
+                    h_all = enrich(h_all, h_map, edge_all_map, map_valid, nbr_types=agent_types)
+                h_ego = h_all[:, 0]
+                h_nbr = h_all[:, 1:]
+            else:
+                # Ego'ya DOKUNULMAZ (gate marjinallesmesin), sadece komsular.
+                nbr_map_edge = build_edge_features(torch.cat([agent_pose[:, 1:], map_pose], dim=1))  # [B,N+S,N+S,De]
+                edge_nbr_map = nbr_map_edge[:, :N, N:]                                      # [B,N,S,De] harita->komsu
+                for enrich in self.nbr_enrich:
+                    h_nbr = enrich(h_nbr, h_map, edge_nbr_map, map_valid, nbr_types=nbr_types)
 
         # --- STAGE B: ego-merkezli causal-split (ajan + harita, causal/confound) ---
         f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = None
@@ -381,7 +399,8 @@ class EgoCausalDisentangler(nn.Module):
              ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
              ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
              gate_cos) = layer(
-                h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid)
+                h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid,
+                h_ego_res=ego_clean if self.ego_res_raw else None)
             gate_cos_layers.append(gate_cos)
         gate_cos_stack = torch.stack(gate_cos_layers, dim=1)   # [B, L] -- L=len(self.layers)
 
@@ -433,10 +452,10 @@ class CausalEgoHead(nn.Module):
 class CausalPlanner(nn.Module):
     """Ust modul: disentangler (A) + ego head (B) + adversarial psi head'leri (C)."""
 
-    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, sep_temp=0, nbr_sepkey=0):
+    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, sep_temp=0, nbr_sepkey=0, ego_enrich=0, ego_res_raw=0):
         super().__init__()
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
-                                                  sep_temp=sep_temp, nbr_sepkey=nbr_sepkey)
+                                                  sep_temp=sep_temp, nbr_sepkey=nbr_sepkey, ego_enrich=ego_enrich, ego_res_raw=ego_res_raw)
         self.head = CausalEgoHead(dim, modes, dropout)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
