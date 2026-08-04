@@ -93,7 +93,7 @@ def main(args):
 
     causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich,
                            sep_temp=args.sep_temp, nbr_sepkey=args.nbr_sepkey, ego_enrich=args.ego_enrich, ego_res_raw=args.ego_res_raw,
-                           full_enrich=args.full_enrich).to(dev)
+                           full_enrich=args.full_enrich, sep_edge_evolved=args.sep_edge_evolved).to(dev)
     causal.load_state_dict(torch.load(args.causal_path, map_location=dev))
     causal.eval()
 
@@ -264,6 +264,7 @@ if __name__ == "__main__":
     p.add_argument("--ego_enrich", type=int, default=0)
     p.add_argument("--ego_res_raw", type=int, default=0)
     p.add_argument("--full_enrich", type=int, default=0)
+    p.add_argument("--sep_edge_evolved", type=int, default=0)
     p.add_argument("--modes", type=int, default=6)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_batches", type=int, default=15)
