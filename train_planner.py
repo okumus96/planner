@@ -139,6 +139,12 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
         q_bar = ((out['M_cas'] * nv_f).sum() / nv_f.sum().clamp(min=1.0)).item()       # marjinal E[M_cas]
         # M_cfd'yi DOGRUDAN gozleyen metrik (adv/excl yapisal olarak olu, ent/cfdacc dolayli).
         mcfd_peak = out['M_cfd'].masked_fill(~nvb, 0.0).max(-1).values.mean().item()   # en confounding ajan
+        # COLLAPSE MONITORU: f_cfd'nin BATCH boyunca varyansi. Loss f_cfd'nin bir sey tasimasini
+        # ZORUNLU KILMIYOR (tek gorevi "manevra hakkinda bilgisiz ol" -> sabit vektor bunu saglar).
+        # Simdilik canli, ama masklari birbirinden iten bir terim eklenince cokme riski dogar.
+        # fcfd_var / fcas_var oraninin 0'a gitmesi = f_cfd sabitlesiyor.
+        fcfd_var = out['f_cfd'].var(dim=0).mean().item()
+        fcas_var = out['f_cas'].var(dim=0).mean().item()
         # UNIFORM REFERANSI: n_valid komsuya esit dagilsa peak tam 1/n_valid olurdu. Peak'i buna gore oku:
         #   peak ~= unif  -> dagilim duz, M sekillenMIYOR (olu)
         #   peak >> unif  -> dagilim tepe yapiyor, M gercekten seciyor
@@ -182,6 +188,7 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
         'minADE': minade, 'minFDE': minfde, 'casacc': cas_acc, 'cfdacc': cfd_acc,
         'mcas_peak': mcas_peak, 'mcas_map_peak': mcas_map_peak, 'qbar': q_bar,
         'mcfd_peak': mcfd_peak, 'unif': unif,
+        'fcfd_var': fcfd_var, 'fcas_var': fcas_var,
         'mcas_ent': mcas_ent, 'mcas_headent': mcas_headent,
         'mcfd_ent': mcfd_ent, 'mcfd_headent': mcfd_headent,
         'mcas_map_ent': mcas_map_ent, 'mcas_map_headent': mcas_map_headent,
@@ -301,7 +308,8 @@ def model_training(args):
             f"cfdacc={val_m['cfdacc']:.3f} peak={val_m['mcas_peak']:.3f} cfdpk={val_m['mcfd_peak']:.3f} "
             f"hgap={val_m['mcas_ent'] - val_m['mcas_headent']:.3f} "
             f"hgap_mp={val_m['mcas_map_ent'] - val_m['mcas_map_headent']:.3f} "
-            f"gcos={val_m['gate_cos_last']:.3f}"
+            f"gcos={val_m['gate_cos_last']:.3f} "
+            f"cfdvar={val_m['fcfd_var'] / max(val_m['fcas_var'], 1e-8):.3f}"   # ->0 = f_cfd cokuyor
         )
 
         scheduler.step()
