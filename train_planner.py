@@ -119,7 +119,8 @@ def maneuver_labels(ego_future):
 
 def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0,
                             neighbors_future=None, lambda_nbr=0.0, lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
-                            lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5):
+                            lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5,
+                            lambda_conflict=0.0):
     """Causal-Planner'a SADIK loss (ref: ~/Causal-Planner lightning_trainer.py). Backdoor/GRL YOK.
 
     CP'nin toplami:
@@ -220,9 +221,22 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
     # cezalamak head'leri hem keskinlesmeye HEM ANLASMAYA zorlar (olculdu: ent 0.908 vs headent 0.513).
     l_peak = F.relu(out['M_cas_ent'] - peak_tau).mean() + F.relu(out['M_cas_map_ent'] - peak_tau).mean()
 
+    # --- L_conflict: M_cas'in BEKLENEN conflict-mesafesini cezalandir -> attention'i ego yoluyla
+    # cakisan ajanlara iter. penalty = 3 mesafe feature'inin ortalamasi (uzak = yuksek).
+    # M_cas softmax oldugu icin Sum_j M_cas_j * penalty_j = E_{M_cas}[penalty].
+    # conflict DETACHED -> gradyan YALNIZ M_cas uzerinden akar, feature'lar sabit hedef.
+    # OLCULDU (gat-conflict kosulari, eval_interaction.py): feature'i yalnizca GIRDIYE koymak
+    # top1-vs-random'i 1.24 -> 1.26x yapiyor (etkisiz); bu LOSS 1.65x yapiyor. Yani modelin
+    # etkilesimi kullanmasi icin ifade edebilmesi YETMIYOR, acikca soylenmesi gerekiyor.
+    l_conflict = torch.zeros((), device=out['traj'].device)
+    if lambda_conflict > 0.0 and out.get('conflict') is not None:
+        penalty = out['conflict'][..., :3].mean(-1)                 # [B,N] uzak = yuksek
+        l_conflict = (out['M_cas'] * penalty).sum(-1).mean()
+
     nv_f = out['nbr_valid'].float()
     loss = (l_traj + lambda_kld * l_kld + lambda_ci * l_ci + lambda_mask * l_mask
-            + lambda_recon * l_recon + lambda_nbr * l_nbr + lambda_budget * l_budget + lambda_bc * l_bc + lambda_peak * l_peak)
+            + lambda_recon * l_recon + lambda_nbr * l_nbr + lambda_budget * l_budget + lambda_bc * l_bc + lambda_peak * l_peak
+            + lambda_conflict * l_conflict)
 
     with torch.no_grad():
         traj_xy = out['traj'][:, 0, :, :, :2]                     # [B, M, 80, 2]
@@ -289,7 +303,7 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
         'ci': l_ci.item(), 'mask': l_mask.item(),
         'comp': l_comp.item(), 'excl': l_excl.item(), 'norm': l_norm.item(),
         'recon': l_recon.item(), 'nbr': l_nbr.item(), 'budget': l_budget.item(),
-        'bc': l_bc.item(), 'peak_hinge': l_peak.item(),
+        'bc': l_bc.item(), 'peak_hinge': l_peak.item(), 'conflict': l_conflict.item(),
         # STEP 3 uyelik metrikleri: sigmoid'de M artik bir dagilim degil, 'ajan iceride mi' skoru.
         # gcas_mean = sahnenin ne kadari nedensel ilan edildi; frac05 = kac ajan g>0.5.
         'gcas_mean': g_mean.item(),
@@ -313,7 +327,8 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
 def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0, lambda_nbr=0.0,
                lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
-               lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5, optimizer=None, desc="Training"):
+               lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5, lambda_conflict=0.0,
+               optimizer=None, desc="Training"):
     train = optimizer is not None
     causal.train() if train else causal.eval()
     gameformer.eval()
@@ -336,7 +351,8 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                                                          lambda_ci, lambda_mask, lambda_recon,
                                                          neighbors_future, lambda_nbr,
                                                          lambda_budget, budget_rho, budget_lo,
-                                                         lambda_bc, lambda_peak, peak_tau)
+                                                         lambda_bc, lambda_peak, peak_tau,
+                                                         lambda_conflict)
 
             if train:
                 optimizer.zero_grad()
@@ -387,6 +403,8 @@ def model_training(args):
                            # yoksa RNG akisi kayar ve eski kosularla birebir kiyas bozulur.
                            recon_drop=(args.recon_drop if args.lambda_recon > 0 else 0.0),
                            num_neighbors=args.num_neighbors, gate=args.gate,
+                           conflict_feats=args.conflict_feats, conflict_bias=args.conflict_bias,
+                           compute_conflict=(args.compute_conflict or args.lambda_conflict > 0),
                            nbr_enrich=args.nbr_enrich).to(args.device)
 
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -403,11 +421,13 @@ def model_training(args):
         train_m = _run_epoch(train_loader, gameformer, causal, args.device, args.num_neighbors,
                              args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_recon, args.lambda_nbr,
                              args.lambda_budget, args.budget_rho, args.budget_lo,
-                             args.lambda_bc, args.lambda_peak, args.peak_tau, optimizer=optimizer, desc="Training")
+                             args.lambda_bc, args.lambda_peak, args.peak_tau, args.lambda_conflict,
+                             optimizer=optimizer, desc="Training")
         val_m = _run_epoch(valid_loader, gameformer, causal, args.device, args.num_neighbors,
                            args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_recon, args.lambda_nbr,
                            args.lambda_budget, args.budget_rho, args.budget_lo,
-                           args.lambda_bc, args.lambda_peak, args.peak_tau, optimizer=None, desc="Validation")
+                           args.lambda_bc, args.lambda_peak, args.peak_tau, args.lambda_conflict,
+                           optimizer=None, desc="Validation")
 
         log = {"epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]}
         log.update({f"train-{k}": v for k, v in train_m.items()})
@@ -469,6 +489,15 @@ if __name__ == "__main__":
                         help="CP decision_loss: CE(psi_cas, m*) [CP=1.0]")
     parser.add_argument("--lambda_ci", type=float, default=0.5,
                         help="CP decision_causal_inference_loss: KL(uniform||p_cfd)+0.1*(-H) [CP=0.5]")
+    parser.add_argument("--lambda_conflict", type=float, default=0.0,
+                        help="L_conflict: E_{M_cas}[conflict-mesafe] cezasi (0 = KAPALI). Feature'lari "
+                             "girdiye eklemeden de calisir -- compute_conflict yeter")
+    parser.add_argument("--conflict_feats", type=int, default=0,
+                        help="conflict feature'larini AJAN edge'ine ekle (girdi olarak). Tek basina etkisiz olcuruldu")
+    parser.add_argument("--conflict_bias", type=int, default=0,
+                        help="causal logit'ten softplus(w)*conflict-mesafe cikar (explicit prior)")
+    parser.add_argument("--compute_conflict", type=int, default=0,
+                        help="conflict feature'larini yalnizca LOSS icin hesapla (girdiyi degistirmeden)")
     parser.add_argument("--lambda_bc", type=float, default=0.0,
                         help="YOL A: Bhattacharyya ortusme cezasi (0 = KAPALI). excl'in duz bolgede kor oldugu yeri gorur")
     parser.add_argument("--lambda_peak", type=float, default=0.0,

@@ -37,6 +37,52 @@ from .relevance_graph import (
 )
 
 NUM_AGENT_TYPES = 4  # ego, vehicle, pedestrian, bicycle
+CONFLICT_FEATURE_DIM = 4  # [d_route, d_ego_aligned, d_ego_spatial, approaching]
+
+
+def _conflict_features(neighbor_futures, neighbor_states, route_xy, route_valid, ego_speed, dt=0.1):
+    """Per-komsu future-conflict feature'lari [B,N,4]. "Causal" icin geometrik proxy: ajanin
+    TAHMIN EDILEN future'i ego'nun yoluyla cakisiyor mu. Hepsi ego-frame. SIZINTI YOK -- ego GT
+    future kullanilmaz, yalniz sabit-hiz kinematik ekstrapolasyon + route.
+      neighbor_futures [B,N,T,2] (frozen decoder top-1); neighbor_states [B,N,>=2];
+      route_xy [B,P,2]; route_valid [B,P] bool; ego_speed [B] (m/s).
+    Doner: [B,N,4] = log1p(d_route), log1p(d_ego_aligned), log1p(d_ego_spatial), approaching/10."""
+    B, N, T, _ = neighbor_futures.shape
+    dev = neighbor_futures.device
+    BIG, CAP = 1e6, 100.0
+    fut_valid = neighbor_futures.abs().sum(-1) > 1e-6                       # [B,N,T] 0-pad'i maskele
+
+    # 1) d_route: future noktalarinin route'a min mesafesi -> komsu ego koridoruna giriyor mu
+    if route_xy.shape[1] > 0:
+        d = torch.cdist(neighbor_futures.reshape(B, N * T, 2), route_xy)    # [B,N*T,P]
+        d = d.masked_fill(~route_valid[:, None, :], BIG)
+        d_route = d.min(-1).values.reshape(B, N, T)
+    else:
+        d_route = torch.full((B, N, T), BIG, device=dev)
+    d_route = d_route.masked_fill(~fut_valid, BIG).min(-1).values           # [B,N]
+
+    # 2) d_ego_aligned: ZAMAN-HIZALI cakisma (ego sabit-hiz ileri: ego_pos(t)=[ego_speed*dt*t, 0])
+    t_idx = torch.arange(1, T + 1, device=dev, dtype=neighbor_futures.dtype)
+    ego_x = ego_speed[:, None] * dt * t_idx[None, :]                        # [B,T]
+    ego_pos = torch.stack([ego_x, torch.zeros_like(ego_x)], dim=-1)         # [B,T,2]
+    d_align = torch.norm(neighbor_futures - ego_pos[:, None], dim=-1)       # [B,N,T]
+    d_ego_aligned = d_align.masked_fill(~fut_valid, BIG).min(-1).values     # [B,N]
+
+    # 3) d_ego_spatial: future ego origin'e en cok ne kadar yaklasiyor
+    d_sp = torch.norm(neighbor_futures, dim=-1)                             # [B,N,T]
+    d_ego_spatial = d_sp.masked_fill(~fut_valid, BIG).min(-1).values        # [B,N]
+
+    # 4) approaching: anlik mesafe - min future mesafe (pozitif = yaklasiyor)
+    d0 = torch.norm(neighbor_states[..., :2], dim=-1)                       # [B,N]
+    approaching = (d0 - d_ego_spatial).clamp(-CAP, CAP)                     # [B,N]
+
+    feats = torch.stack([
+        torch.log1p(d_route.clamp(max=CAP)),
+        torch.log1p(d_ego_aligned.clamp(max=CAP)),
+        torch.log1p(d_ego_spatial.clamp(max=CAP)),
+        approaching / 10.0,
+    ], dim=-1)                                                             # [B,N,4]
+    return feats.detach()   # sabit girdi/hedef; grad yalniz M_cas (loss) veya We_k_ag (feature) uzerinden
 
 
 def _agent_types(neighbor_agents_past, num_neighbors):
@@ -144,18 +190,26 @@ class EgoCausalLayer(nn.Module):
     Harita SADECE bu gate uzerinden trajectory'ye girer (f_cas) -> harita-gate'i anlamli.
     """
 
-    def __init__(self, dim=256, heads=8, edge_dim=EDGE_FEATURE_DIM, dropout=0.1, gate='softmax'):
+    def __init__(self, dim=256, heads=8, edge_dim=EDGE_FEATURE_DIM, dropout=0.1, gate='softmax',
+                 ag_edge_dim=None, conflict_bias=False):
         super().__init__()
         assert dim % heads == 0
         self.dim, self.heads, self.dh = dim, heads, dim // heads
         self.gate = gate                      # 'softmax' (dagilim) | 'sigmoid' (bagimsiz uyelik)
+        # EXPLICIT CONFLICT BIAS: causal logit'ten softplus(w)*conflict-mesafe cikarilir. softplus(w)>=0
+        # oldugu icin YON yapisal garanti (uzak ajan = yuksek mesafe = yuksek ceza), gucunu model ogrenir.
+        self.conflict_bias = conflict_bias
+        if conflict_bias:
+            self.conflict_w = nn.Parameter(torch.full((3,), -1.0))   # softplus(-1)=0.31, nazik baslangic
+        # ag_edge_dim: AJAN edge'i geometri(edge_dim) + opsiyonel conflict feature; harita edge'i HEP edge_dim
+        ag_edge_dim = edge_dim if ag_edge_dim is None else ag_edge_dim
         # 'other' (ajan) iliskisi. Query HEP ego (tek), ama KEY/VALUE komsu-tipine gore AYRI (CP
         # wks["other_*"]/wvs["other"] = 4 tiplik ModuleList; tip = okunulan komsunun tipi). Bizde target
         # hep ego oldugu icin query/output/self_fc tek kalir, SADECE komsu-tarafi K/V tip-basina.
         self.Wq_ag = nn.Linear(dim, dim)
         self.Wk_ag = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_AGENT_TYPES)])
         self.Wv_ag = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_AGENT_TYPES)])
-        self.We_k_ag = _EdgeMLP(edge_dim, dim, dropout=dropout); self.We_v_ag = _EdgeMLP(edge_dim, dim, dropout=dropout)
+        self.We_k_ag = _EdgeMLP(ag_edge_dim, dim, dropout=dropout); self.We_v_ag = _EdgeMLP(ag_edge_dim, dim, dropout=dropout)
         self.attn_cas = nn.Parameter(torch.empty(heads, self.dh))     # ajan causal attn vektoru
         self.attn_cfd = nn.Parameter(torch.empty(heads, self.dh))
         # 'g2a' (harita) iliskisi
@@ -188,7 +242,7 @@ class EgoCausalLayer(nn.Module):
         self.leaky = nn.LeakyReLU(0.2)
         self.dropout = nn.Dropout(dropout)
 
-    def _attend(self, q1, k, ek, msg, valid, attn_cas, attn_cfd, bias):
+    def _attend(self, q1, k, ek, msg, valid, attn_cas, attn_cfd, bias, conflict_bias=None):
         """q1 [B,1,H,dh]; k/ek/msg [B,Nk,H,dh]; valid [B,Nk] bool. AYRI softmax causal/confound.
         Doner: cas [B,D], cfd [B,D], M_cas [B,Nk], M_cfd [B,Nk] (head-ort),
         ent_cas_mean/ent_cas_headmean/ent_cfd_mean/ent_cfd_headmean [B] (elestiri #3, bkz asagi)."""
@@ -196,6 +250,9 @@ class EgoCausalLayer(nn.Module):
         s = self.leaky(q1 + k + ek)                          # [B,Nk,H,dh]
         a_cas = (s * attn_cas).sum(-1)                        # [B,Nk,H]
         a_cfd = (s * attn_cfd).sum(-1)
+        if conflict_bias is not None:
+            # SADECE causal logit: uzak/cakismayan ajan -> logit dusuk -> bastirilir. cfd serbest kalir.
+            a_cas = a_cas - conflict_bias[:, :, None]
         invalid = ~valid[:, :, None]                          # [B,Nk,1]
         neg_inf = torch.finfo(a_cas.dtype).min
         if self.gate == 'sigmoid':
@@ -257,7 +314,8 @@ class EgoCausalLayer(nn.Module):
         idx = types.clamp(min=0, max=len(mods) - 1)[:, :, None, None].expand(-1, -1, 1, x.shape[-1])
         return stacked.gather(2, idx).squeeze(2)                            # [B,N,D]
 
-    def forward(self, h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid):
+    def forward(self, h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid,
+                conflict=None):
         """h_ego [B,D]; h_nbr [B,N,D] (K=V ayni kaynak), nbr_types [B,N] long (komsu tipi -> tip-basina
         K/V), edge_ego [B,N,De], nbr_valid [B,N]; h_map [B,S,D], edge_map [B,S,De] (polygon->ego), map_valid [B,S].
         Doner: h_ego_new, f_cas, f_cfd, M_cas(ajan), M_cfd(ajan), M_cas_mp(harita), M_cfd_mp(harita)."""
@@ -270,9 +328,13 @@ class EgoCausalLayer(nn.Module):
         k_ag = self._per_type(self.Wk_ag, h_nbr, nbr_types).view(B, N, H, dh)
         ek_ag = self.We_k_ag(edge_ego).view(B, N, H, dh)
         msg_ag = self._per_type(self.Wv_ag, h_nbr, nbr_types).view(B, N, H, dh) + self.We_v_ag(edge_ego).view(B, N, H, dh)
+        cb = None
+        if self.conflict_bias and conflict is not None:
+            cb = (F.softplus(self.conflict_w) * conflict[..., :3]).sum(-1)          # [B,N] >= 0
         (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag,
          ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean) = self._attend(
-            q_ag, k_ag, ek_ag, msg_ag, nbr_valid, self.attn_cas, self.attn_cfd, self.gate_bias[0:2])
+            q_ag, k_ag, ek_ag, msg_ag, nbr_valid, self.attn_cas, self.attn_cfd, self.gate_bias[0:2],
+            conflict_bias=cb)
 
         # --- harita iliskisi (g2a) ---
         q_mp = self.Wq_mp(h_ego).view(B, 1, H, dh)
@@ -322,8 +384,13 @@ class EgoCausalDisentangler(nn.Module):
     gunceller, komsular sabit kalir. Son katmanin f_cas/f_cfd + M_cas/M_cfd ciktisi kullanilir.
     """
 
-    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, gate='softmax'):
+    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, gate='softmax',
+                 conflict_feats=0, conflict_bias=0):
         super().__init__()
+        self.conflict_feats = conflict_feats     # 1 -> ajan edge'ine conflict feature'lari EKLE
+        self.conflict_bias = conflict_bias       # 1 -> causal logit'e explicit conflict cezasi
+        # CausalPlanner bunu ayrica set eder; feature/bias kapaliyken bile L_conflict icin hesaplatir.
+        self.compute_conflict = bool(conflict_feats or conflict_bias)
         self.future_encoder = FutureEncoder()
         self.future_fuse = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU())
         self.type_embedding = nn.Embedding(NUM_AGENT_TYPES, dim)
@@ -340,7 +407,9 @@ class EgoCausalDisentangler(nn.Module):
             _NbrMapEnrichLayer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(nbr_enrich)
         ])
         self.layers = nn.ModuleList([
-            EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout, gate=gate) for _ in range(layers)
+            EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout, gate=gate,
+                           ag_edge_dim=EDGE_FEATURE_DIM + (CONFLICT_FEATURE_DIM if conflict_feats else 0),
+                           conflict_bias=bool(conflict_bias)) for _ in range(layers)
         ])
 
     def forward(self, agent_feat, agent_valid, agent_pose, agent_types, inputs,
@@ -391,6 +460,23 @@ class EgoCausalDisentangler(nn.Module):
             for enrich in self.nbr_enrich:
                 h_nbr = enrich(h_nbr, h_map, edge_nbr_map, map_valid)
 
+        # --- FUTURE-CONFLICT feature'lari ---
+        # UC AYRI kullanim, uc ayri bayrak (gat-conflict'te ilk ikisi tek bayraktaydi):
+        #   compute_conflict -> hesapla ve out'a koy (L_conflict loss'u icin YETER, girdiyi degistirmez)
+        #   conflict_feats   -> AYRICA ajan edge'ine ekle (model girdi olarak gorur)
+        #   conflict_bias    -> AYRICA causal logit'ten explicit ceza cikar
+        # Ayrilmasinin sebebi: "bilgiyi girdiye koymak" (olculdu: 1.24->1.26x, etkisiz) ile
+        # "maskeyi denetlemek" (1.65x) farkli seyler; ikisi ayri ayri olculebilmeli.
+        conf = None
+        if self.compute_conflict and neighbor_futures is not None and neighbor_states is not None:
+            route_pts = inputs['route_lanes'][..., :2].float().reshape(B, -1, 2)       # [B,P,2]
+            route_v = route_pts.abs().sum(-1) > 1e-6                                    # [B,P]
+            ego_speed = torch.norm(agent_pose[:, 0, 3:5], dim=-1)                       # [B]
+            conf = _conflict_features(neighbor_futures[:, :N], neighbor_states[:, :N],
+                                      route_pts, route_v, ego_speed)                    # [B,N,4]
+            if self.conflict_feats:
+                edge_ego = torch.cat([edge_ego, conf], dim=-1)                          # [B,N,De+4]
+
         # --- STAGE B: ego-merkezli causal-split (ajan + harita, causal/confound) ---
         f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = f_all = None
         ent_cas_mean = ent_cas_headmean = ent_cfd_mean = ent_cfd_headmean = None
@@ -401,7 +487,7 @@ class EgoCausalDisentangler(nn.Module):
              ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
              ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
              gate_cos, f_all) = layer(
-                h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid)
+                h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid, conflict=conf)
             gate_cos_layers.append(gate_cos)
         gate_cos_stack = torch.stack(gate_cos_layers, dim=1)   # [B, L] -- L=len(self.layers)
 
@@ -409,6 +495,7 @@ class EgoCausalDisentangler(nn.Module):
             'f_cas': f_cas, 'f_cfd': f_cfd, 'M_cas': M_cas, 'M_cfd': M_cfd,
             'M_cas_map': M_cas_mp, 'M_cfd_map': M_cfd_mp, 'map_valid': map_valid,
             'f_all': f_all,                               # [B,3D] gate'siz tam-sahne ozeti (recon hedefi)
+            'conflict': conf,                             # [B,N,4] future-conflict (L_conflict hedefi)
             # elestiri #3: M_cas/M_cfd'nin (head-ortalamasi) entropisi vs head-basina entropinin
             # ortalamasi (normalize: /log(n_valid), batch-agnostik) -- ikisi arasindaki fark,
             # head'lerin farkli komsulara/polygonlara tepe yapip yapmadigini gosterir. Harita icin de
@@ -463,9 +550,14 @@ class CausalPlanner(nn.Module):
     """Ust modul: disentangler (A) + ego head (B) + adversarial psi head'leri (C)."""
 
     def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, num_maneuvers=5,
-                 recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax'):
+                 recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax',
+                 conflict_feats=0, conflict_bias=0, compute_conflict=0):
         super().__init__()
-        self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich, gate=gate)
+        self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
+                                                  gate=gate, conflict_feats=conflict_feats,
+                                                  conflict_bias=conflict_bias)
+        # compute_conflict: feature'lar edge'e girmese/bias olmasa bile hesaplansin (loss icin)
+        self.disentangler.compute_conflict = bool(compute_conflict or conflict_feats or conflict_bias)
         self.head = CausalEgoHead(dim, modes, dropout, num_maneuvers=num_maneuvers)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
@@ -551,5 +643,6 @@ class CausalPlanner(nn.Module):
             'recon_pred': recon_pred,              # STEP 2: [f_cas(dropout'lu); f_cfd] -> f_all tahmini
             'f_all': dis['f_all'],                 # STEP 2: hedef (loss'ta DETACH edilir)
             'nbr_pred': nbr_pred,                  # STEP 2b: f_cfd -> komsu gelecekleri [B,N,80,2]
+            'conflict': dis['conflict'],           # [B,N,4] future-conflict (L_conflict icin)
         }
         return out
