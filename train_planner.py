@@ -117,7 +117,9 @@ def maneuver_labels(ego_future):
     return torch.tensor(labs, dtype=torch.long, device=ego_future.device)
 
 
-def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask):
+def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0,
+                            neighbors_future=None, lambda_nbr=0.0, lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
+                            lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5):
     """Causal-Planner'a SADIK loss (ref: ~/Causal-Planner lightning_trainer.py). Backdoor/GRL YOK.
 
     CP'nin toplami:
@@ -166,10 +168,61 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
     comp_ag, excl_ag, norm_ag = _soft_mask(out['M_cas'], out['M_cfd'], out['nbr_valid'])
     comp_mp, excl_mp, norm_mp = _soft_mask(out['M_cas_map'], out['M_cfd_map'], out['map_valid'])
     l_comp, l_excl, l_norm = comp_ag + comp_mp, excl_ag + excl_mp, norm_ag + norm_mp
-    l_mask = l_comp + l_excl + l_norm                               # CP: other_soft_mask + g2a_soft_mask
+    # STEP 3: norm loss'tan CIKARILDI. Softmax altinda zaten tam 0 (no-op); sigmoid altinda ise
+    # comp ile CELISIR -- comp Sum(g_cfd)=N-Sum(g_cas) derken norm ikisinin de 1 olmasini ister,
+    # bu ancak N=2 icin tutarli. Metrik olarak loglanmaya devam ediyor.
+    l_mask = l_comp + l_excl                                        # CP: other_soft_mask + g2a_soft_mask
+
+    # STEP 3 (opsiyonel emniyet supabi): sigmoid'in dejenere optimumu g_cas=1 her yerde
+    # (comp=0, excl=0 -> "her sey nedensel, hicbir sey confound"). Hinge, ESITLIK degil: az almak
+    # bedava, cok almak pahali. Varsayilan 0 -- once recon<->L_traj rekabetinin yetip yetmedigine bakilir.
+    nvb_b = out['nbr_valid']
+    g_mean = (out['M_cas'] * nvb_b).sum() / nvb_b.sum().clamp(min=1)
+    # IKI YONLU: tavan dejenere 'her sey nedensel'i keser, TABAN 'hicbir sey nedensel'i keser.
+    # step3'te taban yoktu -> g_cas 0.05'e cokup ajan dali bosaldi (viz: cfd her yerde ~0.97).
+    l_budget = F.relu(g_mean - budget_rho) + F.relu(budget_lo - g_mean)
+
+    # --- STEP 2: f_cfd collapse fix. [f_cas(pathway-dropout'lu); f_cfd] gate'siz tam-sahne ozetini
+    # (f_all) geri kurmali. Hedef DETACH -> ana toplama/mesaj projeksiyonlari carpitilmaz; gradyan
+    # yalniz cfd_recon + f_cfd (+ birakilan orneklerde f_cas) uzerine akar. lambda_recon=0 -> KAPALI.
+    l_recon = F.mse_loss(out['recon_pred'], out['f_all'].detach())
+
+    # --- STEP 2b: CP'nin others_reg_loss'unun CONFOUND dala uygulanmis hali. f_cfd TEK BASINA tum
+    # komsularin GT gelecegini tasimali. Ajan-BASINA hedef -> uniform maske optimal degil (recon'un
+    # zaafi buydu). Agirliksiz: M_cfd ile carpsak model "kolay ajani sec"e kacardi. lambda_nbr=0 -> KAPALI.
+    l_nbr = torch.zeros((), device=out['traj'].device)
+    if neighbors_future is not None:
+        N = out['nbr_pred'].shape[1]
+        gt_nbr = neighbors_future[:, :N, :, :2]                              # [B,N,T,2]
+        vmask = torch.ne(gt_nbr, 0).any(-1) & out['nbr_valid'][:, :N, None]  # [B,N,T]
+        per = F.smooth_l1_loss(out['nbr_pred'], gt_nbr, reduction='none').mean(-1)   # [B,N,T]
+        l_nbr = (per * vmask).sum() / vmask.sum().clamp(min=1)
+
+    # --- YOL A: comp/excl'in yerine, softmax parametrizasyonuna UYAN iki terim ---
+    # (1) BHATTACHARYYA ORTUSMESI. excl = MSE(M_cas*M_cfd, 0) iki kucuk olasiligi carpip
+    # kareliyor -> uniform'da 1/N^4 (N=10 icin 1e-4) cikip "cozuldu" der; oysa uniform
+    # AZAMI ortusmedir. BC = sum_j sqrt(M_cas*M_cfd) ayni durumda tam 1.0 verir ve N'den
+    # BAGIMSIZDIR (N=4 de 40 da 1.0). Olculdu: E(uniform) BC=1.000 excl=0.0039,
+    # C(farkli tepeler) BC=0.512 excl=0.0009 -> BC 0.49 oynuyor, excl 0.003.
+    # NOT: excl kor DEGIL, sadece DUZ bolgede kor -- ayni ajanda cift tepeyi iyi yakalar
+    # (B: excl=0.131). Bu yuzden BC onun YERINE degil, TAMAMLAYICISI olarak dusunulmeli.
+    eps = 1e-12
+    def _bc(M_cas, M_cfd, valid):
+        vf = valid.float()
+        return (((M_cas.clamp(min=eps) * M_cfd.clamp(min=eps)).sqrt() * vf).sum(-1)).mean()
+    l_bc = _bc(out['M_cas'], out['M_cfd'], out['nbr_valid']) \
+         + _bc(out['M_cas_map'], out['M_cfd_map'], out['map_valid'])
+
+    # (2) ENTROPI HINGE (secicilik). M_cas_ent zaten log(n_valid)'e BOLUNMUS: 1=uniform, 0=tek-tepe.
+    # relu(H - tau): tau'nun ALTI bedava -> "2-3 ajan onemli" cezalanmaz, "10 ajan esit" cezalanir.
+    # Duz -H olsaydi her sahneyi tek-tepeye zorlardik. Hedef HEAD-ORTALAMASI entropi (M_cas_ent),
+    # head-basina (M_cas_headent) DEGIL: teslim ettigimiz maske head ortalamasi, ve ortalamayi
+    # cezalamak head'leri hem keskinlesmeye HEM ANLASMAYA zorlar (olculdu: ent 0.908 vs headent 0.513).
+    l_peak = F.relu(out['M_cas_ent'] - peak_tau).mean() + F.relu(out['M_cas_map_ent'] - peak_tau).mean()
 
     nv_f = out['nbr_valid'].float()
-    loss = l_traj + lambda_kld * l_kld + lambda_ci * l_ci + lambda_mask * l_mask
+    loss = (l_traj + lambda_kld * l_kld + lambda_ci * l_ci + lambda_mask * l_mask
+            + lambda_recon * l_recon + lambda_nbr * l_nbr + lambda_budget * l_budget + lambda_bc * l_bc + lambda_peak * l_peak)
 
     with torch.no_grad():
         traj_xy = out['traj'][:, 0, :, :, :2]                     # [B, M, 80, 2]
@@ -235,6 +288,13 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
         'kl': l_kl.item(), 'ent': ent.item(), 'casent': casent, 'entgap': entgap,
         'ci': l_ci.item(), 'mask': l_mask.item(),
         'comp': l_comp.item(), 'excl': l_excl.item(), 'norm': l_norm.item(),
+        'recon': l_recon.item(), 'nbr': l_nbr.item(), 'budget': l_budget.item(),
+        'bc': l_bc.item(), 'peak_hinge': l_peak.item(),
+        # STEP 3 uyelik metrikleri: sigmoid'de M artik bir dagilim degil, 'ajan iceride mi' skoru.
+        # gcas_mean = sahnenin ne kadari nedensel ilan edildi; frac05 = kac ajan g>0.5.
+        'gcas_mean': g_mean.item(),
+        'gcfd_mean': ((out['M_cfd'] * nvb_b).sum() / nvb_b.sum().clamp(min=1)).item(),
+        'gcas_frac05': (((out['M_cas'] > 0.5) & nvb_b).sum() / nvb_b.sum().clamp(min=1)).item(),
         'minADE': minade, 'minFDE': minfde, 'casacc': cas_acc, 'cfdacc': cfd_acc,
         'mcas_peak': mcas_peak, 'mcas_map_peak': mcas_map_peak, 'qbar': q_bar,
         'mcfd_peak': mcfd_peak, 'unif': unif,
@@ -251,8 +311,9 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask)
 
 
 def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
-               lambda_kld, lambda_ci, lambda_mask,
-               optimizer=None, desc="Training"):
+               lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0, lambda_nbr=0.0,
+               lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
+               lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5, optimizer=None, desc="Training"):
     train = optimizer is not None
     causal.train() if train else causal.eval()
     gameformer.eval()
@@ -260,7 +321,7 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
 
     with tqdm(data_loader, desc=desc, unit="batch") as data_epoch:
         for batch in data_epoch:
-            inputs, ego_future, _, _ = read_batch(batch, device)
+            inputs, ego_future, neighbors_future, _ = read_batch(batch, device)
 
             with torch.no_grad():
                 encoder_outputs = gameformer.encoder(inputs)
@@ -272,7 +333,10 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                 out = causal(encoder_outputs, inputs, num_agents=num_neighbors + 1,
                              neighbor_futures=top1_fut, neighbor_states=nbr_states)
                 loss, metrics = causal_loss_and_metrics(out, ego_future, lambda_kld,
-                                                         lambda_ci, lambda_mask)
+                                                         lambda_ci, lambda_mask, lambda_recon,
+                                                         neighbors_future, lambda_nbr,
+                                                         lambda_budget, budget_rho, budget_lo,
+                                                         lambda_bc, lambda_peak, peak_tau)
 
             if train:
                 optimizer.zero_grad()
@@ -302,6 +366,10 @@ def model_training(args):
     logging.info("Batch size: {}".format(args.batch_size))
     logging.info("Learning rate: {}".format(args.learning_rate))
     logging.info("Use device: {}".format(args.device))
+    # TAM KONFIGURASYON. Eski kosularda sadece batch/lr/device loglaniyordu; lambda degerleri
+    # hicbir yerde kayitli degildi, bu yuzden "bu kosu hangi lambda_mask ile egitildi" sorusunu
+    # tahmin ederek cevaplamak zorunda kaldik. Artik checkpoint <-> konfigurasyon bagi kopmuyor.
+    logging.info("Config: {}".format({k: v for k, v in sorted(vars(args).items())}))
 
     set_seed(args.seed)
 
@@ -315,6 +383,10 @@ def model_training(args):
     freeze_gameformer(gameformer)
 
     causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, dropout=args.dropout,
+                           # lambda_recon=0 iken pathway-dropout'u da kapat: torch.rand cagrilmasin,
+                           # yoksa RNG akisi kayar ve eski kosularla birebir kiyas bozulur.
+                           recon_drop=(args.recon_drop if args.lambda_recon > 0 else 0.0),
+                           num_neighbors=args.num_neighbors, gate=args.gate,
                            nbr_enrich=args.nbr_enrich).to(args.device)
 
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -329,11 +401,13 @@ def model_training(args):
     for epoch in range(args.train_epochs):
         logging.info(f"Epoch {epoch + 1}/{args.train_epochs}")
         train_m = _run_epoch(train_loader, gameformer, causal, args.device, args.num_neighbors,
-                             args.lambda_kld, args.lambda_ci, args.lambda_mask,
-                             optimizer=optimizer, desc="Training")
+                             args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_recon, args.lambda_nbr,
+                             args.lambda_budget, args.budget_rho, args.budget_lo,
+                             args.lambda_bc, args.lambda_peak, args.peak_tau, optimizer=optimizer, desc="Training")
         val_m = _run_epoch(valid_loader, gameformer, causal, args.device, args.num_neighbors,
-                           args.lambda_kld, args.lambda_ci, args.lambda_mask,
-                           optimizer=None, desc="Validation")
+                           args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_recon, args.lambda_nbr,
+                           args.lambda_budget, args.budget_rho, args.budget_lo,
+                           args.lambda_bc, args.lambda_peak, args.peak_tau, optimizer=None, desc="Validation")
 
         log = {"epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]}
         log.update({f"train-{k}": v for k, v in train_m.items()})
@@ -395,6 +469,26 @@ if __name__ == "__main__":
                         help="CP decision_loss: CE(psi_cas, m*) [CP=1.0]")
     parser.add_argument("--lambda_ci", type=float, default=0.5,
                         help="CP decision_causal_inference_loss: KL(uniform||p_cfd)+0.1*(-H) [CP=0.5]")
+    parser.add_argument("--lambda_bc", type=float, default=0.0,
+                        help="YOL A: Bhattacharyya ortusme cezasi (0 = KAPALI). excl'in duz bolgede kor oldugu yeri gorur")
+    parser.add_argument("--lambda_peak", type=float, default=0.0,
+                        help="YOL A: relu(H(M_cas)/log n - tau) secicilik hinge'i (0 = KAPALI)")
+    parser.add_argument("--peak_tau", type=float, default=0.5,
+                        help="YOL A: entropi hinge esigi; ALTI bedava (1=uniform, 0=tek-tepe)")
+    parser.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"],
+                        help="STEP 3: komsu maskesi -- softmax (dagilim, toplam=1) | sigmoid (bagimsiz uyelik)")
+    parser.add_argument("--lambda_budget", type=float, default=0.0,
+                        help="STEP 3: relu(mean(g_cas)-rho) hinge agirligi (0 = KAPALI)")
+    parser.add_argument("--budget_rho", type=float, default=0.2,
+                        help="STEP 3: butce bandinin UST siniri")
+    parser.add_argument("--budget_lo", type=float, default=0.0,
+                        help="STEP 3: butce bandinin ALT siniri (0 = taban yok, tek yonlu)")
+    parser.add_argument("--lambda_nbr", type=float, default=0.0,
+                        help="STEP 2b: f_cfd->komsu-gelecek tahmini agirligi (0 = KAPALI)")
+    parser.add_argument("--lambda_recon", type=float, default=0.0,
+                        help="STEP 2: [f_cas;f_cfd]->f_all rekonstruksiyon agirligi (0 = KAPALI)")
+    parser.add_argument("--recon_drop", type=float, default=0.5,
+                        help="STEP 2: recon head'inde f_cas'in sifirlanma olasiligi (pathway dropout)")
     parser.add_argument("--lambda_mask", type=float, default=0.5,
                         help="CP soft_mask_loss: (comp+excl+norm) ajan + harita TOPLAMI [CP=0.5]")
     args = parser.parse_args()

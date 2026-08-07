@@ -252,8 +252,13 @@ def main(args):
     gameformer.load_state_dict(torch.load(args.pretrained_path, map_location=dev))
     gameformer = gameformer.to(dev); freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich).to(dev)
-    causal.load_state_dict(torch.load(args.causal_path, map_location=dev))
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate).to(dev)
+    # strict=False: eski checkpoint'ler (ornegin Step 2 oncesi) cfd_recon agirliklarini icermez.
+    # O modul viz yolunda HIC kullanilmaz, o yuzden eksik olmasi zararsiz -- ama ne eksikse yazdir,
+    # sessizce gercek bir uyumsuzlugu yutmayalim.
+    missing, unexpected = causal.load_state_dict(torch.load(args.causal_path, map_location=dev), strict=False)
+    if missing or unexpected:
+        print(f"[load] missing={list(missing)}  unexpected={list(unexpected)}")
     causal.eval()
 
     valid_set = DrivingData(args.valid_set + "/*.npz", args.num_neighbors)
@@ -340,6 +345,8 @@ if __name__ == "__main__":
     p.add_argument("--decoder_levels", type=int, default=2)
     p.add_argument("--graph_layers", type=int, default=1)
     p.add_argument("--nbr_enrich", type=int, default=0)
+    p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"],
+                   help="checkpoint hangi kapi moduyla EGITILDIYSE o verilmeli (aksi halde maske yanlis hesaplanir)")
     p.add_argument("--modes", type=int, default=6)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--out", type=str, default="causal_bev.png")

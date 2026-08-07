@@ -144,10 +144,11 @@ class EgoCausalLayer(nn.Module):
     Harita SADECE bu gate uzerinden trajectory'ye girer (f_cas) -> harita-gate'i anlamli.
     """
 
-    def __init__(self, dim=256, heads=8, edge_dim=EDGE_FEATURE_DIM, dropout=0.1):
+    def __init__(self, dim=256, heads=8, edge_dim=EDGE_FEATURE_DIM, dropout=0.1, gate='softmax'):
         super().__init__()
         assert dim % heads == 0
         self.dim, self.heads, self.dh = dim, heads, dim // heads
+        self.gate = gate                      # 'softmax' (dagilim) | 'sigmoid' (bagimsiz uyelik)
         # 'other' (ajan) iliskisi. Query HEP ego (tek), ama KEY/VALUE komsu-tipine gore AYRI (CP
         # wks["other_*"]/wvs["other"] = 4 tiplik ModuleList; tip = okunulan komsunun tipi). Bizde target
         # hep ego oldugu icin query/output/self_fc tek kalir, SADECE komsu-tarafi K/V tip-basina.
@@ -164,6 +165,14 @@ class EgoCausalLayer(nn.Module):
         self.attn_cfd_mp = nn.Parameter(torch.empty(heads, self.dh))
         for p in (self.attn_cas, self.attn_cfd, self.attn_cas_mp, self.attn_cfd_mp):
             nn.init.xavier_uniform_(p)
+        # STEP 3 -- SIGMOID KAPI modu (gate='sigmoid'). Softmax komsular uzerinde bir DAGILIM zorlar:
+        # toplam hep 1, yani bos yolda bile "biri nedensel" demek zorunda, ve ajanlar birbiriyle
+        # yarisir. Oysa sorumuz ajan-BASINA evet/hayir. Sigmoid'de her kapi bagimsiz [0,1] -> hepsine
+        # hayir diyebilir, ve CP'nin comp/excl kayiplari ILK KEZ tatmin edilebilir hale gelir
+        # (comp: g_cas+g_cfd=1, excl: g_cas*g_cfd=0 -> birlikte {0,1} ikili atama).
+        # Bias -2 ile baslar (sigmoid(-2)~0.12): aksi halde sigmoid(0)=0.5 ile sahnenin YARISI
+        # bastan "nedensel" olur ve ilk epoch'lar bunu geri cekmekle gecer.
+        self.gate_bias = nn.Parameter(torch.full((4,), -2.0))   # [cas_ag, cfd_ag, cas_mp, cfd_mp]
         # birlestirme (Eq 6): [self ; ajan ; harita] -> f_cas / f_cfd
         self.self_fc = nn.Sequential(nn.Linear(dim, dim), nn.ReLU())
         # AYRI cikis projeksiyonu + LayerNorm (CP hdgt_encoder.py ile ayni: out_fc_causal/out_fc_confound
@@ -179,7 +188,7 @@ class EgoCausalLayer(nn.Module):
         self.leaky = nn.LeakyReLU(0.2)
         self.dropout = nn.Dropout(dropout)
 
-    def _attend(self, q1, k, ek, msg, valid, attn_cas, attn_cfd):
+    def _attend(self, q1, k, ek, msg, valid, attn_cas, attn_cfd, bias):
         """q1 [B,1,H,dh]; k/ek/msg [B,Nk,H,dh]; valid [B,Nk] bool. AYRI softmax causal/confound.
         Doner: cas [B,D], cfd [B,D], M_cas [B,Nk], M_cfd [B,Nk] (head-ort),
         ent_cas_mean/ent_cas_headmean/ent_cfd_mean/ent_cfd_headmean [B] (elestiri #3, bkz asagi)."""
@@ -189,10 +198,21 @@ class EgoCausalLayer(nn.Module):
         a_cfd = (s * attn_cfd).sum(-1)
         invalid = ~valid[:, :, None]                          # [B,Nk,1]
         neg_inf = torch.finfo(a_cas.dtype).min
-        M_cas_h = torch.softmax(a_cas.masked_fill(invalid, neg_inf), dim=1).masked_fill(invalid, 0.0)
-        M_cfd_h = torch.softmax(a_cfd.masked_fill(invalid, neg_inf), dim=1).masked_fill(invalid, 0.0)
-        cas = (M_cas_h.unsqueeze(-1) * msg).sum(dim=1).reshape(B, self.dim)   # [B,D]
-        cfd = (M_cfd_h.unsqueeze(-1) * msg).sum(dim=1).reshape(B, self.dim)
+        if self.gate == 'sigmoid':
+            # STEP 3: bagimsiz kapilar. Toplama Sum(g)/clamp(min=1) ile normalize -- clamp KRITIK:
+            # toplam kapi 1'in altina duserse bolme YAPILMAZ, cikti sifira dogru kuculur. "Kimse
+            # nedensel degil" boylece ifade edilebilir hale gelir (softmax'ta imkansizdi).
+            M_cas_h = torch.sigmoid(a_cas + bias[0]).masked_fill(invalid, 0.0)
+            M_cfd_h = torch.sigmoid(a_cfd + bias[1]).masked_fill(invalid, 0.0)
+            den_cas = M_cas_h.sum(dim=1).clamp(min=1.0)[:, None, :, None]      # [B,1,H,1]
+            den_cfd = M_cfd_h.sum(dim=1).clamp(min=1.0)[:, None, :, None]
+            cas = ((M_cas_h.unsqueeze(-1) * msg) / den_cas).sum(dim=1).reshape(B, self.dim)
+            cfd = ((M_cfd_h.unsqueeze(-1) * msg) / den_cfd).sum(dim=1).reshape(B, self.dim)
+        else:
+            M_cas_h = torch.softmax(a_cas.masked_fill(invalid, neg_inf), dim=1).masked_fill(invalid, 0.0)
+            M_cfd_h = torch.softmax(a_cfd.masked_fill(invalid, neg_inf), dim=1).masked_fill(invalid, 0.0)
+            cas = (M_cas_h.unsqueeze(-1) * msg).sum(dim=1).reshape(B, self.dim)   # [B,D]
+            cfd = (M_cfd_h.unsqueeze(-1) * msg).sum(dim=1).reshape(B, self.dim)
 
         # ELESTIRI #3: TOPLAMA (yukarida) her head'in KENDI M_cas_h agirligini kullanir, ama
         # rapor edilen M_cas = M_cas_h.mean(-1) (head-ortalamasi). Head'ler farkli komsuya tepe
@@ -202,10 +222,18 @@ class EgoCausalLayer(nn.Module):
         eps = 1e-12
         M_cas_mean = M_cas_h.mean(-1)                                              # [B,Nk]
         M_cfd_mean = M_cfd_h.mean(-1)
+        if self.gate == 'sigmoid':
+            # Kapilar bir dagilim DEGIL (toplam != 1). Entropiyi normalize edilmis p = g/Sum(g)
+            # uzerinden hesapla ki sayilar softmax kosulariyla ayni olcekte kalsin; UYELIK bilgisi
+            # ayrica gcas_mean/gcas_frac05 metrikleriyle raporlanir.
+            pc = M_cas_h / M_cas_h.sum(dim=1, keepdim=True).clamp(min=eps)
+            pf = M_cfd_h / M_cfd_h.sum(dim=1, keepdim=True).clamp(min=eps)
+        else:
+            pc, pf = M_cas_h, M_cfd_h
         ent_cas_mean = -(M_cas_mean.clamp(min=eps).log() * M_cas_mean).sum(-1)      # [B], NATS (ham)
-        ent_cas_headmean = (-(M_cas_h.clamp(min=eps).log() * M_cas_h).sum(1)).mean(-1)   # [B]
+        ent_cas_headmean = (-(pc.clamp(min=eps).log() * pc).sum(1)).mean(-1)   # [B]
         ent_cfd_mean = -(M_cfd_mean.clamp(min=eps).log() * M_cfd_mean).sum(-1)
-        ent_cfd_headmean = (-(M_cfd_h.clamp(min=eps).log() * M_cfd_h).sum(1)).mean(-1)
+        ent_cfd_headmean = (-(pf.clamp(min=eps).log() * pf).sum(1)).mean(-1)
 
         # NORMALIZASYON (elestiri): maksimum entropi log(n_valid), n_valid sahneden sahneye
         # (2-40) degisir. Ham nats'i batch uzerinden ortalamak kalabalik sahneleri (buyuk log(n))
@@ -244,7 +272,7 @@ class EgoCausalLayer(nn.Module):
         msg_ag = self._per_type(self.Wv_ag, h_nbr, nbr_types).view(B, N, H, dh) + self.We_v_ag(edge_ego).view(B, N, H, dh)
         (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag,
          ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean) = self._attend(
-            q_ag, k_ag, ek_ag, msg_ag, nbr_valid, self.attn_cas, self.attn_cfd)
+            q_ag, k_ag, ek_ag, msg_ag, nbr_valid, self.attn_cas, self.attn_cfd, self.gate_bias[0:2])
 
         # --- harita iliskisi (g2a) ---
         q_mp = self.Wq_mp(h_ego).view(B, 1, H, dh)
@@ -253,10 +281,22 @@ class EgoCausalLayer(nn.Module):
         msg_mp = self.Wv_mp(h_map).view(B, S, H, dh) + self.We_v_mp(edge_map).view(B, S, H, dh)
         (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp,
          ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean) = self._attend(
-            q_mp, k_mp, ek_mp, msg_mp, map_valid, self.attn_cas_mp, self.attn_cfd_mp)
+            q_mp, k_mp, ek_mp, msg_mp, map_valid, self.attn_cas_mp, self.attn_cfd_mp, self.gate_bias[2:4])
+
+        # --- GATE'SIZ TAM-SAHNE OZETI (f_all): causal/confound ayrimi YOK, ogrenilen secim YOK.
+        # Gecerli komsularin/polygonlarin DUZ ORTALAMASI. Step 2'de [f_cas; f_cfd] bunu geri
+        # kurmak zorunda -> f_cfd'nin sabit vektore cokmesi (fcfd_var ~ 1e-4) yasaklanir.
+        # Sadece hedef olarak kullanilir (loss'ta detach) -> ana toplamayi carpitmaz.
+        w_ag = nbr_valid.float()
+        w_ag = w_ag / w_ag.sum(-1, keepdim=True).clamp(min=1.0)               # [B,N]
+        all_ag = (w_ag[:, :, None, None] * msg_ag).sum(dim=1).reshape(B, self.dim)
+        w_mp = map_valid.float()
+        w_mp = w_mp / w_mp.sum(-1, keepdim=True).clamp(min=1.0)               # [B,S]
+        all_mp = (w_mp[:, :, None, None] * msg_mp).sum(dim=1).reshape(B, self.dim)
 
         # --- birlestirme (Eq 6): [self ; ajan ; harita] ---
         self_fea = self.self_fc(h_ego)                                        # [B,D]
+        f_all = torch.cat([self_fea, all_ag, all_mp], dim=-1)                 # [B,3D] recon hedefi
         f_cas = self.norm_cas(self.out_fc_cas(torch.cat([self_fea, ag_cas, mp_cas], dim=-1)) + h_ego)
         f_cfd = self.norm_cfd(self.out_fc_cfd(torch.cat([self_fea, ag_cfd, mp_cfd], dim=-1)))
         f_cas = self.ffn_cas(f_cas)      # FAZ 1: kendi prenorm+residual'iyla ek dogrusal-olmayan isleme
@@ -271,7 +311,7 @@ class EgoCausalLayer(nn.Module):
         return (h_ego_new, f_cas, f_cfd, M_cas_ag, M_cfd_ag, M_cas_mp, M_cfd_mp,
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
                 ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
-                gate_cos)
+                gate_cos, f_all)
 
 
 class EgoCausalDisentangler(nn.Module):
@@ -282,7 +322,7 @@ class EgoCausalDisentangler(nn.Module):
     gunceller, komsular sabit kalir. Son katmanin f_cas/f_cfd + M_cas/M_cfd ciktisi kullanilir.
     """
 
-    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0):
+    def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, gate='softmax'):
         super().__init__()
         self.future_encoder = FutureEncoder()
         self.future_fuse = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU())
@@ -300,7 +340,7 @@ class EgoCausalDisentangler(nn.Module):
             _NbrMapEnrichLayer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(nbr_enrich)
         ])
         self.layers = nn.ModuleList([
-            EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout) for _ in range(layers)
+            EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout, gate=gate) for _ in range(layers)
         ])
 
     def forward(self, agent_feat, agent_valid, agent_pose, agent_types, inputs,
@@ -352,7 +392,7 @@ class EgoCausalDisentangler(nn.Module):
                 h_nbr = enrich(h_nbr, h_map, edge_nbr_map, map_valid)
 
         # --- STAGE B: ego-merkezli causal-split (ajan + harita, causal/confound) ---
-        f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = None
+        f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = f_all = None
         ent_cas_mean = ent_cas_headmean = ent_cfd_mean = ent_cfd_headmean = None
         ent_cas_mp_mean = ent_cas_mp_headmean = ent_cfd_mp_mean = ent_cfd_mp_headmean = None
         gate_cos_layers = []          # elestiri: katman-basina cos(f_cas, h_ego), bypass/GRU-fix etkilesimi
@@ -360,7 +400,7 @@ class EgoCausalDisentangler(nn.Module):
             (h_ego, f_cas, f_cfd, M_cas, M_cfd, M_cas_mp, M_cfd_mp,
              ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
              ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
-             gate_cos) = layer(
+             gate_cos, f_all) = layer(
                 h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid)
             gate_cos_layers.append(gate_cos)
         gate_cos_stack = torch.stack(gate_cos_layers, dim=1)   # [B, L] -- L=len(self.layers)
@@ -368,6 +408,7 @@ class EgoCausalDisentangler(nn.Module):
         return {
             'f_cas': f_cas, 'f_cfd': f_cfd, 'M_cas': M_cas, 'M_cfd': M_cfd,
             'M_cas_map': M_cas_mp, 'M_cfd_map': M_cfd_mp, 'map_valid': map_valid,
+            'f_all': f_all,                               # [B,3D] gate'siz tam-sahne ozeti (recon hedefi)
             # elestiri #3: M_cas/M_cfd'nin (head-ortalamasi) entropisi vs head-basina entropinin
             # ortalamasi (normalize: /log(n_valid), batch-agnostik) -- ikisi arasindaki fark,
             # head'lerin farkli komsulara/polygonlara tepe yapip yapmadigini gosterir. Harita icin de
@@ -421,9 +462,10 @@ class CausalEgoHead(nn.Module):
 class CausalPlanner(nn.Module):
     """Ust modul: disentangler (A) + ego head (B) + adversarial psi head'leri (C)."""
 
-    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, num_maneuvers=5):
+    def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, num_maneuvers=5,
+                 recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax'):
         super().__init__()
-        self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich)
+        self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich, gate=gate)
         self.head = CausalEgoHead(dim, modes, dropout, num_maneuvers=num_maneuvers)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
@@ -431,6 +473,27 @@ class CausalPlanner(nn.Module):
         # ZORUNDA -> hile yapamaz -> uniform baskisi f_cfd FEATURE'larina akar -> entropy CANLI kalir.
         # Cikti = 5-sinif MANEVRA (CP get_decision.py) -- SABIT/ogrenilebilir hedef (WTA m* DEGIL).
         self.psi = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_maneuvers))
+
+        # STEP 2 -- f_cfd COLLAPSE FIX. Olculen kusur: fcfd_var/fcas_var ~ 1e-4 (3 kosuda), yani
+        # f_cfd her sahnede AYNI vektor. Sebep: loss ondan tek sey istiyor ("manevrayi ele verme"),
+        # sabit vektor bunu bedavaya sagliyor -- yani confound dalinin hicbir MUSTERISI yok.
+        # Cozum: [f_cas ; f_cfd] birlikte gate'siz tam-sahne ozetini (f_all) geri kurabilsin.
+        # PATHWAY DROPOUT sart: f_cas her zaman verilirse recon "f_cas'i kopyala"yi ogrenir ve
+        # f_cfd'ye hic bakmaz (DOD'da ise yarayan ayni numara). p ile f_cas SIFIRLANIR -> o orneklerde
+        # hedefi TEK BASINA f_cfd tasimak zorunda.
+        self.recon_drop = recon_drop
+        self.cfd_recon = nn.Sequential(nn.Linear(2 * dim, 2 * dim), nn.ReLU(), nn.Linear(2 * dim, 3 * dim))
+
+        # STEP 2b (option B) -- CP'nin agent_predictor'unun CONFOUND dala uygulanmis hali.
+        # CP (planning_model.py:519) komsu geleceklerini CAUSAL dugum ozelliklerinden tahmin eder
+        # (others_reg_loss); confound dalinin ise TEK tuketicisi decision_decoder'dir -> orada da
+        # cokme serbest. Biz ayni yardimci gorevi f_cfd'ye veriyoruz: f_cfd TEK BASINA tum komsularin
+        # gelecegini tasimali. Recon'dan farki: hedef ajan-BASINA, yani uniform maske optimal DEGIL --
+        # her ajanin gelecegi farkli miktarda bilgi ister, maske tahsisi ogrenmek ZORUNDA.
+        # Agirliksiz biraktik bilerek: M_cfd ile agirliklandirsak model "kolay ajani sec"e kacardi.
+        self.num_neighbors, self.future_steps = num_neighbors, future_steps
+        self.nbr_head = nn.Sequential(nn.Linear(dim, 2 * dim), nn.ReLU(),
+                                      nn.Linear(2 * dim, num_neighbors * future_steps * 2))
 
     def forward(self, encoder_outputs, inputs, num_agents,
                 neighbor_futures=None, neighbor_states=None, also_cfd_plan=False):
@@ -443,6 +506,17 @@ class CausalPlanner(nn.Module):
         dis = self.disentangler(agent_feat, agent_valid, agent_pose, agent_types, inputs,
                                 neighbor_futures=neighbor_futures, neighbor_states=neighbor_states)
         f_cas, f_cfd = dis['f_cas'], dis['f_cfd']
+
+        # STEP 2: [f_cas ; f_cfd] -> f_all rekonstruksiyonu. f_cas per-ornek olasilikla SIFIRLANIR
+        # (yalniz egitimde) -> o orneklerde hedefi tek basina f_cfd tasimali. Inference'ta kapali;
+        # cfd_recon plan yoluna hic dokunmaz, sadece f_cfd'ye gradyan saglar.
+        keep = 1.0
+        if self.training and self.recon_drop > 0.0:
+            keep = (torch.rand(f_cas.shape[0], 1, device=f_cas.device) >= self.recon_drop).float()
+        recon_pred = self.cfd_recon(torch.cat([keep * f_cas, f_cfd], dim=-1))   # [B,3D]
+
+        # STEP 2b: komsu gelecekleri YALNIZ f_cfd'den (f_cas'a bakmadan) -> f_cfd sahne icerigi tasimali.
+        nbr_pred = self.nbr_head(f_cfd).view(-1, self.num_neighbors, self.future_steps, 2)
 
         # DOD: psi'yi head'den ONCE hesapla; tahmin edilen manevra karari (b*) decoder query'sine besle.
         psi_cas = self.psi(f_cas)
@@ -474,5 +548,8 @@ class CausalPlanner(nn.Module):
             'gate_cos': dis['gate_cos'],                   # katman-basina cos(f_cas, h_ego)
             'psi_cas': psi_cas,                    # PAYLASILAN head -> manevra (L_KLD, informative)
             'psi_cfd': psi_cfd,                    # AYNI head -> uniform (L_ENT); hile yapamaz -> entropy canli
+            'recon_pred': recon_pred,              # STEP 2: [f_cas(dropout'lu); f_cfd] -> f_all tahmini
+            'f_all': dis['f_all'],                 # STEP 2: hedef (loss'ta DETACH edilir)
+            'nbr_pred': nbr_pred,                  # STEP 2b: f_cfd -> komsu gelecekleri [B,N,80,2]
         }
         return out
