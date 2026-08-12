@@ -83,7 +83,14 @@ class CausalRefinerPlanner(PlannerV2):
         self.backbone.to(self._device).eval()
         # CausalPlanner (egitilmis) — neural_plan + M_cas
         self.causal = CausalPlanner(layers=self._graph_layers, modes=self._modes, nbr_enrich=self._nbr_enrich)
-        self.causal.load_state_dict(torch.load(self._causal_path, map_location=self._device))
+        # strict=False: model sonradan modul kazandi (gate_bias, nbr_head, cfd_recon); eski checkpoint'ler
+        # bu anahtarlari icermez. Ucu de PLAN YOLUNUN DISINDA: gate_bias yalniz gate='sigmoid' dalinda
+        # okunur (planner softmax kurar), nbr_head/cfd_recon yalniz egitim loss'larini besler. Yine de
+        # ne eksikse yazdir -- listede head.* / attn_* / out_fc_* gorunurse sonuc GECERSIZDIR.
+        _miss, _unexp = self.causal.load_state_dict(
+            torch.load(self._causal_path, map_location=self._device), strict=False)
+        if _miss or _unexp:
+            print(f'[load] missing={list(_miss)}  unexpected={list(_unexp)}')
         self.causal.to(self._device).eval()
         self.relevance_graph = None
 

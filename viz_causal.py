@@ -138,6 +138,15 @@ def plot_scene(ax, s, mode, thr, topn, branch="cas"):
               facecolor="#222222", edgecolor="black", lw=1.0, z=6)
     ax.plot(s["ego_plan"][:, 0], s["ego_plan"][:, 1], "--", color="#2ca02c", lw=1.8, zorder=7)
 
+    # L_conflict'in koridoru: lattice planner referans yolu (c_lat_candidates[0]).
+    # KOYU mor = reach icinde kalan parca (cezanin gercekten kullandigi), ACIK mor = otesi.
+    rp = s["ref_path"]
+    rp = rp[np.abs(rp).sum(-1) > 1e-6]
+    if len(rp) > 1:
+        inside = np.linalg.norm(rp, axis=-1) <= s["reach"]
+        ax.plot(rp[~inside, 0], rp[~inside, 1], ".", color="#9C7BB8", ms=1.2, zorder=3, alpha=0.7)
+        ax.plot(rp[inside, 0], rp[inside, 1], "-", color="#6A1B9A", lw=2.2, zorder=4, alpha=0.9)
+
     agent_sel = select_mask(s["M_cas"][:s["N"]], s["valid"], mode, thr, topn)
     # HARITA ile AYNI normalizasyon: renk = m / (sahne-ici max M_cas), boyle harita ile
     # kiyaslanabilir olur (onceden ham/mutlak degerle boyaniyordu -> harita hep daha "kesin"
@@ -185,7 +194,7 @@ def plot_scene(ax, s, mode, thr, topn, branch="cas"):
 
 @torch.no_grad()
 def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device,
-                   scenario, mode, thr, topn, branch="cas"):
+                   scenario, mode, thr, topn, branch="cas", ref_idx=0):
     """branch='cas' (varsayilan) -> M_cas/M_cas_map + f_cas'ten uretilen plan (ANA, deploy edilen).
     branch='cfd' -> M_cfd/M_cfd_map + f_cfd'den uretilen plan (traj_cfd/score_cfd, tani/ablasyon amacli,
     hicbir ajan silinmez)."""
@@ -194,7 +203,7 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
     mask_key = "M_cas" if branch == "cas" else "M_cfd"
     map_key = "M_cas_map" if branch == "cas" else "M_cfd_map"
     for batch in loader:
-        inputs, ego_future, _, _ = read_batch(batch, device)
+        inputs, ego_future, _, ref_path = read_batch(batch, device)
         enc = gameformer.encoder(inputs)
         top1_fut, nbr_states, _ = extract_neighbor_top1_futures(gameformer, enc, num_neighbors)
         out = causal(enc, inputs, num_agents=Na, neighbor_futures=top1_fut, neighbor_states=nbr_states,
@@ -206,6 +215,9 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
         traj_key, score_key = ("traj_cfd", "score_cfd") if branch == "cfd" else ("traj", "score")
         traj = out[traj_key][:, 0, :, :, :2]
         best = out[score_key][:, 0].argmax(-1)
+        ref0 = ref_path[:, ref_idx, :, :2]                       # [B,R,2] lattice planner referans yolu (aday 0)
+        ego_spd = torch.norm(actors[:, 0, 3:5], dim=-1)     # [B] anlik ego hizi
+        reach = (ego_spd * 0.1 * 80).clamp(min=10.0)        # L_conflict'teki reach ile AYNI formul
         dims = inputs["neighbor_agents_past"][:, :, -1, 6:8]
         types = inputs["neighbor_agents_past"][:, :, -1, 8:11].argmax(-1)
 
@@ -235,6 +247,7 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
                 "pos": actors[b, 1:Na, :3].cpu().numpy(),
                 "dims": dims[b].cpu().numpy(), "types": types[b].cpu().numpy(),
                 "ego_plan": traj[b, best[b]].cpu().numpy(),
+                "ref_path": ref0[b].cpu().numpy(), "reach": float(reach[b]),
                 "fut": top1_fut[b].cpu().numpy(),
                 "map_polys": polys,
                 "map_mcas": M_cas_map[b].cpu().numpy(),
@@ -265,7 +278,8 @@ def main(args):
     loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     scenes = collect_scenes(gameformer, causal, loader, args.num_neighbors, args.num_scenes, dev,
-                            args.scenario, args.select, args.threshold, args.topn, branch=args.branch)
+                            args.scenario, args.select, args.threshold, args.topn, branch=args.branch,
+                            ref_idx=args.ref_idx)
     if args.select == "none":
         sel_desc = "yok (secim kapali, sadece normalize renklendirme)"
     elif args.select == "topn":
@@ -345,6 +359,8 @@ if __name__ == "__main__":
     p.add_argument("--decoder_levels", type=int, default=2)
     p.add_argument("--graph_layers", type=int, default=1)
     p.add_argument("--nbr_enrich", type=int, default=0)
+    p.add_argument("--ref_idx", type=int, default=0,
+                   help="c_lat_candidates icinden hangi aday cizilecek (0 = ego'ya en yakin)")
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"],
                    help="checkpoint hangi kapi moduyla EGITILDIYSE o verilmeli (aksi halde maske yanlis hesaplanir)")
     p.add_argument("--modes", type=int, default=6)

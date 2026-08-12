@@ -86,7 +86,7 @@ def main():
                         batch_size=args.batch_size, shuffle=False, num_workers=4)
     rng = np.random.default_rng(0)
     N = args.num_neighbors
-    acc = {k: {m: [] for m in ("d0", "dmin", "tmin", "path")} for k in ("top1", "random", "near")}
+    acc = {k: {m: [] for m in ("d0", "dmin", "tmin", "path", "behind")} for k in ("top1", "random", "near")}
     mcas_sel = []
 
     for bi, batch in enumerate(loader):
@@ -121,6 +121,8 @@ def main():
                 if np.isnan(dmin):
                     continue
                 acc[k]["d0"].append(float(np.linalg.norm(pos0[b, j])))
+                # ego-frame'de +x ileri: x<0 -> ajan ego'nun ARKASINDA
+                acc[k]["behind"].append(float(pos0[b, j, 0] < 0))
                 acc[k]["dmin"].append(dmin)
                 acc[k]["tmin"].append(tmin)
                 acc[k]["path"].append(path)
@@ -129,7 +131,7 @@ def main():
     name = args.causal_path.split('/')[-2]
     print(f"\n=== Interaction check — {name} ({n} sahne) ===")
     print(f"  secilen ajanin ortalama M_cas: {np.mean(mcas_sel):.3f}\n")
-    hdr = f"{'':10s}{'d0 (m)':>18s}{'dmin (m)':>18s}{'path (m)':>18s}{'tmin (s)':>10s}{'dmin<%.0fm':>10s}" % args.conflict_thr
+    hdr = f"{'':10s}{'d0 (m)':>18s}{'dmin (m)':>18s}{'path (m)':>18s}{'tmin (s)':>10s}{'dmin<%.0fm':>10s}{'ARKADA':>9s}" % args.conflict_thr
     print(hdr); print("-" * len(hdr))
     for k in ("top1", "near", "random"):
         a = acc[k]
@@ -138,7 +140,7 @@ def main():
               f"{np.mean(a['d0']):9.2f} (med {np.median(a['d0']):5.1f})"
               f"{np.mean(a['dmin']):9.2f} (med {np.median(a['dmin']):5.1f})"
               f"{np.mean(a['path']):9.2f} (med {np.median(a['path']):5.1f})"
-              f"{np.mean(a['tmin']):10.2f}{frac:10.3f}")
+              f"{np.mean(a['tmin']):10.2f}{frac:10.3f}{np.mean(a['behind']):9.3f}")
 
     t, r, nr = np.array(acc["top1"]["dmin"]), np.array(acc["random"]["dmin"]), np.array(acc["near"]["dmin"])
     print(f"\n  top1 vs random : {np.mean(r) / max(np.mean(t), 1e-6):.2f}x daha yakin "

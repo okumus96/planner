@@ -16,9 +16,12 @@ from GameFormer.causal_graph import CausalPlanner
 from GameFormer.train_utils import DrivingData, imitation_loss, initLogging, set_seed
 
 
-def extract_neighbor_top1_futures(gameformer, encoder_outputs, num_neighbors):
+def extract_neighbor_top1_futures(gameformer, encoder_outputs, num_neighbors, return_ego=False):
     """Run frozen decoder, take argmax-mode trajectory per neighbor.
-    Returns (top1_futures [B,N,T,2], current_states [B,N,5], valid [B,N])."""
+    Returns (top1_futures [B,N,T,2], current_states [B,N,5], valid [B,N]).
+    return_ego=True ise ayrica ego'nun top-1 plani [B,T,2] doner (inter index 0). Bu, conflict
+    koridoru icin ALTERNATIF kaynak: --ego_corridor gf. Varsayilan kaynak lattice planner referans
+    yolu (npz'deki c_lat_candidates) -- GF ciktisina bagimlilik istemedigimiz icin."""
     decoder_outputs, _ = gameformer.decoder(encoder_outputs)
     last_k = max(int(k.split('_')[1]) for k in decoder_outputs if 'interactions' in k)
     inter = decoder_outputs[f'level_{last_k}_interactions']        # [B, N+1, M, T, 4]
@@ -34,6 +37,11 @@ def extract_neighbor_top1_futures(gameformer, encoder_outputs, num_neighbors):
     current_states = encoder_outputs['actors'][:, 1:1 + num_neighbors, -1]  # [B, N, 5]
     nbr_valid = ~encoder_outputs['mask'][:, 1:1 + num_neighbors]            # [B, N]
 
+    if return_ego:
+        ego_best = scores[:, 0].argmax(-1)                                  # [B]
+        g0 = ego_best.view(B, 1, 1, 1).expand(-1, 1, T, 2)
+        ego_plan = torch.gather(inter[:, 0, ..., :2], 1, g0).squeeze(1)      # [B, T, 2]
+        return top1_futures, current_states, nbr_valid, ego_plan
     return top1_futures, current_states, nbr_valid
 
 
@@ -120,7 +128,7 @@ def maneuver_labels(ego_future):
 def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0,
                             neighbors_future=None, lambda_nbr=0.0, lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
                             lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5,
-                            lambda_conflict=0.0):
+                            lambda_conflict=0.0, conflict_terms='all'):
     """Causal-Planner'a SADIK loss (ref: ~/Causal-Planner lightning_trainer.py). Backdoor/GRL YOK.
 
     CP'nin toplami:
@@ -230,7 +238,19 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
     # etkilesimi kullanmasi icin ifade edebilmesi YETMIYOR, acikca soylenmesi gerekiyor.
     l_conflict = torch.zeros((), device=out['traj'].device)
     if lambda_conflict > 0.0 and out.get('conflict') is not None:
-        penalty = out['conflict'][..., :3].mean(-1)                 # [B,N] uzak = yuksek
+        # HANGI TERIMLER: olculdu (viraj-guvenli lider tanimiyla, lider = ref path'e <2m ve ileride):
+        #   [route, aligned, reach]  lider secme 0.565   arkada 0.392   <- 'all'
+        #   [route, reach]                       0.698          0.381
+        #   [reach] tek                          0.706          0.360   <- 'reach'
+        #   [route] tek                          0.294          0.503
+        #   [aligned] tek                        0.385          0.401
+        # d_ego_aligned ZARARLI: ikisi de koridorun ustundeyken route/reach ayirt etmez, karar ona
+        # kalir, o da takip mesafesini KORUYAN lideri cezalandirir (her t'de 25 m uzakta sayilir),
+        # arkadan geleni odullendirir (ego'nun yay noktalarindan gecer). CLS'te de gorunur: yay
+        # yurumesi bu terimi keskinlestirdi ve 0.8126 -> 0.794 (taban 10 ve 30'da AYNI).
+        # d_route zayif: route_lanes 10 ayri serit, yan seritleri odullendiriyor.
+        pen_idx = [2] if conflict_terms == 'reach' else [0, 1, 2]
+        penalty = out['conflict'][..., pen_idx].mean(-1)            # [B,N] uzak = yuksek
         l_conflict = (out['M_cas'] * penalty).sum(-1).mean()
 
     nv_f = out['nbr_valid'].float()
@@ -327,8 +347,8 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
 def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0, lambda_nbr=0.0,
                lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
-               lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5, lambda_conflict=0.0,
-               optimizer=None, desc="Training"):
+               lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5, lambda_conflict=0.0, conflict_terms='all',
+               ego_corridor='refpath', optimizer=None, desc="Training"):
     train = optimizer is not None
     causal.train() if train else causal.eval()
     gameformer.eval()
@@ -336,23 +356,31 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
 
     with tqdm(data_loader, desc=desc, unit="batch") as data_epoch:
         for batch in data_epoch:
-            inputs, ego_future, neighbors_future, _ = read_batch(batch, device)
+            inputs, ego_future, neighbors_future, ref_path = read_batch(batch, device)
 
             with torch.no_grad():
                 encoder_outputs = gameformer.encoder(inputs)
-                top1_fut, nbr_states, _ = extract_neighbor_top1_futures(
-                    gameformer, encoder_outputs, num_neighbors=num_neighbors
-                )
+                if ego_corridor == 'gf':
+                    # ALTERNATIF koridor: frozen GameFormer'in kendi ego plani (GT DEGIL, tahmin).
+                    # Ref path'ten farki: donusleri ve hizi modelin gordugu gibi tasir, ama conflict
+                    # feature'i frozen backbone'un kalitesine baglar.
+                    top1_fut, nbr_states, _, ego_plan = extract_neighbor_top1_futures(
+                        gameformer, encoder_outputs, num_neighbors=num_neighbors, return_ego=True)
+                    ref_path = ego_plan[:, None]                             # [B,1,T,2]
+                else:
+                    top1_fut, nbr_states, _ = extract_neighbor_top1_futures(
+                        gameformer, encoder_outputs, num_neighbors=num_neighbors
+                    )
 
             with torch.set_grad_enabled(train):
                 out = causal(encoder_outputs, inputs, num_agents=num_neighbors + 1,
-                             neighbor_futures=top1_fut, neighbor_states=nbr_states)
+                             neighbor_futures=top1_fut, neighbor_states=nbr_states, ref_path=ref_path)
                 loss, metrics = causal_loss_and_metrics(out, ego_future, lambda_kld,
                                                          lambda_ci, lambda_mask, lambda_recon,
                                                          neighbors_future, lambda_nbr,
                                                          lambda_budget, budget_rho, budget_lo,
                                                          lambda_bc, lambda_peak, peak_tau,
-                                                         lambda_conflict)
+                                                         lambda_conflict, conflict_terms)
 
             if train:
                 optimizer.zero_grad()
@@ -405,6 +433,7 @@ def model_training(args):
                            num_neighbors=args.num_neighbors, gate=args.gate,
                            conflict_feats=args.conflict_feats, conflict_bias=args.conflict_bias,
                            compute_conflict=(args.compute_conflict or args.lambda_conflict > 0),
+                           aligned_mode=args.aligned_mode,
                            nbr_enrich=args.nbr_enrich).to(args.device)
 
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -421,13 +450,13 @@ def model_training(args):
         train_m = _run_epoch(train_loader, gameformer, causal, args.device, args.num_neighbors,
                              args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_recon, args.lambda_nbr,
                              args.lambda_budget, args.budget_rho, args.budget_lo,
-                             args.lambda_bc, args.lambda_peak, args.peak_tau, args.lambda_conflict,
-                             optimizer=optimizer, desc="Training")
+                             args.lambda_bc, args.lambda_peak, args.peak_tau, args.lambda_conflict, args.conflict_terms,
+                             args.ego_corridor, optimizer=optimizer, desc="Training")
         val_m = _run_epoch(valid_loader, gameformer, causal, args.device, args.num_neighbors,
                            args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_recon, args.lambda_nbr,
                            args.lambda_budget, args.budget_rho, args.budget_lo,
-                           args.lambda_bc, args.lambda_peak, args.peak_tau, args.lambda_conflict,
-                           optimizer=None, desc="Validation")
+                           args.lambda_bc, args.lambda_peak, args.peak_tau, args.lambda_conflict, args.conflict_terms,
+                           args.ego_corridor, optimizer=None, desc="Validation")
 
         log = {"epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]}
         log.update({f"train-{k}": v for k, v in train_m.items()})
@@ -489,6 +518,15 @@ if __name__ == "__main__":
                         help="CP decision_loss: CE(psi_cas, m*) [CP=1.0]")
     parser.add_argument("--lambda_ci", type=float, default=0.5,
                         help="CP decision_causal_inference_loss: KL(uniform||p_cfd)+0.1*(-H) [CP=0.5]")
+    parser.add_argument("--conflict_terms", type=str, default="all", choices=["all", "reach"],
+                        help="L_conflict cezasindaki terimler: all = [d_route, d_ego_aligned, d_ego_reach] "
+                             "| reach = yalniz d_ego_reach (olculdu: lider secme 0.565 -> 0.706)")
+    parser.add_argument("--aligned_mode", type=str, default="straight", choices=["straight", "arc"],
+                        help="d_ego_aligned'da ego'nun t anindaki yeri: straight = [hiz*t, 0] duz cizgi "
+                             "(A/B/D kosulari) | arc = ref path uzerinde yay yurumesi (E/F; CLS -0.019)")
+    parser.add_argument("--ego_corridor", type=str, default="refpath", choices=["refpath", "gf"],
+                        help="conflict koridorunun kaynagi: refpath = lattice planner referans yolu "
+                             "(npz c_lat_candidates, GF'den bagimsiz) | gf = frozen GameFormer'in ego plani")
     parser.add_argument("--lambda_conflict", type=float, default=0.0,
                         help="L_conflict: E_{M_cas}[conflict-mesafe] cezasi (0 = KAPALI). Feature'lari "
                              "girdiye eklemeden de calisir -- compute_conflict yeter")

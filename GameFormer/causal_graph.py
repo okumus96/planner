@@ -40,12 +40,16 @@ NUM_AGENT_TYPES = 4  # ego, vehicle, pedestrian, bicycle
 CONFLICT_FEATURE_DIM = 4  # [d_route, d_ego_aligned, d_ego_spatial, approaching]
 
 
-def _conflict_features(neighbor_futures, neighbor_states, route_xy, route_valid, ego_speed, dt=0.1):
+def _conflict_features(neighbor_futures, neighbor_states, route_xy, route_valid, ego_speed,
+                       ref_xy=None, ref_valid=None, dt=0.1, aligned_mode='straight'):
     """Per-komsu future-conflict feature'lari [B,N,4]. "Causal" icin geometrik proxy: ajanin
     TAHMIN EDILEN future'i ego'nun yoluyla cakisiyor mu. Hepsi ego-frame. SIZINTI YOK -- ego GT
     future kullanilmaz, yalniz sabit-hiz kinematik ekstrapolasyon + route.
       neighbor_futures [B,N,T,2] (frozen decoder top-1); neighbor_states [B,N,>=2];
-      route_xy [B,P,2]; route_valid [B,P] bool; ego_speed [B] (m/s).
+      route_xy [B,P,2]; route_valid [B,P] bool; ego_speed [B] (m/s);
+      ref_xy [B,R,2]/ref_valid [B,R]: lattice planner REFERANS YOLU (c_lat_candidates, graph-search
+      ciktisi, data_process.py:156'da uretilip npz'ye yazilmis). Tek bir yol -- route_lanes gibi 10
+      ayri serit degil. GF ciktisi ya da GT ego future KULLANILMAZ.
     Doner: [B,N,4] = log1p(d_route), log1p(d_ego_aligned), log1p(d_ego_spatial), approaching/10."""
     B, N, T, _ = neighbor_futures.shape
     dev = neighbor_futures.device
@@ -61,20 +65,62 @@ def _conflict_features(neighbor_futures, neighbor_states, route_xy, route_valid,
         d_route = torch.full((B, N, T), BIG, device=dev)
     d_route = d_route.masked_fill(~fut_valid, BIG).min(-1).values           # [B,N]
 
-    # 2) d_ego_aligned: ZAMAN-HIZALI cakisma (ego sabit-hiz ileri: ego_pos(t)=[ego_speed*dt*t, 0])
+    # 2) d_ego_aligned: ZAMAN-HIZALI cakisma. Ego'nun t anindaki konumu, REFERANS YOL uzerinde
+    # yay-uzunlugu ego_speed*dt*t kadar ilerlemis nokta.
+    #
+    # ONCESI DUZ CIZGIYDI: ego_pos(t) = [ego_speed*dt*t, 0]. Ego sola donerken bu "ego duz gidecek"
+    # diyordu -> donus boyunca gercekten onemli ajanlar (karsidan gelen, kesisen) hayali duz cizgiden
+    # uzak kalip cezalaniyordu. Olculdu: L_conflict'li 3 kosunun UCUNDE de ayni iki donus senaryosu
+    # sifirlaniyor (starting_right_turn 0.862->0.000, starting_left_turn 0.798->0.000); CLS kaybinin
+    # (0.8579->0.8126) TAMAMI bu iki senaryo. Duz sahnelerde davranis degismez (ref path duz ise
+    # yay-yurumesi duz cizgiyle ayni noktayi verir).
     t_idx = torch.arange(1, T + 1, device=dev, dtype=neighbor_futures.dtype)
-    ego_x = ego_speed[:, None] * dt * t_idx[None, :]                        # [B,T]
-    ego_pos = torch.stack([ego_x, torch.zeros_like(ego_x)], dim=-1)         # [B,T,2]
+    s_t = ego_speed[:, None] * dt * t_idx[None, :]                          # [B,T] kat edilecek yay
+    if aligned_mode == 'arc' and ref_xy is not None and ref_xy.shape[1] > 1:
+        seg = torch.norm(ref_xy[:, 1:] - ref_xy[:, :-1], dim=-1)            # [B,R-1]
+        seg = seg * (ref_valid[:, 1:] & ref_valid[:, :-1]).to(seg.dtype)
+        cum = torch.cat([torch.zeros(B, 1, device=dev, dtype=seg.dtype), seg.cumsum(-1)], dim=1)
+        pick = (cum[:, None, :] - s_t[:, :, None]).abs()                    # [B,T,R]
+        pick = pick.masked_fill(~ref_valid[:, None, :], BIG)
+        idx = pick.argmin(-1)                                               # [B,T]
+        ego_pos = torch.gather(ref_xy, 1, idx[..., None].expand(-1, -1, 2))  # [B,T,2]
+    else:
+        ego_pos = torch.stack([s_t, torch.zeros_like(s_t)], dim=-1)         # DUZ cizgi (varsayilan)
     d_align = torch.norm(neighbor_futures - ego_pos[:, None], dim=-1)       # [B,N,T]
     d_ego_aligned = d_align.masked_fill(~fut_valid, BIG).min(-1).values     # [B,N]
 
-    # 3) d_ego_spatial: future ego origin'e en cok ne kadar yaklasiyor
-    d_sp = torch.norm(neighbor_futures, dim=-1)                             # [B,N,T]
-    d_ego_spatial = d_sp.masked_fill(~fut_valid, BIG).min(-1).values        # [B,N]
+    # 3) d_ego_reach: komsunun future'i, ego'nun bu ufukta GERCEKTEN katedecegi koridora ne kadar
+    # yaklasiyor. Koridor = route'un ego_speed*T*dt icinde kalan parcasi (graph-search referans yolu,
+    # npz'de route_lanes olarak hazir; GF ciktisi ya da GT KULLANILMAZ).
+    #
+    # ONCEKI HALI YANLISTI: d_ego_spatial = min_t ||nbr_future(t)|| yani ego'nun t=0 KONUMUNA mesafe.
+    # Arkadaki arac ileri giderken ego'nun SIMDIKI noktasindan gecer -> mesafe ~0 -> ceza yok -> secilir;
+    # ondeki arac ileri giderken origin'den UZAKLASIR -> cezalanir. Olculdu: secilen ajanin arkada olma
+    # orani 0.288 (conflict'siz) -> 0.62 (conflict'li), hem dogal dagilimin (0.46) hem en-yakinin (0.52)
+    # ustunde. Tanim geregi de gecmise bakiyordu: ego oradan zaten gecti, orada cakisma OLAMAZ.
+    #
+    # d_route'dan farki HIZ: d_route tum route'u alir (ufkun cok otesine uzanabilir), bu ise ego'nun
+    # bu 8 saniyede ulasabilecegi parcayla sinirlar.
+    corr_xy = ref_xy if ref_xy is not None else route_xy
+    corr_v = ref_valid if ref_valid is not None else route_valid
+    if corr_xy is not None and corr_xy.shape[1] > 0:
+        # TABAN 10 m. 30'a cikarmayi denedim (confE): koridor uzayinca daha cok ajan "yakin" sayiliyor,
+        # ceza ayrimi koreliyor. confE ayni anda yay-yurumesini de getirdigi icin CLS dususu (0.8126 ->
+        # 0.7935) hangisinden geldigi belirsizdi; taban 10'a geri alindi ki yay-yurumesi tek basina olculsun.
+        reach = (ego_speed * dt * T).clamp(min=10.0)                        # [B]
+        reach_v = corr_v & (torch.norm(corr_xy, dim=-1) <= reach[:, None])
+        d_r = torch.cdist(neighbor_futures.reshape(B, N * T, 2), corr_xy)   # [B,N*T,R]
+        d_r = d_r.masked_fill(~reach_v[:, None, :], BIG)
+        d_ego_spatial = d_r.min(-1).values.reshape(B, N, T)
+        d_ego_spatial = d_ego_spatial.masked_fill(~fut_valid, BIG).min(-1).values   # [B,N]
+    else:
+        d_ego_spatial = torch.full((B, N), BIG, device=dev)
 
-    # 4) approaching: anlik mesafe - min future mesafe (pozitif = yaklasiyor)
+    # 4) approaching: anlik mesafe - zaman-hizali en yakin yaklasma (pozitif = yaklasiyor).
+    # d_ego_aligned uzerinden: ikisi de EGO'ya mesafe, ayni birim. (d_ego_spatial artik koridora
+    # mesafe olduğu icin ondan cikarmak elma-armut olurdu.)
     d0 = torch.norm(neighbor_states[..., :2], dim=-1)                       # [B,N]
-    approaching = (d0 - d_ego_spatial).clamp(-CAP, CAP)                     # [B,N]
+    approaching = (d0 - d_ego_aligned).clamp(-CAP, CAP)                     # [B,N]
 
     feats = torch.stack([
         torch.log1p(d_route.clamp(max=CAP)),
@@ -391,6 +437,7 @@ class EgoCausalDisentangler(nn.Module):
         self.conflict_bias = conflict_bias       # 1 -> causal logit'e explicit conflict cezasi
         # CausalPlanner bunu ayrica set eder; feature/bias kapaliyken bile L_conflict icin hesaplatir.
         self.compute_conflict = bool(conflict_feats or conflict_bias)
+        self.aligned_mode = 'straight'   # CausalPlanner set eder: 'straight' (A/B/D) | 'arc' (E/F)
         self.future_encoder = FutureEncoder()
         self.future_fuse = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU())
         self.type_embedding = nn.Embedding(NUM_AGENT_TYPES, dim)
@@ -413,7 +460,7 @@ class EgoCausalDisentangler(nn.Module):
         ])
 
     def forward(self, agent_feat, agent_valid, agent_pose, agent_types, inputs,
-                neighbor_futures=None, neighbor_states=None):
+                neighbor_futures=None, neighbor_states=None, ref_path=None):
         """agent_feat [B,Na,D], agent_valid [B,Na] bool, agent_pose [B,Na,5], agent_types [B,Na],
         inputs (harita icin). neighbor_futures [B,N,T,2], neighbor_states [B,N,>=5] (opsiyonel)."""
         B, Na, D = agent_feat.shape
@@ -472,8 +519,19 @@ class EgoCausalDisentangler(nn.Module):
             route_pts = inputs['route_lanes'][..., :2].float().reshape(B, -1, 2)       # [B,P,2]
             route_v = route_pts.abs().sum(-1) > 1e-6                                    # [B,P]
             ego_speed = torch.norm(agent_pose[:, 0, 3:5], dim=-1)                       # [B]
+            ref_xy = ref_v = None
+            if ref_path is not None:
+                # SADECE aday 0. get_candidate_paths ego'ya mesafeye gore SIRALI dondurur
+                # (state_lattice_path_planner.py:55), data_process ayni sirayla yazar -> index 0 =
+                # ego'nun UZERINDE bulundugu seridin yolu. Diger 4'u alternatif rotalar; hepsini
+                # birlestirmek route_lanes'teki hatanin aynisi olurdu (sahnelerin %81'i 2-5 adayli).
+                rp = ref_path[:, 0, :, :2].float()                                      # [B,R,2]
+                ref_v = rp.abs().sum(-1) > 1e-6
+                ref_xy = rp
             conf = _conflict_features(neighbor_futures[:, :N], neighbor_states[:, :N],
-                                      route_pts, route_v, ego_speed)                    # [B,N,4]
+                                      route_pts, route_v, ego_speed,
+                                      ref_xy=ref_xy, ref_valid=ref_v,
+                                      aligned_mode=self.aligned_mode)                    # [B,N,4]
             if self.conflict_feats:
                 edge_ego = torch.cat([edge_ego, conf], dim=-1)                          # [B,N,De+4]
 
@@ -551,13 +609,14 @@ class CausalPlanner(nn.Module):
 
     def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, num_maneuvers=5,
                  recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax',
-                 conflict_feats=0, conflict_bias=0, compute_conflict=0):
+                 conflict_feats=0, conflict_bias=0, compute_conflict=0, aligned_mode='straight'):
         super().__init__()
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
                                                   gate=gate, conflict_feats=conflict_feats,
                                                   conflict_bias=conflict_bias)
         # compute_conflict: feature'lar edge'e girmese/bias olmasa bile hesaplansin (loss icin)
         self.disentangler.compute_conflict = bool(compute_conflict or conflict_feats or conflict_bias)
+        self.disentangler.aligned_mode = aligned_mode
         self.head = CausalEgoHead(dim, modes, dropout, num_maneuvers=num_maneuvers)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
@@ -588,7 +647,7 @@ class CausalPlanner(nn.Module):
                                       nn.Linear(2 * dim, num_neighbors * future_steps * 2))
 
     def forward(self, encoder_outputs, inputs, num_agents,
-                neighbor_futures=None, neighbor_states=None, also_cfd_plan=False):
+                neighbor_futures=None, neighbor_states=None, also_cfd_plan=False, ref_path=None):
         Na = num_agents
         agent_feat = encoder_outputs['agent_tokens'][:, :Na].detach()   # [B,Na,D] temiz, fusion oncesi
         agent_valid = ~encoder_outputs['mask'][:, :Na]                  # [B,Na] True=gecerli
@@ -596,7 +655,8 @@ class CausalPlanner(nn.Module):
         agent_types = _agent_types(inputs['neighbor_agents_past'], Na - 1)
 
         dis = self.disentangler(agent_feat, agent_valid, agent_pose, agent_types, inputs,
-                                neighbor_futures=neighbor_futures, neighbor_states=neighbor_states)
+                                neighbor_futures=neighbor_futures, neighbor_states=neighbor_states,
+                                ref_path=ref_path)
         f_cas, f_cfd = dis['f_cas'], dis['f_cfd']
 
         # STEP 2: [f_cas ; f_cfd] -> f_all rekonstruksiyonu. f_cas per-ornek olasilikla SIFIRLANIR
