@@ -943,8 +943,8 @@ $M^{cas}, M^{cfd} \in \Delta^{N-1}$ are **softmax over neighbours**, so each sum
 | $\mathcal{L}_{\text{kld}}$ | 1.0 | live |
 | $\mathcal{L}_{\text{ci}}$ | 0.5 | live, but on its own it lets $f^{cfd}$ collapse |
 | $\mathcal{L}_{\text{mask}}$ | 0.5 | **dead** — see Finding 1; `λ=0` improved every metric |
-| $\mathcal{L}_{\text{recon}}$ | 0 | fixes the collapse |
-| $\mathcal{L}_{\text{nbr}}$ | 0 | makes $M^{cfd}$ selective, costs the causal mask |
+| $\mathcal{L}_{\text{recon}}$ | 0 | fixes the collapse, but drives $M^{cfd}$ to *exactly* uniform; CLS effect **unmeasured** (no clean on/off pair) |
+| $\mathcal{L}_{\text{nbr}}$ | 0 | **the go-to term** — only one with an interior optimum ($M^{cfd}$ 1.81× uniform), keeps $f^{cfd}$ alive (`cfdvar` 1.742), best minADE, CLS 0.8336. Lowers the RNC ratio (12.1× → 8.9×) because the mask stays soft, not because it is worse |
 | $\mathcal{L}_{\text{budget}}$ | 0 | sigmoid-gate only; that line was abandoned |
 | $\mathcal{L}_{\text{bc}}$ | 0 | separates the masks, sharpens; **source of the rear bias** |
 | $\mathcal{L}_{\text{peak}}$ | 0 | never fires in practice |
