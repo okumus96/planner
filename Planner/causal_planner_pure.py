@@ -23,7 +23,7 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 
 class CausalPurePlanner(AbstractPlanner):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
-                 plan_source='cas', nbr_enrich=0, device=None):
+                 plan_source='cas', nbr_enrich=0, ego_residual=1, device=None):
         self._future_horizon = T
         self._step_interval = DT
         self._backbone_path = backbone_path
@@ -32,6 +32,7 @@ class CausalPurePlanner(AbstractPlanner):
         self._graph_layers = graph_layers
         self._modes = modes
         self._nbr_enrich = nbr_enrich
+        self._ego_residual = ego_residual
         # 'cas' (varsayilan, ANA plan) vs 'cfd': plani f_cfd'den uretir (refiner YOK, ciplak head).
         assert plan_source in ('cas', 'cfd')
         self._plan_source = plan_source
@@ -52,7 +53,7 @@ class CausalPurePlanner(AbstractPlanner):
         self._gameformer.load_state_dict(torch.load(self._backbone_path, map_location=self._device))
         self._gameformer.to(self._device).eval()
         # causal head (trained module)
-        self._causal = CausalPlanner(layers=self._graph_layers, modes=self._modes, nbr_enrich=self._nbr_enrich)
+        self._causal = CausalPlanner(layers=self._graph_layers, modes=self._modes, nbr_enrich=self._nbr_enrich, ego_residual=self._ego_residual)
         # strict=False: model sonradan modul kazandi (gate_bias, nbr_head, cfd_recon); eski checkpoint'ler
         # bu anahtarlari icermez. Ucu de PLAN YOLUNUN DISINDA: gate_bias yalniz gate='sigmoid' dalinda
         # okunur (planner softmax kurar), nbr_head/cfd_recon yalniz egitim loss'larini besler. Yine de

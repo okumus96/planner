@@ -433,7 +433,7 @@ def model_training(args):
                            num_neighbors=args.num_neighbors, gate=args.gate,
                            conflict_feats=args.conflict_feats, conflict_bias=args.conflict_bias,
                            compute_conflict=(args.compute_conflict or args.lambda_conflict > 0),
-                           aligned_mode=args.aligned_mode,
+                           aligned_mode=args.aligned_mode, ego_residual=args.ego_residual,
                            nbr_enrich=args.nbr_enrich).to(args.device)
 
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -521,6 +521,9 @@ if __name__ == "__main__":
     parser.add_argument("--conflict_terms", type=str, default="all", choices=["all", "reach"],
                         help="L_conflict cezasindaki terimler: all = [d_route, d_ego_aligned, d_ego_reach] "
                              "| reach = yalniz d_ego_reach (olculdu: lider secme 0.565 -> 0.706)")
+    parser.add_argument("--ego_residual", type=int, default=1,
+                        help="1 = f_cas = LN(out_fc + h_ego) (CP Eq 6, varsayilan) | 0 = residual YOK, "
+                             "ego bilgisi f_cas'a yalniz self_fea uzerinden girer")
     parser.add_argument("--aligned_mode", type=str, default="straight", choices=["straight", "arc"],
                         help="d_ego_aligned'da ego'nun t anindaki yeri: straight = [hiz*t, 0] duz cizgi "
                              "(A/B/D kosulari) | arc = ref path uzerinde yay yurumesi (E/F; CLS -0.019)")

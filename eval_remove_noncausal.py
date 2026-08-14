@@ -91,7 +91,7 @@ def main(args):
     gameformer = gameformer.to(dev)
     freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate).to(dev)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual).to(dev)
     causal.load_state_dict(torch.load(args.causal_path, map_location=dev))
     causal.eval()
 
@@ -257,6 +257,8 @@ if __name__ == "__main__":
     p.add_argument("--decoder_levels", type=int, default=2)
     p.add_argument("--graph_layers", type=int, default=1)
     p.add_argument("--nbr_enrich", type=int, default=0)
+    p.add_argument("--ego_residual", type=int, default=1,
+                   help="checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)")
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"],
                    help="checkpoint hangi kapi moduyla EGITILDIYSE o verilmeli (aksi halde maske yanlis hesaplanir)")
     p.add_argument("--modes", type=int, default=6)

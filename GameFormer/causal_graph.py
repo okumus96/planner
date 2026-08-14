@@ -281,6 +281,11 @@ class EgoCausalLayer(nn.Module):
         self.out_fc_cfd = nn.Linear(3 * dim, dim)
         self.norm_cas = nn.LayerNorm(dim)
         self.norm_cfd = nn.LayerNorm(dim)
+        # h_ego RESIDUAL anahtari (CP Eq 6 = True). Kapatinca ego bilgisi f_cas'a YALNIZ self_fea
+        # uzerinden girer; agent teriminin goreli payi artar -> filtrenin (RemoveNonCausal) daha
+        # keskin olmasi beklenir. Parametre DEGIL, saf davranis anahtari: egitilmis bir checkpoint'e
+        # cikarim aninda False atayip modelin bu yola ne kadar dayandigi olculebilir.
+        self.ego_residual = True
         # FAZ 1: FFN eklendi (CP'de var, bizde yoktu -- attention SADECE token'lar arasi dogrusal
         # karisim yapar, FFN her token'i KENDI icinde dogrusal-olmayan isler). Kendi prenorm+residual'i var.
         self.ffn_cas = _FFN(dim, dropout=dropout)
@@ -405,7 +410,8 @@ class EgoCausalLayer(nn.Module):
         # --- birlestirme (Eq 6): [self ; ajan ; harita] ---
         self_fea = self.self_fc(h_ego)                                        # [B,D]
         f_all = torch.cat([self_fea, all_ag, all_mp], dim=-1)                 # [B,3D] recon hedefi
-        f_cas = self.norm_cas(self.out_fc_cas(torch.cat([self_fea, ag_cas, mp_cas], dim=-1)) + h_ego)
+        cas_pre = self.out_fc_cas(torch.cat([self_fea, ag_cas, mp_cas], dim=-1))
+        f_cas = self.norm_cas(cas_pre + h_ego if self.ego_residual else cas_pre)
         f_cfd = self.norm_cfd(self.out_fc_cfd(torch.cat([self_fea, ag_cfd, mp_cfd], dim=-1)))
         f_cas = self.ffn_cas(f_cas)      # FAZ 1: kendi prenorm+residual'iyla ek dogrusal-olmayan isleme
         f_cfd = self.ffn_cfd(f_cfd)
@@ -609,11 +615,14 @@ class CausalPlanner(nn.Module):
 
     def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, num_maneuvers=5,
                  recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax',
-                 conflict_feats=0, conflict_bias=0, compute_conflict=0, aligned_mode='straight'):
+                 conflict_feats=0, conflict_bias=0, compute_conflict=0, aligned_mode='straight',
+                 ego_residual=1):
         super().__init__()
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
                                                   gate=gate, conflict_feats=conflict_feats,
                                                   conflict_bias=conflict_bias)
+        for _l in self.disentangler.layers:
+            _l.ego_residual = bool(ego_residual)
         # compute_conflict: feature'lar edge'e girmese/bias olmasa bile hesaplansin (loss icin)
         self.disentangler.compute_conflict = bool(compute_conflict or conflict_feats or conflict_bias)
         self.disentangler.aligned_mode = aligned_mode

@@ -26,7 +26,7 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 
 class CausalRefinerPlanner(PlannerV2):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
-                 use_causal=True, remove='none', remove_k=1, plan_source='cas', nbr_enrich=0, device=None):
+                 use_causal=True, remove='none', remove_k=1, plan_source='cas', nbr_enrich=0, ego_residual=1, device=None):
         super().__init__(model_path=causal_path, device=device, debug=False,
                          debug_dir=None, debug_max_plots=0, oracle_mode=False)
         self._backbone_path = backbone_path
@@ -35,6 +35,7 @@ class CausalRefinerPlanner(PlannerV2):
         self._graph_layers = graph_layers
         self._modes = modes
         self._nbr_enrich = nbr_enrich
+        self._ego_residual = ego_residual
         self._use_causal = use_causal    # neural_plan: CausalPlanner (True) vs GameFormer (False)
         # RemoveNonCausal-via-CLS: her frame'de M_cas'a gore TEK ajani cikar (girdiden sifirla).
         # 'high'=en causal ajani cikar (CLS dusmeli), 'low'=en az causal (CLS degismemeli), 'random'=kontrol.
@@ -82,7 +83,7 @@ class CausalRefinerPlanner(PlannerV2):
         self.backbone.load_state_dict(torch.load(self._backbone_path, map_location=self._device))
         self.backbone.to(self._device).eval()
         # CausalPlanner (egitilmis) — neural_plan + M_cas
-        self.causal = CausalPlanner(layers=self._graph_layers, modes=self._modes, nbr_enrich=self._nbr_enrich)
+        self.causal = CausalPlanner(layers=self._graph_layers, modes=self._modes, nbr_enrich=self._nbr_enrich, ego_residual=self._ego_residual)
         # strict=False: model sonradan modul kazandi (gate_bias, nbr_head, cfd_recon); eski checkpoint'ler
         # bu anahtarlari icermez. Ucu de PLAN YOLUNUN DISINDA: gate_bias yalniz gate='sigmoid' dalinda
         # okunur (planner softmax kurar), nbr_head/cfd_recon yalniz egitim loss'larini besler. Yine de

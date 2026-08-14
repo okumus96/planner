@@ -45,10 +45,21 @@ mask's **shape**. None of it moved the mask's **content**. See
    only as a no-regression guard. See
    [Finding 5](#finding-5--closed-loop-score-is-blind-to-mask-correctness).
 
-**Current working model: `nbr(2b)` (`step2b_nbr_nbrenrich2`, epoch 15).** CP mask loss kept,
-`f_cfd` alive (`cfdvar` 1.742 vs the baseline's 0.00012), mask non-degenerate (`mcfd_peak`
-1.81× uniform), best minADE of the lineage (**0.6731**), CLS **0.8336** — about one scenario
-below the untouched baseline.
+**And a sixth, which gives Finding 5 its mechanism:**
+
+6. **Every path that reaches the plan without passing through `M_cas` buys CLS and weakens the
+   filter.** The `h_ego` residual is one such path (`f_cas = LN(out_fc + h_ego)`, CP Eq 6). Deleting
+   it costs **+0.008 minADE** and improves every filter metric — RNC matched **3.4× → 4.8×**,
+   hi/lo 8.9× → 12.4×, rear 0.373 → **0.298** — while CLS falls 0.8336 → 0.8160, a drop that is
+   **entirely one scenario** (a left turn where the ego hesitated and tripped the progress
+   multiplier; no collision, no drivable violation). DOD showed the same trade earlier
+   (CLS 0.8336 → 0.8579, RNC matched 5.2× → 4.0×). See
+   [Finding 6](#finding-6--the-h_ego-residual-is-a-side-channel-removing-it-strengthens-the-filter).
+
+**Current working model: `noresid` (`noresid_nbr_nbrenrich2`, epoch 13).** CP mask loss kept,
+`f_cfd` alive (`cfdvar` 1.782 vs the baseline's 0.00012), mask non-degenerate and soft
+(`mcas_peak` 2.1× uniform), best filter in the lineage, minADE 0.6815, CLS 0.8160. Its predecessor
+`nbr(2b)` (same config, `--ego_residual 1`) trades 41% of the filter for one scenario of CLS.
 
 ---
 
@@ -526,6 +537,7 @@ them moved it.
 | **confF** | **0.6732** | 0.148 | 0.859 | 0.283 | 0.217 | **0.893** |
 | confH | 0.6934 | 0.124 | 0.827 | **0.914** | **0.00009** | 0.899 |
 | **confI** | 0.6997 | 0.169 | 0.794 | **0.923** | **0.00005** | 0.884 |
+| **noresid** | 0.6815 | — | 0.252 | 0.216 | **1.782** | 0.904 |
 
 `confH` and `confI` are the two runs with `λ_recon = 0`. Both drive `mcfd_peak` past **0.91**
 (one-hot) and `cfdvar` to ~5e-5 (dead). With BC on and **no consumer for `f_cfd`**, BC is the only
@@ -555,6 +567,7 @@ References: `random` = chance (`dmin` 15.37 m, `dmin<5m` 0.101, rear 0.462);
 | confH | 1.90× | 8.09 | 4.83 | 0.404 | 0.412 | 0.437 |
 | confG (`λ_conf` 0.01) | 1.15× | 13.37 | 9.68 | 0.150 | 0.860 | 0.178 |
 | **confI** | **1.01×** | 15.26 | 12.31 | 0.110 | **0.928** | 0.131 |
+| **noresid** | 1.24× | 12.39 | 8.24 | 0.131 | **0.298** | 0.157 |
 
 **`λ_conflict` does not scale down.** `confG` is `confF` with `λ_conf` 0.1 → 0.01 and nothing else.
 Interaction falls 1.90× → **1.15×** and rear bias jumps 0.418 → **0.860**, i.e. almost all the way
@@ -595,6 +608,7 @@ readings that transfer.
 | **confE** | 0.5070 | 0.0000 | 17603× | 15.1× | **0.566** |
 | confF | **0.5538** | 0.0001 | 7313× | 13.3× | 0.511 |
 | confI | 0.4422 | 0.0030 | 146.7× | 8.0× | 0.471 |
+| **noresid** | **0.4754** | 0.0384 | 12.4× | **4.8×** | **0.552** |
 
 `confI` is the clearest demonstration of the saturation caveat: it **passes** RemoveNonCausal at
 146.7× while sitting at *exact chance* on interaction (1.01×). Passing this test proves the mask
@@ -629,6 +643,7 @@ was explicitly passed `--lambda_mask 0`.
 | confG | `confG_lc001_nbrenrich2` | 0 | 1.0 | 0 | 0.1 | 0.5 | **0.01** | ref path | arc |
 | **confH** | `confH_norecon_nbrenrich2` | 0 | **0** | 0 | 0.1 | 0.5 | 0.1 | ref path | straight |
 | **confI** | `confI_bcpeak_only_nbrenrich2` | 0 | **0** | 0 | 0.1 | 0.5 | **0** | — | — |
+| **noresid** | `noresid_nbr_nbrenrich2` | **0.5** | 0 | **0.1** | 0 | 0 | 0 | — | — *(`--ego_residual 0`)* |
 
 The three families, stated plainly:
 
@@ -645,7 +660,8 @@ or less** and must not be interpreted.
 |---|---|---|---|---|---|---|---|---|
 | **dod_manlbl** | mask | **0.8579** | 1.000 | **0.947** | 0.974 | **1.000** | 0.974 | 0.787 |
 | **confI** | BC/peak | **0.8364** | 1.000 | 0.921 | 0.974 | 0.974 | 0.947 | 0.810 |
-| **nbr(2b)** | mask | **0.8336** | 1.000 | 0.921 | 0.974 | 0.947 | 0.947 | **0.822** |
+| **nbr(2b)** | mask | **0.8336** | 1.000 | 0.921 | 0.974 | 0.947 | 0.947 | 0.822 |
+| **noresid** | mask, no `h_ego` | **0.8160** | 1.000 | 0.921 | 0.947 | 0.974 | 0.895 | **0.826** |
 | dodrop50 | mask | 0.8322 | 1.000 | 0.921 | 0.974 | **1.000** | 0.974 | 0.790 |
 | **recon(2)** | mask | **0.8256** | 1.000 | 0.921 | 0.974 | 0.947 | 0.947 | 0.797 |
 | confD | conflict | 0.8176 | 1.000 | 0.921 | 0.947 | 0.974 | 0.947 | 0.817 |
@@ -773,6 +789,117 @@ by fiat; `L_nbr` reaches it from a task.
 
 ---
 
+## Finding 6 — the `h_ego` residual is a side-channel; removing it strengthens the filter
+
+Finding 5 says CLS does not reward mask correctness. Finding 6 gives the **architectural mechanism**:
+every path by which information reaches the plan *without passing through* $M^{cas}$ raises CLS and
+weakens the filter. There are three such paths for the ego token, and only one had ever been
+questioned.
+
+### Where the residual is
+
+[`causal_graph.py:413-415`](GameFormer/causal_graph.py#L413-L415) — CP's Eq 6, **causal branch only**:
+
+```python
+cas_pre = self.out_fc_cas(cat([self_fea, ag_cas, mp_cas]))
+f_cas   = self.norm_cas(cas_pre + h_ego if self.ego_residual else cas_pre)   # <- the residual
+f_cfd   = self.norm_cfd(self.out_fc_cfd(cat([self_fea, ag_cfd, mp_cfd])))    # <- none
+```
+
+Note `self_fea = self_fc(h_ego)` is **already inside the concatenation**. So the ego token enters
+`f_cas` twice here, and a third time as `ego_clean` in the decoder's cross-attention memory
+(`ctx = [f_cas ; ego_clean]`). Three ego paths; only the agent term passes through $M^{cas}$.
+
+### Two measurements, and why the first one misled
+
+**Inference-time surgery** — set `ego_residual = False` on the *trained* `nbr(2b)` checkpoint, no
+retraining (~10 s):
+
+| | ON | OFF |
+|---|---|---|
+| minADE | 0.6731 | **0.8506** (+26%) |
+| `mcas_peak` / `mcfd_peak` / `cfdacc` | — | **identical to 4 dp** |
+| `fcfd_var` | — | **identical** |
+
+Two structural facts fall out. At `graph_layers 1` the residual is added **after** the attention, so
+it **cannot affect mask computation in the forward pass** — the masks are bit-identical. And
+`f_cfd` is untouched, confirming the residual is causal-branch only.
+
+But the +26% does **not** predict the retrained result, because `self_fea` gives the network an
+alternate route it never had a chance to learn here.
+
+> **`gcos` is not a dependence measure.** `gcos = cos(f_cas, h_ego)` sits at 0.14–0.16 in every run,
+> and an earlier draft read that as "the residual does little." Wrong: cosine measures *direction*,
+> and `LN(x + h_ego)` followed by an FFN can rotate the output nearly orthogonal to `h_ego` while
+> `h_ego` still largely determined it. `gcos` only rules out the degenerate case `f_cas ≈ h_ego`.
+
+**Retrained ablation** — `noresid_nbr_nbrenrich2`, identical to `nbr(2b)` but `--ego_residual 0`:
+
+| | nbr(2b) | **noresid** | |
+|---|---|---|---|
+| minADE | 0.6731 | 0.6815 | +1.2% |
+| **RNC Δhigh** | 0.4318 | **0.4754** | +10% |
+| **RNC Δlow** | 0.0477 | **0.0384** | −19% |
+| **RNC hi/lo** | 8.9× | **12.4×** | **+39%** |
+| **RNC matched** | 3.4× | **4.8×** | **+41%** |
+| RNC corr | 0.54 | 0.552 | |
+| **rear** | 0.373 | **0.298** | best in the mask family |
+| `cfdvar` | 1.742 | 1.782 | |
+| `mcas_peak` | 0.2332 | 0.2519 | still soft |
+| interaction | 1.26× | 1.24× | unchanged |
+| `gcos` | 0.152 | **0.052** | bypass gone |
+| **CLS-R** | **0.8336** | **0.8160** | −0.0176 |
+
+The model relearned to route ego information through `self_fea`, so the surgery's +26% collapsed to
+**+0.008 minADE**. Every filter metric improved. The viz is near-identical — **expected**, since the
+residual cannot change the mask forward-pass at one layer; what changes is how much the plan
+*depends* on it, which is what RNC measures and viz cannot show.
+
+### The CLS drop is one scenario, and it is hesitation, not danger
+
+`c9764042dda65af7`, a `starting_left_turn`:
+
+| | nbr(2b) | noresid |
+|---|---|---|
+| collisions / drivable / direction / TTC / comfort | all 1.0 | **all 1.0** |
+| `ego_is_making_progress` | 1.0 | **0.0** ← multiplier, zeroes the scenario |
+| route progress | 0.370 | **0.171** |
+| score | 0.803 | **0.000** |
+
+Nothing unsafe happened; the ego simply did not go. Across all 43 scenarios:
+
+```
+c9764042dda65af7        0.803 -> 0.000    -0.803
+24 other changed        net               +0.051
+                        sum -0.752 / 43 = -0.0175
+```
+
+**Excluding that one scenario, noresid is slightly ahead.** The aggregate signature agrees:
+comfort −2 scenarios, progress −1, **TTC +1**, and route progress 0.822 → **0.826, the highest of
+any run measured**.
+
+Coherent reading: removing the bypass makes the plan lean on the neighbour aggregate rather than the
+ego's own intent, so it **hesitates** in an unprotected left turn — exactly what the progress
+multiplier punishes. Jerkier but with better clearances is the same story. On this reading the
+side-channel is not merely free CLS; it is what lets the ego commit to its own intent instead of
+deferring to the scene.
+
+### Verdict, with the evidence weighted honestly
+
+The filter gain is measured on **1104 validation scenes** and is large (+41% matched). The CLS loss
+is **n = 1**, and by this file's own rule (1 scenario = 0.023) a 0.0176 difference is not
+interpretable. Those are not the same quality of evidence, so **`noresid` supersedes `nbr(2b)` as the
+go-to configuration**.
+
+The caveat is not hidden: n = 1 cannot separate "unlucky scenario" from "systematically timid in
+unprotected left turns," and the latter would matter. Turning is already a chronic weakness here —
+three turning scenarios score 0.000 even in the baseline, and 16 of 43 are turns. **The only thing
+that settles it is more scenarios** (`test14-hard` or full `test14`, simulation only, no retraining):
+a systematic failure shows as a pattern, luck washes out. Until that runs, treat the CLS ranking
+between `nbr(2b)` and `noresid` as **undetermined** and the filter ranking as settled.
+
+---
+
 ## Which run is best, and for what
 
 | criterion | winner | value | note |
@@ -784,7 +911,9 @@ by fiat; `L_nbr` reaches it from a task.
 | **Confound branch alive** | **nbr(2b)** | `cfdvar` **1.742** | *and* CLS 0.8336, *and* best minADE |
 | **Non-degenerate mask** | **nbr(2b)** | `mcfd_peak` **1.81× uniform** | only run with an interior optimum |
 | **Route progress** | **nbr(2b)** | **0.822** | above the 0.8579 baseline's 0.787 |
-| **Best overall compromise** | **nbr(2b)** | CLS 0.8336 · minADE 0.6731 · `cfdvar` 1.742 · 1.26× | mask family, no BC, no conflict |
+| **Filter strength** | **noresid** | RNC matched **4.8×** · hi/lo **12.4×** · corr 0.552 | best in the study; costs one scenario of CLS |
+| **Lowest rear bias** | **noresid** | **0.298** | mask family only; conflict family sits at 0.41–0.62 |
+| **Best overall compromise** | **noresid** | CLS 0.8160 · minADE 0.6815 · `cfdvar` 1.782 · matched 4.8× | `nbr(2b)` if the CLS number matters more than the filter |
 | **Best for the causal claim alone** | **confB** | 1.90× · corr 0.546 · minADE 0.6822 · CLS 0.8126 | GF-independent, softest conflict mask (`ent` 0.292) |
 
 **There is no run that is simultaneously best on causality and on CLS**, and Finding 5 shows why:
@@ -803,13 +932,32 @@ nearest-agent heuristic.
 
 ## Go-to configuration
 
-**`training_log/step2b_nbr_nbrenrich2/causal_epoch_15_minADE_0.6731.pth`**
+**`training_log/noresid_nbr_nbrenrich2/causal_epoch_13_minADE_0.6815.pth`**
+(supersedes `nbr(2b)` on filter strength; see [Finding 6](#finding-6--the-h_ego-residual-is-a-side-channel-removing-it-strengthens-the-filter))
 
 ```bash
---lambda_mask 0.5 --lambda_nbr 0.1 \
+--lambda_mask 0.5 --lambda_nbr 0.1 --ego_residual 0 \
 --lambda_recon 0 --lambda_bc 0 --lambda_peak 0 --lambda_conflict 0 \
 --nbr_enrich 2 --graph_layers 1 --gate softmax        # + manlbl + DOD
 ```
+
+> **`--ego_residual 0` must be passed to every downstream tool** — it is a behaviour switch with no
+> weights, so a checkpoint loaded without it silently runs the wrong forward pass and `strict=False`
+> will not warn you. Wired through `eval_remove_noncausal.py`, `viz_causal.py`, `eval_interaction.py`,
+> `eval_metrics_from_ckpt.py`, `run_nuplan_test.py` and both planners.
+
+Its predecessor, if you want the higher CLS instead of the stronger filter:
+**`training_log/step2b_nbr_nbrenrich2/causal_epoch_15_minADE_0.6731.pth`** (same flags,
+`--ego_residual 1`).
+
+| | nbr(2b) | **noresid** |
+|---|---|---|
+| CLS-R | **0.8336** | 0.8160 *(the gap is one scenario — see Finding 6)* |
+| minADE | **0.6731** | 0.6815 |
+| RNC matched | 3.4× | **4.8×** |
+| RNC hi/lo | 8.9× | **12.4×** |
+| rear | 0.373 | **0.298** |
+| route progress | 0.822 | **0.826** |
 
 | | value | context |
 |---|---|---|
@@ -905,12 +1053,21 @@ consumes — a direct objective conflict, which is why the damage concentrates i
 already failed (`confG` at 0.01). A top-1 **margin/ranking** loss would constrain only the argmax
 and leave the remaining mass free for the plan. The functional form is the untried variable.
 
+### G — settle noresid vs nbr(2b) on more scenarios  ← CHEAPEST OPEN QUESTION
+Simulation only, no retraining. `noresid`'s entire CLS deficit is one `starting_left_turn` that
+tripped the progress multiplier; 43 scenarios cannot separate bad luck from systematic timidity in
+unprotected left turns. Run both checkpoints on `test14-hard` or full `test14` — a systematic
+failure shows as a pattern, luck washes out. Remember `--ego_residual 0` for the `noresid` run.
+
 ### Also outstanding
 - **CLS for `stepA`** — still never run; the 2026-08-10 simulation attributed to it was
   `step2_recon` (see the bookkeeping correction above).
 - **No clean `λ_recon` on/off pair exists.** Every candidate also changes `aligned_mode` or
   `λ_bc`. Recon's closed-loop effect is unmeasured.
 - **CLS for `confG`, `confF-gf`, `conf_only`, `confA`** — trained, never simulated.
+- **Is the side-channel law general?** Finding 6 has two data points (DOD, `h_ego` residual). The
+  third path — `ego_clean` in the decoder's cross-attention memory `ctx = [f_cas ; ego_clean]` — has
+  never been ablated and would be the decisive test.
 - State perturbation (`cp_manlbl_pert`: pure CLS 0.58 → 0.70) never tried on this lineage;
   orthogonal to the mask, so it cannot recreate this trade.
 

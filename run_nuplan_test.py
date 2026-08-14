@@ -176,7 +176,7 @@ def main(args):
         planner = CausalPurePlanner(
             backbone_path=args.model_path, causal_path=args.causal_path,
             num_neighbors=args.num_neighbors, graph_layers=args.graph_layers,
-            modes=args.modes, plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, device=args.device,
+            modes=args.modes, plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, ego_residual=args.ego_residual, device=args.device,
         )
         print(f"[PURE CAUSAL] backbone={args.model_path}  causal={args.causal_path}  (refiner YOK)  "
               f"plan_source={args.plan_source}")
@@ -187,7 +187,7 @@ def main(args):
             num_neighbors=args.num_neighbors, graph_layers=args.graph_layers,
             modes=args.modes,
             use_causal=(not args.baseline), remove=args.remove, remove_k=args.remove_k,
-            plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, device=args.device,
+            plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, ego_residual=args.ego_residual, device=args.device,
         )
         print(f"[CAUSAL+REFINER] causal={args.causal_path}  "
               f"plan={'GameFormer' if args.baseline else 'CausalPlanner'}  remove={args.remove}x{args.remove_k}  "
@@ -338,6 +338,8 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', type=str, help='path to data')
     parser.add_argument('--map_path', type=str, help='path to nuplan maps')
     parser.add_argument('--model_path', type=str, help='path to model (frozen GameFormer backbone)')
+    parser.add_argument('--ego_residual', type=int, default=1,
+                        help='checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)')
     parser.add_argument('--causal_path', type=str, default=None,
                         help='CausalPlanner ckpt -> PURE causal planner (refiner YOK). Verilirse model_path=backbone.')
     parser.add_argument('--num_neighbors', type=int, default=10)
