@@ -127,16 +127,58 @@ def scenario_match(man, scenario):
     }.get(scenario, True)
 
 
-def plot_scene(ax, s, mode, thr, topn, branch="cas"):
+CH_SHORT = ["ahead", "behind", "adjL", "adjR", "collide", "intersect", "near",
+            "follows", "merges", "overtakes", "vru"]   # CHANNEL_NAMES kisa etiketleri
+# DOD manevra siniflari (train_planner._MANEUVER ile AYNI indeks sirasi)
+MANEUVER_SHORT = ["stationary", "straight", "turn-L", "turn-R", "U-turn-L"]
+# Harita arka plan paleti (eval_channels._draw / KG notebook stili ile ayni tonlar)
+BG_LANE, BG_LANE_EDGE = "#e8e8e8", "#c4c4c4"
+BG_CROSSWALK, BG_CROSSWALK_EDGE = "#fff4b8", "#b59b31"
+BG_ROUTE = "#f06292"
+
+
+def _plot_map_background(ax, s):
+    """Tum harita geometrisini SOLUK arka plan bandi olarak ciz (serit gri, crosswalk sari,
+    rota pembe) -- M_cas_map renklendirmesi ustte kalir. Gate'li modellerde harita elemanlarinin
+    cogu M~0 aldigindan _plot_map_causal tek basina 'bos' gorunuyordu; baglam bu katmandan gelir."""
+    ax.set_facecolor("#fafafa")
+    L, C, _ = s["map_counts"]
+    for i, poly in enumerate(s["map_polys"]):
+        msk = np.abs(poly).sum(-1) > 1e-3
+        if msk.sum() < 2:
+            continue
+        p = poly[msk]
+        if i < L:            # serit: genis gri bant + ince kenar
+            ax.plot(p[:, 0], p[:, 1], color=BG_LANE, lw=6.0, alpha=0.6,
+                    zorder=0.3, solid_capstyle="round")
+            ax.plot(p[:, 0], p[:, 1], color=BG_LANE_EDGE, lw=0.5, alpha=0.5, zorder=0.4)
+        elif i < L + C:      # crosswalk: sari bant
+            ax.plot(p[:, 0], p[:, 1], color=BG_CROSSWALK, lw=5.0, alpha=0.85,
+                    zorder=0.5, solid_capstyle="round")
+            ax.plot(p[:, 0], p[:, 1], color=BG_CROSSWALK_EDGE, lw=0.5, alpha=0.6, zorder=0.55)
+        else:                # rota seridi: pembe (KG R2_ROUTE tonu)
+            ax.plot(p[:, 0], p[:, 1], color=BG_ROUTE, lw=2.6, alpha=0.5,
+                    zorder=0.6, solid_capstyle="round")
+
+
+def plot_scene(ax, s, mode, thr, topn, branch="cas", show_channels=False):
     """s: dict of numpy arrays for one sample. branch='cas'|'cfd' -> only affects label text
     (mask/data used was already selected upstream in collect_scenes)."""
     tag_word = "causal" if branch == "cas" else "confound"
+    _plot_map_background(ax, s)                                           # baglam: soluk bantlar
     _plot_map_causal(ax, s["map_polys"], s["map_mcas"], s["map_valid"])   # map: colored only
 
     # ego (idx 0) -> origin, black
     _draw_car(ax, s["ego"][0], s["ego"][1], s["ego"][2], 4.8, 2.0,
               facecolor="#222222", edgecolor="black", lw=1.0, z=6)
     ax.plot(s["ego_plan"][:, 0], s["ego_plan"][:, 1], "--", color="#2ca02c", lw=1.8, zorder=7)
+    # DOD karari: head'in kullandigi b* = argmax psi_cas (modelin TAHMINI, GT degil).
+    # Panel kose etiketi (ego uzerine yazinca komsu ajan etiketleriyle cakisiyordu).
+    if s.get("dod") is not None:
+        b, p = s["dod"]
+        ax.text(0.02, 0.97, f"DOD: {MANEUVER_SHORT[b]} ({p:.2f})", transform=ax.transAxes,
+                color="#1b5e20", fontsize=7, ha="left", va="top", fontweight="bold", zorder=9,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.2))
 
     # L_conflict'in koridoru: lattice planner referans yolu (c_lat_candidates[0]).
     # KOYU mor = reach icinde kalan parca (cezanin gercekten kullandigi), ACIK mor = otesi.
@@ -172,6 +214,18 @@ def plot_scene(ax, s, mode, thr, topn, branch="cas"):
             fm = np.abs(fut).sum(-1) > 1e-3
             if fm.sum() > 1:
                 ax.plot(fut[fm, 0], fut[fm, 1], "-", color=FUTURE_COLOR, lw=1.6, alpha=0.95, zorder=6)
+        if show_channels and s.get("ch_active") is not None:
+            fired = [c for c in range(s["ch_active"].shape[-1]) if s["ch_active"][j, c]]
+            if s.get("M_typed") is not None and fired:
+                # typed model: kanal-basina M_cas agirligi (softmax (ajan,kanal) girisleri uzerinde;
+                # ajanin per-agent degeri bunlarin toplami). Agirliga gore buyukten kucuge.
+                fired.sort(key=lambda c: -float(s["M_typed"][j, c]))
+                lbl = ",".join(f"{CH_SHORT[c]}:{float(s['M_typed'][j, c]):.2f}" for c in fired)
+            else:
+                lbl = ",".join(CH_SHORT[c] for c in fired)
+            ax.text(x, y - 2.6, lbl if fired else "-",
+                    color=("black" if causal else "0.35"), fontsize=5.5, ha="center",
+                    fontweight=("bold" if causal else "normal"), zorder=9)
         xs.append(x); ys.append(y)
 
     r = 40
@@ -211,6 +265,11 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
 
         M_cas = out[mask_key]; valid = out["nbr_valid"]
         M_cas_map = out[map_key]; map_valid = out["map_valid"]
+        # typed (ajan,kanal) maskesi [B,N,R] (typed_kv=0 ise None); dal ile tutarli anahtar
+        M_typed = out.get("M_cas_typed" if branch == "cas" else "M_cfd_typed")
+        # DOD karari: head'in query'sine giden b* = argmax psi_cas (+softmax guveni)
+        psi_prob = torch.softmax(out["psi_cas"], dim=-1)                 # [B,K]
+        dod_idx = psi_prob.argmax(-1)                                    # [B]
         actors = enc["actors"][:, :, -1]
         traj_key, score_key = ("traj_cfd", "score_cfd") if branch == "cfd" else ("traj", "score")
         traj = out[traj_key][:, 0, :, :, :2]
@@ -243,6 +302,16 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
             scenes.append({
                 "man": man, "N": num_neighbors,
                 "M_cas": mca, "valid": vv,
+                # yanan predicate kanallari [N,R] (channels branch; kanal yoksa None)
+                "ch_active": (out["ch_active"][b].cpu().numpy()
+                              if out.get("ch_active") is not None else None),
+                # typed (ajan,kanal) M agirliklari [N,R] (typed_kv=0 -> None; per-agent M = satir toplami)
+                "M_typed": (M_typed[b].cpu().numpy() if M_typed is not None else None),
+                # DOD: (manevra sinifi, softmax guveni) -- psi_cas'ten, modelin tahmini
+                "dod": (int(dod_idx[b]), float(psi_prob[b, dod_idx[b]])),
+                # arka plan stillemesi icin poly tip sayilari (lanes, crosswalks, routes)
+                "map_counts": (inputs["map_lanes"].shape[1], inputs["map_crosswalks"].shape[1],
+                               inputs["route_lanes"].shape[1]),
                 "ego": actors[b, 0, :3].cpu().numpy(),
                 "pos": actors[b, 1:Na, :3].cpu().numpy(),
                 "dims": dims[b].cpu().numpy(), "types": types[b].cpu().numpy(),
@@ -265,7 +334,7 @@ def main(args):
     gameformer.load_state_dict(torch.load(args.pretrained_path, map_location=dev))
     gameformer = gameformer.to(dev); freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual).to(dev)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust).to(dev)
     # strict=False: eski checkpoint'ler (ornegin Step 2 oncesi) cfd_recon agirliklarini icermez.
     # O modul viz yolunda HIC kullanilmaz, o yuzden eksik olmasi zararsiz -- ama ne eksikse yazdir,
     # sessizce gercek bir uyumsuzlugu yutmayalim.
@@ -296,7 +365,8 @@ def main(args):
     for i in range(rows * cols):
         ax = axes[i // cols][i % cols]
         if i < n:
-            plot_scene(ax, scenes[i], args.select, args.threshold, args.topn, branch=args.branch)
+            plot_scene(ax, scenes[i], args.select, args.threshold, args.topn, branch=args.branch,
+                       show_channels=bool(args.show_channels))
         else:
             ax.axis("off")
     sm = mpl.cm.ScalarMappable(cmap=CMAP, norm=plt.Normalize(0, 1))
@@ -320,6 +390,9 @@ def main(args):
     handles += [
         Line2D([0], [0], color=CMAP(0.95), lw=3.2, label=f"Map polyline (sahne-ici en yuksek {mask_name}_map)"),
         Line2D([0], [0], color=CMAP(0.25), lw=1.2, label="Map polyline (sahne-ici dusuk)"),
+        Line2D([0], [0], color=BG_LANE, lw=6.0, label="Lane (arka plan)"),
+        Line2D([0], [0], color=BG_CROSSWALK, lw=5.0, label="Crosswalk (arka plan)"),
+        Line2D([0], [0], color=BG_ROUTE, lw=2.6, label="Route (arka plan)"),
         Patch(facecolor="0.7", edgecolor="0.4", label="Type: vehicle (rect)"),
         Line2D([0], [0], marker="o", ls="None", markerfacecolor="0.7", markeredgecolor="0.4",
                markersize=11, label="Type: pedestrian (circle)"),
@@ -361,6 +434,12 @@ if __name__ == "__main__":
     p.add_argument("--nbr_enrich", type=int, default=0)
     p.add_argument("--ref_idx", type=int, default=0,
                    help="c_lat_candidates icinden hangi aday cizilecek (0 = ego'ya en yakin)")
+    p.add_argument("--show_channels", type=int, default=0,
+                   help="1 = her ajanin altina yanan predicate kanallarini yaz (ahead/near/vru...)")
+    p.add_argument("--gate_channels", type=int, default=0)
+    p.add_argument("--typed_kv", type=int, default=0)
+    p.add_argument("--channel_evidence", type=int, default=0)
+    p.add_argument("--gate_trust", type=str, default="all", choices=["all", "reliable"])
     p.add_argument("--ego_residual", type=int, default=1,
                    help="checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)")
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"],
