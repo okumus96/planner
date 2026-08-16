@@ -568,8 +568,17 @@ References: `random` = chance (`dmin` 15.37 m, `dmin<5m` 0.101, rear 0.462);
 | confG (`λ_conf` 0.01) | 1.15× | 13.37 | 9.68 | 0.150 | 0.860 | 0.178 |
 | **confI** | **1.01×** | 15.26 | 12.31 | 0.110 | **0.928** | 0.131 |
 | **noresid** | 1.24× | 12.39 | 8.24 | 0.131 | **0.298** | 0.157 |
+| **gate** *(channels)* | **1.45×** | 10.59 | 6.24 | 0.179 | 0.325 | 0.286 |
+| **typed** *(channels)* | **1.46×** | 10.50 | 6.46 | 0.187 | 0.307 | 0.304 |
 
-**`λ_conflict` does not scale down.** `confG` is `confF` with `λ_conf` 0.1 → 0.01 and nothing else.
+**Channels lineage (2026-08-16).** `gate`/`typed` = the noresid config + predicate-channel flags
+(see the configuration table below; details in `CHANNELS_AUDIT.md`). Structural gating alone —
+zero new losses — lifts the mask family from 1.24× to **1.45×** while *keeping* its low rear bias
+(0.31–0.33; the conflict family pays 0.41+ for its 1.90×). `typed` adds **nothing** to selection
+(1.46×): without loss pressure, per-relation K/V capacity does not move the mask's *content*.
+Both remain below the `near` bar (2.12×) and the conflict-supervised 1.90× — the bottleneck is
+now proven to be **allocation inside the fired set**, which is exactly what the faithfulness
+loss targets next. `confG` is `confF` with `λ_conf` 0.1 → 0.01 and nothing else.
 Interaction falls 1.90× → **1.15×** and rear bias jumps 0.418 → **0.860**, i.e. almost all the way
 back to `confI`'s BC-only failure mode (1.01×, 0.928). At one tenth the weight the conflict term
 loses to BC outright. The term is effectively **binary at these magnitudes**: 0.1 or nothing.
@@ -609,12 +618,24 @@ readings that transfer.
 | confF | **0.5538** | 0.0001 | 7313× | 13.3× | 0.511 |
 | confI | 0.4422 | 0.0030 | 146.7× | 8.0× | 0.471 |
 | **noresid** | **0.4754** | 0.0384 | 12.4× | **4.8×** | **0.552** |
+| **gate** *(channels)* | **0.5726** | 0.0006 | 968× | **8.4×** | **0.610** |
+| **typed** *(channels)* | **0.5848** | 0.0008 | 732× | 6.2× | 0.588–0.606 |
 
 `confI` is the clearest demonstration of the saturation caveat: it **passes** RemoveNonCausal at
 146.7× while sitting at *exact chance* on interaction (1.01×). Passing this test proves the mask
 is peaked, not that it is right. The mask-family runs — `dod_manlbl` 12.1×, `nbr(2b)` 8.9× — look
 far worse on the ratio precisely because their masks are soft (`mcas_peak` ~2× uniform), so
 `Δlow` does not collapse to zero and the ratio stays informative.
+
+**Channels lineage (2026-08-16).** The hard gate *structurally* zeroes non-fired agents, so
+`Δlow` collapses (0.0006/0.0008) and hi/lo joins the inflated class — read `matched` and `corr`
+instead. On those, `gate` sets **the best calibration of the entire study**: corr **0.610**
+(previous best `confE` 0.566, `noresid` 0.552) and matched **8.4×** (vs noresid's 4.8×) while
+keeping a soft in-gate mask. Δ-vs-M_cas bins are monotone for both — gate
+0.004 → 0.16 → 0.61 → **0.87**, typed 0.005 → 0.21 → 0.63 → **0.92** — i.e. mask magnitude
+*predicts* intervention effect, not just mask rank. Both PASS. (typed's corr measured 0.588 and
+0.606 on two runs of the eval — the eval subsamples and its random-removal control is unseeded,
+so ±0.01–0.02 run-to-run jitter is expected; gate reproduced at 0.610/0.611.)
 
 ### Complete run configuration
 
@@ -644,12 +665,18 @@ was explicitly passed `--lambda_mask 0`.
 | **confH** | `confH_norecon_nbrenrich2` | 0 | **0** | 0 | 0.1 | 0.5 | 0.1 | ref path | straight |
 | **confI** | `confI_bcpeak_only_nbrenrich2` | 0 | **0** | 0 | 0.1 | 0.5 | **0** | — | — |
 | **noresid** | `noresid_nbr_nbrenrich2` | **0.5** | 0 | **0.1** | 0 | 0 | 0 | — | — *(`--ego_residual 0`)* |
+| **gate** | `gate_noresid` | **0.5** | 0 | **0.1** | 0 | 0 | 0 | — | — *(`--ego_residual 0 --gate_channels 1`)* |
+| **typed** | `typed_noresid` | **0.5** | 0 | **0.1** | 0 | 0 | 0 | — | — *(`--ego_residual 0 --gate_channels 1 --typed_kv 1`)* |
 
 The three families, stated plainly:
 
 - **mask family** (`λ_mask 0.5`, no BC/peak/conflict): dod_manlbl, dodrop50, recon(2), nbr(2b)
 - **BC/peak family** (`λ_mask 0`, no conflict): stepA, confI
 - **conflict family** (`λ_mask 0`, `λ_conf > 0`): conf_only … confH
+- **channels family** (noresid losses + predicate-channel structure, no new losses): gate, typed
+  — best epochs `gate` e16 minADE **0.6914**, `typed` e15 minADE **0.7196** (vs noresid 0.6815:
+  gating is nearly free, typed's 11-way K/V pays +0.028 optimization cost). Channel definitions,
+  thresholds and extraction cache: `CHANNELS_AUDIT.md`.
 
 ### Closed-loop (test14-random_reduced, 43 scenarios, reactive, `--deploy refiner`)
 
@@ -661,7 +688,8 @@ or less** and must not be interpreted.
 | **dod_manlbl** | mask | **0.8579** | 1.000 | **0.947** | 0.974 | **1.000** | 0.974 | 0.787 |
 | **confI** | BC/peak | **0.8364** | 1.000 | 0.921 | 0.974 | 0.974 | 0.947 | 0.810 |
 | **nbr(2b)** | mask | **0.8336** | 1.000 | 0.921 | 0.974 | 0.947 | 0.947 | 0.822 |
-| **noresid** | mask, no `h_ego` | **0.8160** | 1.000 | 0.921 | 0.947 | 0.974 | 0.895 | **0.826** |
+| **typed** | channels | **0.8453** | 1.000 | 0.921 | 0.974 | 0.974 | 0.974 | **0.830** |
+| **noresid** | mask, no `h_ego` | **0.8160** | 1.000 | 0.921 | 0.947 | 0.974 | 0.895 | 0.826 |
 | dodrop50 | mask | 0.8322 | 1.000 | 0.921 | 0.974 | **1.000** | 0.974 | 0.790 |
 | **recon(2)** | mask | **0.8256** | 1.000 | 0.921 | 0.974 | 0.947 | 0.947 | 0.797 |
 | confD | conflict | 0.8176 | 1.000 | 0.921 | 0.947 | 0.974 | 0.947 | 0.817 |
@@ -675,6 +703,17 @@ or less** and must not be interpreted.
 Collision score is **1.000 in every single run**. Driving-direction compliance is 1.000
 everywhere and speed-limit compliance is 0.99+ everywhere; the entire CLS spread lives in
 drivable-area, TTC, comfort and progress, i.e. in a handful of individual scenarios.
+
+**Channels lineage (2026-08-16).** `typed` **0.8453** is **+0.029 over its direct parent config
+`noresid`** (~1.3 scenarios — above the one-scenario noise bar) and the **best route progress in
+the table (0.830)**; overall it is #2 behind `dod_manlbl` while carrying the study's best
+calibration (corr 0.610-class) instead of a chance-level mask. Deployment detail that makes this
+number valid: channels are computed **on-the-fly** each cycle (GF top-1 neighbor futures ×
+raw-order lattice candidates, candidate 0 = ego's lane — same semantics as the training cache;
+wiring in `causal_refiner_planner.py`). A typed checkpoint run *without* the channel flags falls
+back to an untyped attention path that received **no gradients** during typed training — the
+flags are mandatory, and `run_nuplan_test.py` prints `[channels] deploy: AKTIF` on the first
+frame as confirmation. `gate` CLS: not yet run.
 
 #### Bookkeeping correction — the "stepA = 0.8256" run was not stepA
 
@@ -906,12 +945,12 @@ between `nbr(2b)` and `noresid` as **undetermined** and the filter ranking as se
 |---|---|---|---|
 | **Closed-loop driving** | **dod_manlbl** | CLS **0.8579** | no conflict supervision at all; `f_cfd` dead |
 | **Causal selection** | **confB** | **1.90×** vs random, rear 0.412 | `confE`/`confF` within noise at 1.89–1.90× |
-| **Ranking quality** | **confE** | corr **0.566** | best of every run measured |
+| **Ranking quality** | **gate** *(2026-08-16)* | corr **0.610** | channels lineage; typed 0.59–0.61; previous best confE 0.566 |
 | **Open-loop accuracy** | confB+BC / nbr(2b) | minADE **0.6727 / 0.6731** | |
 | **Confound branch alive** | **nbr(2b)** | `cfdvar` **1.742** | *and* CLS 0.8336, *and* best minADE |
 | **Non-degenerate mask** | **nbr(2b)** | `mcfd_peak` **1.81× uniform** | only run with an interior optimum |
-| **Route progress** | **nbr(2b)** | **0.822** | above the 0.8579 baseline's 0.787 |
-| **Filter strength** | **noresid** | RNC matched **4.8×** · hi/lo **12.4×** · corr 0.552 | best in the study; costs one scenario of CLS |
+| **Route progress** | **typed** *(2026-08-16)* | **0.830** | previous best nbr(2b) 0.822; dod_manlbl baseline 0.787 |
+| **Filter strength** | **gate** *(2026-08-16)* | RNC matched **8.4×** · corr **0.610** | hard gate collapses Δlow so hi/lo is inflated; previous best noresid 4.8×/0.552 |
 | **Lowest rear bias** | **noresid** | **0.298** | mask family only; conflict family sits at 0.41–0.62 |
 | **Best overall compromise** | **noresid** | CLS 0.8160 · minADE 0.6815 · `cfdvar` 1.782 · matched 4.8× | `nbr(2b)` if the CLS number matters more than the filter |
 | **Best for the causal claim alone** | **confB** | 1.90× · corr 0.546 · minADE 0.6822 · CLS 0.8126 | GF-independent, softest conflict mask (`ent` 0.292) |
@@ -927,6 +966,12 @@ open-loop accuracy of the lineage, and gives up ~1 scenario of CLS against a bas
 confound branch is a constant. `confB` remains the run to cite if the interaction number is the
 headline — but it costs 0.021 more CLS than `nbr(2b)` for a mask that is still below the trivial
 nearest-agent heuristic.
+
+**Update (2026-08-16, channels lineage):** `typed` now holds CLS 0.8453 (+0.029 over its parent
+`noresid`, #2 overall), best route progress (0.830), the study-best calibration class (corr
+0.59–0.61 with monotone Δ bins) *and* the mask family's low rear bias — the first run to move
+CLS and mask-quality **in the same direction**. Selection (1.46×) still trails the near bar; the
+faithfulness loss is the open lever. See the channels rows in the three tables above.
 
 ---
 
