@@ -176,7 +176,9 @@ def main(args):
         planner = CausalPurePlanner(
             backbone_path=args.model_path, causal_path=args.causal_path,
             num_neighbors=args.num_neighbors, graph_layers=args.graph_layers,
-            modes=args.modes, plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, ego_residual=args.ego_residual, device=args.device,
+            modes=args.modes, plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, ego_residual=args.ego_residual,
+            gate_channels=args.gate_channels, typed_kv=args.typed_kv,
+            channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, device=args.device,
         )
         print(f"[PURE CAUSAL] backbone={args.model_path}  causal={args.causal_path}  (refiner YOK)  "
               f"plan_source={args.plan_source}")
@@ -187,11 +189,14 @@ def main(args):
             num_neighbors=args.num_neighbors, graph_layers=args.graph_layers,
             modes=args.modes,
             use_causal=(not args.baseline), remove=args.remove, remove_k=args.remove_k,
-            plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, ego_residual=args.ego_residual, device=args.device,
+            plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, ego_residual=args.ego_residual,
+            gate_channels=args.gate_channels, typed_kv=args.typed_kv,
+            channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, device=args.device,
         )
         print(f"[CAUSAL+REFINER] causal={args.causal_path}  "
               f"plan={'GameFormer' if args.baseline else 'CausalPlanner'}  remove={args.remove}x{args.remove_k}  "
-              f"plan_source={args.plan_source}")
+              f"plan_source={args.plan_source}  channels(gate={args.gate_channels},typed={args.typed_kv},"
+              f"evid={args.channel_evidence},trust={args.gate_trust})")
     else:
         planner = Planner(
             args.model_path,
@@ -358,6 +363,16 @@ if __name__ == "__main__":
                              "'cfd' (confounding graph'tan uret, HICBIR ajan silinmez, remove'dan bagimsiz — "
                              "'confounding graph gercekten davranis-belirleyici mi?' testi).")
     parser.add_argument('--remove_k', type=int, default=1, help='kac ajan cikarilacak (high/low top-k). default 1.')
+    parser.add_argument('--gate_channels', type=int, default=0,
+                        help='ckpt hangi degerle egitildiyse o: predicate kanali yanmayan girdi causal '
+                             'softmax\'a giremez. Deployment\'ta kanallar on-the-fly hesaplanir '
+                             '(GF top-1 future + lattice ref path). Sadece --deploy refiner.')
+    parser.add_argument('--typed_kv', type=int, default=0,
+                        help='ckpt hangi degerle egitildiyse o: (ajan, kanal) tipli K/V + tipli causal softmax.')
+    parser.add_argument('--channel_evidence', type=int, default=0,
+                        help='ckpt hangi degerle egitildiyse o: kanal evidence vektorleri edge feature\'a eklenir.')
+    parser.add_argument('--gate_trust', type=str, default='all', choices=['all', 'reliable'],
+                        help='gate karari hangi kanallara guvensin (reliable: zayif-IoU kanallar sayilmaz).')
     parser.add_argument('--device', type=str, default='cuda', help='device to run model on')
     parser.add_argument('--debug', action='store_true', help='save per-iteration debug trajectory plots')
     parser.add_argument('--debug_max_plots', type=int, default=200, help='maximum number of debug plots to save')

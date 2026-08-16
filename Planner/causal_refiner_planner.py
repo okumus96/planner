@@ -26,7 +26,8 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 
 class CausalRefinerPlanner(PlannerV2):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
-                 use_causal=True, remove='none', remove_k=1, plan_source='cas', nbr_enrich=0, ego_residual=1, device=None):
+                 use_causal=True, remove='none', remove_k=1, plan_source='cas', nbr_enrich=0, ego_residual=1,
+                 gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all', device=None):
         super().__init__(model_path=causal_path, device=device, debug=False,
                          debug_dir=None, debug_max_plots=0, oracle_mode=False)
         self._backbone_path = backbone_path
@@ -36,6 +37,16 @@ class CausalRefinerPlanner(PlannerV2):
         self._modes = modes
         self._nbr_enrich = nbr_enrich
         self._ego_residual = ego_residual
+        # Predicate kanallari (channels branch). Checkpoint hangi bayraklarla EGITILDIYSE ayni
+        # bayraklar verilmeli; ozellikle typed_kv=1 ckpt'lerde untyped attention dali (Wk_ag/attn_cas)
+        # egitimde HIC gradyan almadi -> kanallar deployment'ta uretilemezse model o egitilmemis
+        # dala duser ve sonuc GECERSIZDIR (asagida _run_causal icindeki uyari bunu yakalar).
+        self._gate_channels = gate_channels
+        self._typed_kv = typed_kv
+        self._channel_evidence = channel_evidence
+        self._gate_trust = gate_trust
+        self._ch_logged = False          # ilk frame'de kanal durumunu bir kez yazdir
+        self._ch_missing_warned = False  # kanal istendi ama ref path yok uyarisi (bir kez)
         self._use_causal = use_causal    # neural_plan: CausalPlanner (True) vs GameFormer (False)
         # RemoveNonCausal-via-CLS: her frame'de M_cas'a gore TEK ajani cikar (girdiden sifirla).
         # 'high'=en causal ajani cikar (CLS dusmeli), 'low'=en az causal (CLS degismemeli), 'random'=kontrol.
@@ -50,9 +61,9 @@ class CausalRefinerPlanner(PlannerV2):
         return (f"CausalRefinerPlanner[{'causal' if self._use_causal else 'baseline-gf'};"
                 f"remove={self._remove}x{self._remove_k};plan={self._plan_source}]")
 
-    def _remove_agents(self, features):
+    def _remove_agents(self, features, ch_ref_path=None):
         """M_cas'a gore en causal/az causal k komsuyu girdiden sifirla. RemoveNonCausal, closed-loop."""
-        out = self._run_causal(features)
+        out = self._run_causal(features, ch_ref_path)
         M = out['M_cas'][0]                          # [N]
         valid = out['nbr_valid'][0]                  # [N] bool
         n_valid = int(valid.sum().item())
@@ -83,7 +94,10 @@ class CausalRefinerPlanner(PlannerV2):
         self.backbone.load_state_dict(torch.load(self._backbone_path, map_location=self._device))
         self.backbone.to(self._device).eval()
         # CausalPlanner (egitilmis) — neural_plan + M_cas
-        self.causal = CausalPlanner(layers=self._graph_layers, modes=self._modes, nbr_enrich=self._nbr_enrich, ego_residual=self._ego_residual)
+        self.causal = CausalPlanner(layers=self._graph_layers, modes=self._modes, nbr_enrich=self._nbr_enrich,
+                                    ego_residual=self._ego_residual,
+                                    gate_channels=self._gate_channels, typed_kv=self._typed_kv,
+                                    channel_evidence=self._channel_evidence, gate_trust=self._gate_trust)
         # strict=False: model sonradan modul kazandi (gate_bias, nbr_head, cfd_recon); eski checkpoint'ler
         # bu anahtarlari icermez. Ucu de PLAN YOLUNUN DISINDA: gate_bias yalniz gate='sigmoid' dalinda
         # okunur (planner softmax kurar), nbr_head/cfd_recon yalniz egitim loss'larini besler. Yine de
@@ -95,18 +109,52 @@ class CausalRefinerPlanner(PlannerV2):
         self.causal.to(self._device).eval()
         self.relevance_graph = None
 
+    def _channels_ref_path(self, ego_state, traffic_light_data):
+        """Kanal hesabi icin aday rotalar [1,5,P,6] — extract_channels/cache ile AYNI semantik.
+
+        HAM lattice sirasi kullanilir (aday 0 = ego'nun UZERINDE bulundugu seridin yolu,
+        get_candidate_paths mesafe-sirali dondurur — data_process npz'yi ayni sirayla yazdi ve
+        kanal cache'i o siradan hesaplandi). DOD yolundaki sort_candidates_by_lateral BILEREK
+        uygulanmaz: kanallar aday-0'in "ego koridoru" olmasina dayanir, sol->sag siralama bunu bozar.
+        Rota yoksa (aday 0 bos) None doner -> kanallar o frame hesaplanamaz.
+        """
+        if not (self._gate_channels or self._typed_kv or self._channel_evidence):
+            return None
+        c_lat, _ = self.get_multimodal_reference_paths2(
+            ego_state, traffic_light_data, points_per_route=MAX_LEN * 10)
+        if np.abs(c_lat[0]).sum() < 1e-6:
+            return None
+        return torch.tensor(c_lat, dtype=torch.float32, device=self._device).unsqueeze(0)
+
     @torch.no_grad()
-    def _run_causal(self, features):
+    def _run_causal(self, features, ch_ref_path=None):
         enc = self.backbone.encoder(features)
         top1, nbr_states, _ = extract_neighbor_top1_futures(self.backbone, enc, self._num_neighbors)
         out = self.causal(enc, features, num_agents=self._num_neighbors + 1,
                           neighbor_futures=top1, neighbor_states=nbr_states,
-                          also_cfd_plan=(self._plan_source == 'cfd'))
+                          also_cfd_plan=(self._plan_source == 'cfd'), ref_path=ch_ref_path)
+        # Kanal durumu teshisi: ilk frame'de bir kez dogrula (typed ckpt + kanal yok = egitilmemis dal!)
+        if not self._ch_logged:
+            ca = out.get('ch_active')
+            if ca is None:
+                print(f"[channels] deploy: KAPALI (gate={self._gate_channels} typed={self._typed_kv} "
+                      f"evid={self._channel_evidence})")
+            else:
+                print(f"[channels] deploy: AKTIF — ilk frame'de {int(ca[0].sum())} ajan-kanal, "
+                      f"{int(out['mch_active'][0].sum())} harita-kanal girisi yandi "
+                      f"(typed={'evet' if out.get('M_cas_typed') is not None else 'hayir'})")
+            self._ch_logged = True
+        if ((self._gate_channels or self._typed_kv) and out.get('ch_active') is None
+                and not self._ch_missing_warned):
+            print("[channels] UYARI: kanal bayraklari acik ama bu frame'de ref path yok -> "
+                  "kanallar devre disi; typed ckpt'te bu frame'ler EGITILMEMIS untyped dala duser "
+                  "(rota-disi frame'lerde beklenir, yayginsa sonuc supheli).")
+            self._ch_missing_warned = True
         return out
 
     @torch.no_grad()
-    def _causal_neural_plan(self, features):
-        out = self._run_causal(features)
+    def _causal_neural_plan(self, features, ch_ref_path=None):
+        out = self._run_causal(features, ch_ref_path)
         traj_key, score_key = ('traj_cfd', 'score_cfd') if self._plan_source == 'cfd' else ('traj', 'score')
         traj = out[traj_key][0, 0]                    # [M,80,4]
         best = int(out[score_key][0, 0].argmax().item())
@@ -120,14 +168,16 @@ class CausalRefinerPlanner(PlannerV2):
     def _plan(self, ego_state, history, traffic_light_data, observation, iteration=None):
         features = observation_adapter(history, traffic_light_data, self._map_api,
                                        self._route_roadblock_ids, self._device)
+        # Kanal ref path'i _remove_agents'tan ONCE hesaplanmali (o da _run_causal cagiriyor).
+        ch_ref = self._channels_ref_path(ego_state, traffic_light_data)
         if self._remove != 'none':                   # RemoveNonCausal-via-CLS: k ajani cikar
-            features = self._remove_agents(features)
+            features = self._remove_agents(features, ch_ref)
         ref_path = self._get_reference_path(ego_state, traffic_light_data, observation)
 
         with torch.no_grad():
             _, gf_plan, predictions, scores, ego_cur, nbr_cur = self._get_prediction(features)
             # neural_plan: causal (gate'li) VEYA GameFormer (tum ajanlar, baseline)
-            plan = self._causal_neural_plan(features) if self._use_causal else gf_plan
+            plan = self._causal_neural_plan(features, ch_ref) if self._use_causal else gf_plan
 
         if ref_path is None:
             # ego rotada degil -> refiner yok, ciplak plan

@@ -61,6 +61,10 @@ def main():
     p.add_argument("--decoder_levels", type=int, default=2)
     p.add_argument("--graph_layers", type=int, default=1)
     p.add_argument("--nbr_enrich", type=int, default=0)
+    p.add_argument("--gate_channels", type=int, default=0)
+    p.add_argument("--typed_kv", type=int, default=0)
+    p.add_argument("--channel_evidence", type=int, default=0)
+    p.add_argument("--gate_trust", type=str, default="all", choices=["all", "reliable"])
     p.add_argument("--ego_residual", type=int, default=1,
                    help="checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)")
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"])
@@ -78,7 +82,7 @@ def main():
     freeze_gameformer(gameformer)
 
     causal = CausalPlanner(layers=args.graph_layers, modes=args.modes,
-                           nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual).to(dev)
+                           nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust).to(dev)
     missing, unexpected = causal.load_state_dict(torch.load(args.causal_path, map_location=dev), strict=False)
     if missing or unexpected:
         print(f"[load] missing={list(missing)}  unexpected={list(unexpected)}")

@@ -23,7 +23,14 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 
 class CausalPurePlanner(AbstractPlanner):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
-                 plan_source='cas', nbr_enrich=0, ego_residual=1, device=None):
+                 plan_source='cas', nbr_enrich=0, ego_residual=1,
+                 gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all', device=None):
+        # Pure planner'da lattice ref path YOK -> predicate kanallari deployment'ta hesaplanamaz.
+        # typed_kv ckpt'ler kanalsiz calisirsa EGITILMEMIS untyped dala duser (sonuc gecersiz) --
+        # sessizce cop CLS uretmek yerine acikca reddet.
+        if gate_channels or typed_kv or channel_evidence:
+            raise ValueError("CausalPurePlanner kanal bayraklarini desteklemiyor (ref path uretecek "
+                             "lattice yok). gate_channels/typed_kv ckpt'ler icin --deploy refiner kullanin.")
         self._future_horizon = T
         self._step_interval = DT
         self._backbone_path = backbone_path
