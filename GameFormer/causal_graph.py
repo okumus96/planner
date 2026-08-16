@@ -35,9 +35,15 @@ from .relevance_graph import (
     PolylineEncoder, build_edge_features, _polyline_pose_and_valid, EDGE_FEATURE_DIM,
     NODE_TYPE_EGO, NODE_TYPE_VEHICLE, NODE_TYPE_PEDESTRIAN, NODE_TYPE_BICYCLE,
 )
+from .channels import (compute_channels, compute_map_channels,
+                       NUM_CHANNELS, NUM_EVIDENCE, NUM_MAP_CHANNELS, NUM_MAP_EVIDENCE,
+                       CH_COLLISION_COURSE, CH_SHARES_INTERSECTION, CH_MERGES)
 
 NUM_AGENT_TYPES = 4  # ego, vehicle, pedestrian, bicycle
 CONFLICT_FEATURE_DIM = 4  # [d_route, d_ego_aligned, d_ego_spatial, approaching]
+# Zayif-kanit kanallari (GT-vs-GF IoU: %37/%50/%67, CHANNELS_AUDIT.md) -- gate_trust='reliable'
+# modunda GATING karari bunlara dayandirilmaz (typed girdileri yine kurulur).
+UNRELIABLE_CHANNELS = (CH_COLLISION_COURSE, CH_SHARES_INTERSECTION, CH_MERGES)
 
 
 def _conflict_features(neighbor_futures, neighbor_states, route_xy, route_valid, ego_speed,
@@ -237,11 +243,27 @@ class EgoCausalLayer(nn.Module):
     """
 
     def __init__(self, dim=256, heads=8, edge_dim=EDGE_FEATURE_DIM, dropout=0.1, gate='softmax',
-                 ag_edge_dim=None, conflict_bias=False):
+                 ag_edge_dim=None, conflict_bias=False, typed_kv=False, map_edge_dim=None):
         super().__init__()
         assert dim % heads == 0
         self.dim, self.heads, self.dh = dim, heads, dim // heads
         self.gate = gate                      # 'softmax' (dagilim) | 'sigmoid' (bagimsiz uyelik)
+        # TYPED K/V (channels branch): softmax destegi ajan degil YANAN (ajan, kanal) girdisi;
+        # her girdi kendi kanalinin node-K/V setiyle islenir (edge MLP'leri PAYLASILIR).
+        # Kanal basina ayri set (paylasim yok, v1): training olceginde nadir kanallar da doyuyor.
+        self.typed_kv = bool(typed_kv)
+        if self.typed_kv:
+            assert gate == 'softmax', "typed_kv v1 yalniz softmax kapiyla"
+            self.Wk_ch = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_CHANNELS)])
+            self.Wv_ch = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_CHANNELS)])
+            self.attn_cas_ch = nn.Parameter(torch.empty(NUM_CHANNELS, heads, self.dh))
+            self.attn_cfd_ch = nn.Parameter(torch.empty(NUM_CHANNELS, heads, self.dh))
+            self.Wk_mch = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_MAP_CHANNELS)])
+            self.Wv_mch = nn.ModuleList([nn.Linear(dim, dim) for _ in range(NUM_MAP_CHANNELS)])
+            self.attn_cas_mch = nn.Parameter(torch.empty(NUM_MAP_CHANNELS, heads, self.dh))
+            self.attn_cfd_mch = nn.Parameter(torch.empty(NUM_MAP_CHANNELS, heads, self.dh))
+            for p in (self.attn_cas_ch, self.attn_cfd_ch, self.attn_cas_mch, self.attn_cfd_mch):
+                nn.init.xavier_uniform_(p)
         # EXPLICIT CONFLICT BIAS: causal logit'ten softplus(w)*conflict-mesafe cikarilir. softplus(w)>=0
         # oldugu icin YON yapisal garanti (uzak ajan = yuksek mesafe = yuksek ceza), gucunu model ogrenir.
         self.conflict_bias = conflict_bias
@@ -260,7 +282,9 @@ class EgoCausalLayer(nn.Module):
         self.attn_cfd = nn.Parameter(torch.empty(heads, self.dh))
         # 'g2a' (harita) iliskisi
         self.Wq_mp = nn.Linear(dim, dim); self.Wk_mp = nn.Linear(dim, dim); self.Wv_mp = nn.Linear(dim, dim)
-        self.We_k_mp = _EdgeMLP(edge_dim, dim, dropout=dropout); self.We_v_mp = _EdgeMLP(edge_dim, dim, dropout=dropout)
+        # map_edge_dim: harita kenari geometri(edge_dim) + opsiyonel kanal kaniti (channel_evidence)
+        map_edge_dim = edge_dim if map_edge_dim is None else map_edge_dim
+        self.We_k_mp = _EdgeMLP(map_edge_dim, dim, dropout=dropout); self.We_v_mp = _EdgeMLP(map_edge_dim, dim, dropout=dropout)
         self.attn_cas_mp = nn.Parameter(torch.empty(heads, self.dh))  # harita causal attn vektoru
         self.attn_cfd_mp = nn.Parameter(torch.empty(heads, self.dh))
         for p in (self.attn_cas, self.attn_cfd, self.attn_cas_mp, self.attn_cfd_mp):
@@ -319,6 +343,13 @@ class EgoCausalLayer(nn.Module):
         else:
             M_cas_h = torch.softmax(a_cas.masked_fill(invalid, neg_inf), dim=1).masked_fill(invalid, 0.0)
             M_cfd_h = torch.softmax(a_cfd.masked_fill(invalid, neg_inf), dim=1).masked_fill(invalid, 0.0)
+            # GATING guvenligi: sahnede hic gecerli girdi kalmadiysa softmax(-inf'ler) NaN uretir;
+            # o satirlarda M = 0, katki = 0 (bos sahne = bos causal baglam).
+            has_any = valid.any(dim=1)                                            # [B]
+            if not bool(has_any.all()):
+                z = has_any[:, None, None].float()
+                M_cas_h = torch.nan_to_num(M_cas_h) * z
+                M_cfd_h = torch.nan_to_num(M_cfd_h) * z
             cas = (M_cas_h.unsqueeze(-1) * msg).sum(dim=1).reshape(B, self.dim)   # [B,D]
             cfd = (M_cfd_h.unsqueeze(-1) * msg).sum(dim=1).reshape(B, self.dim)
 
@@ -357,6 +388,42 @@ class EgoCausalLayer(nn.Module):
         return (cas, cfd, M_cas_mean, M_cfd_mean,
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean)
 
+    def _attend_typed(self, q1, h_src, ek, edge_v, entry_valid, Wk_list, Wv_list,
+                      attn_cas_ch, attn_cfd_ch, conflict_bias=None):
+        """TYPED attention: softmax YANAN (kaynak, kanal) girdileri uzerinde.
+        q1 [B,1,H,dh]; h_src [B,S,D]; ek/edge_v [B,S,H,dh] (edge MLP'leri kanallar arasi PAYLASILIR);
+        entry_valid [B,S,R] bool. Doner: cas/cfd [B,D], M_cas/M_cfd ajan-duzeyi [B,S] (kanal toplami,
+        eski eval/log uyumu), M_cas_typed/M_cfd_typed [B,S,R]."""
+        B, S, D = h_src.shape
+        H, dh = self.heads, self.dh
+        R = entry_valid.shape[-1]
+        # kanal-basina node K/V: [B,S,R,H,dh]
+        k_ch = torch.stack([m(h_src) for m in Wk_list], dim=2).view(B, S, R, H, dh)
+        v_ch = torch.stack([m(h_src) for m in Wv_list], dim=2).view(B, S, R, H, dh)
+        msg = v_ch + edge_v[:, :, None]                                   # edge value paylasilir
+        s = self.leaky(q1[:, :, None] + k_ch + ek[:, :, None])            # [B,S,R,H,dh]
+        a_cas = (s * attn_cas_ch[None, None]).sum(-1)                     # [B,S,R,H]
+        a_cfd = (s * attn_cfd_ch[None, None]).sum(-1)
+        if conflict_bias is not None:                                     # per-ajan ceza -> girdilere yay
+            a_cas = a_cas - conflict_bias[:, :, None, None]
+        neg_inf = torch.finfo(a_cas.dtype).min
+        inv = ~entry_valid[..., None]                                     # [B,S,R,1]
+        a_cas = a_cas.masked_fill(inv, neg_inf).view(B, S * R, H)
+        a_cfd = a_cfd.masked_fill(inv, neg_inf).view(B, S * R, H)
+        M_cas_h = torch.softmax(a_cas, dim=1)
+        M_cfd_h = torch.softmax(a_cfd, dim=1)
+        has_any = entry_valid.view(B, -1).any(dim=1)                      # bos sahne guvenligi
+        z = has_any[:, None, None].float()
+        M_cas_h = torch.nan_to_num(M_cas_h) * z
+        M_cfd_h = torch.nan_to_num(M_cfd_h) * z
+        M_cas_h = M_cas_h.view(B, S, R, H).masked_fill(~entry_valid[..., None], 0.0)
+        M_cfd_h = M_cfd_h.view(B, S, R, H).masked_fill(~entry_valid[..., None], 0.0)
+        cas = (M_cas_h[..., None] * msg).sum(dim=(1, 2)).reshape(B, self.dim)
+        cfd = (M_cfd_h[..., None] * msg).sum(dim=(1, 2)).reshape(B, self.dim)
+        M_cas_typed = M_cas_h.mean(-1)                                    # [B,S,R] (head-ort)
+        M_cfd_typed = M_cfd_h.mean(-1)
+        return cas, cfd, M_cas_typed.sum(-1), M_cfd_typed.sum(-1), M_cas_typed, M_cfd_typed
+
     @staticmethod
     def _per_type(mods, x, types):
         """x [B,N,D], types [B,N] long, mods = T tiplik ModuleList -> her token'a KENDI tipinin
@@ -366,7 +433,7 @@ class EgoCausalLayer(nn.Module):
         return stacked.gather(2, idx).squeeze(2)                            # [B,N,D]
 
     def forward(self, h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid,
-                conflict=None):
+                conflict=None, ch_active=None, mch_active=None):
         """h_ego [B,D]; h_nbr [B,N,D] (K=V ayni kaynak), nbr_types [B,N] long (komsu tipi -> tip-basina
         K/V), edge_ego [B,N,De], nbr_valid [B,N]; h_map [B,S,D], edge_map [B,S,De] (polygon->ego), map_valid [B,S].
         Doner: h_ego_new, f_cas, f_cfd, M_cas(ajan), M_cfd(ajan), M_cas_mp(harita), M_cfd_mp(harita)."""
@@ -376,30 +443,57 @@ class EgoCausalLayer(nn.Module):
 
         # --- ajan iliskisi (other): KEY/VALUE komsu-tipine gore AYRI (CP tip-basina wks/wvs) ---
         q_ag = self.Wq_ag(h_ego).view(B, 1, H, dh)
-        k_ag = self._per_type(self.Wk_ag, h_nbr, nbr_types).view(B, N, H, dh)
         ek_ag = self.We_k_ag(edge_ego).view(B, N, H, dh)
-        msg_ag = self._per_type(self.Wv_ag, h_nbr, nbr_types).view(B, N, H, dh) + self.We_v_ag(edge_ego).view(B, N, H, dh)
+        ev_ag = self.We_v_ag(edge_ego).view(B, N, H, dh)
         cb = None
         if self.conflict_bias and conflict is not None:
             cb = (F.softplus(self.conflict_w) * conflict[..., :3]).sum(-1)          # [B,N] >= 0
-        (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag,
-         ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean) = self._attend(
-            q_ag, k_ag, ek_ag, msg_ag, nbr_valid, self.attn_cas, self.attn_cfd, self.gate_bias[0:2],
-            conflict_bias=cb)
+        M_cas_typed = M_cfd_typed = None
+        if self.typed_kv and ch_active is not None:
+            # TYPED: girdiler = yanan (ajan, kanal); node K/V kanal setinden, edge paylasilir.
+            entry_valid = nbr_valid[:, :, None] & ch_active
+            (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag, M_cas_typed, M_cfd_typed) = self._attend_typed(
+                q_ag, h_nbr, ek_ag, ev_ag, entry_valid, self.Wk_ch, self.Wv_ch,
+                self.attn_cas_ch, self.attn_cfd_ch, conflict_bias=cb)
+            ent_cas_mean = ent_cas_headmean = ent_cfd_mean = ent_cfd_headmean = \
+                torch.zeros(B, device=h_ego.device)
+        else:
+            k_ag = self._per_type(self.Wk_ag, h_nbr, nbr_types).view(B, N, H, dh)
+            msg_ag = self._per_type(self.Wv_ag, h_nbr, nbr_types).view(B, N, H, dh) + ev_ag
+            (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag,
+             ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean) = self._attend(
+                q_ag, k_ag, ek_ag, msg_ag, nbr_valid, self.attn_cas, self.attn_cfd, self.gate_bias[0:2],
+                conflict_bias=cb)
 
         # --- harita iliskisi (g2a) ---
         q_mp = self.Wq_mp(h_ego).view(B, 1, H, dh)
-        k_mp = self.Wk_mp(h_map).view(B, S, H, dh)
         ek_mp = self.We_k_mp(edge_map).view(B, S, H, dh)
-        msg_mp = self.Wv_mp(h_map).view(B, S, H, dh) + self.We_v_mp(edge_map).view(B, S, H, dh)
-        (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp,
-         ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean) = self._attend(
-            q_mp, k_mp, ek_mp, msg_mp, map_valid, self.attn_cas_mp, self.attn_cfd_mp, self.gate_bias[2:4])
+        ev_mp = self.We_v_mp(edge_map).view(B, S, H, dh)
+        M_cas_mp_typed = M_cfd_mp_typed = None
+        if self.typed_kv and mch_active is not None:
+            entry_valid_mp = map_valid[:, :, None] & mch_active
+            (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp, M_cas_mp_typed, M_cfd_mp_typed) = self._attend_typed(
+                q_mp, h_map, ek_mp, ev_mp, entry_valid_mp, self.Wk_mch, self.Wv_mch,
+                self.attn_cas_mch, self.attn_cfd_mch)
+            ent_cas_mp_mean = ent_cas_mp_headmean = ent_cfd_mp_mean = ent_cfd_mp_headmean = \
+                torch.zeros(B, device=h_ego.device)
+        else:
+            k_mp = self.Wk_mp(h_map).view(B, S, H, dh)
+            msg_mp = self.Wv_mp(h_map).view(B, S, H, dh) + ev_mp
+            (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp,
+             ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean) = self._attend(
+                q_mp, k_mp, ek_mp, msg_mp, map_valid, self.attn_cas_mp, self.attn_cfd_mp, self.gate_bias[2:4])
 
         # --- GATE'SIZ TAM-SAHNE OZETI (f_all): causal/confound ayrimi YOK, ogrenilen secim YOK.
         # Gecerli komsularin/polygonlarin DUZ ORTALAMASI. Step 2'de [f_cas; f_cfd] bunu geri
         # kurmak zorunda -> f_cfd'nin sabit vektore cokmesi (fcfd_var ~ 1e-4) yasaklanir.
         # Sadece hedef olarak kullanilir (loss'ta detach) -> ana toplamayi carpitmaz.
+        # typed modda msg_ag/msg_mp yaratilmadi -> f_all icin UNTYPED value transformlariyla uret
+        # (f_all gate'siz TESHIS/recon hedefi; typed olmasi gerekmiyor).
+        if self.typed_kv and ch_active is not None:
+            msg_ag = self._per_type(self.Wv_ag, h_nbr, nbr_types).view(B, N, H, dh) + ev_ag
+        if self.typed_kv and mch_active is not None:
+            msg_mp = self.Wv_mp(h_map).view(B, S, H, dh) + ev_mp
         w_ag = nbr_valid.float()
         w_ag = w_ag / w_ag.sum(-1, keepdim=True).clamp(min=1.0)               # [B,N]
         all_ag = (w_ag[:, :, None, None] * msg_ag).sum(dim=1).reshape(B, self.dim)
@@ -425,7 +519,7 @@ class EgoCausalLayer(nn.Module):
         return (h_ego_new, f_cas, f_cfd, M_cas_ag, M_cfd_ag, M_cas_mp, M_cfd_mp,
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
                 ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
-                gate_cos, f_all)
+                gate_cos, f_all, M_cas_typed, M_cfd_typed, M_cas_mp_typed, M_cfd_mp_typed)
 
 
 class EgoCausalDisentangler(nn.Module):
@@ -437,8 +531,15 @@ class EgoCausalDisentangler(nn.Module):
     """
 
     def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, gate='softmax',
-                 conflict_feats=0, conflict_bias=0):
+                 conflict_feats=0, conflict_bias=0, gate_channels=0, typed_kv=0,
+                 channel_evidence=0, gate_trust='all'):
         super().__init__()
+        # --- predicate kanallari (channels branch) ---
+        self.gate_channels = bool(gate_channels)   # yapisal gating: kanali yanmayan girdi yarismaz
+        self.typed_kv = bool(typed_kv)             # (ajan,kanal) girdileri + kanal-basina K/V
+        self.channel_evidence = bool(channel_evidence)  # 9/8-dim kanit edge'e concat
+        assert gate_trust in ('all', 'reliable')
+        self.gate_trust = gate_trust               # 'reliable': zayif-IoU kanallar GATE karari disi
         self.conflict_feats = conflict_feats     # 1 -> ajan edge'ine conflict feature'lari EKLE
         self.conflict_bias = conflict_bias       # 1 -> causal logit'e explicit conflict cezasi
         # CausalPlanner bunu ayrica set eder; feature/bias kapaliyken bile L_conflict icin hesaplatir.
@@ -461,8 +562,13 @@ class EgoCausalDisentangler(nn.Module):
         ])
         self.layers = nn.ModuleList([
             EgoCausalLayer(dim, heads, EDGE_FEATURE_DIM, dropout, gate=gate,
-                           ag_edge_dim=EDGE_FEATURE_DIM + (CONFLICT_FEATURE_DIM if conflict_feats else 0),
-                           conflict_bias=bool(conflict_bias)) for _ in range(layers)
+                           ag_edge_dim=(EDGE_FEATURE_DIM
+                                        + (CONFLICT_FEATURE_DIM if conflict_feats else 0)
+                                        + (NUM_EVIDENCE if channel_evidence else 0)),
+                           map_edge_dim=(EDGE_FEATURE_DIM
+                                         + (NUM_MAP_EVIDENCE if channel_evidence else 0)),
+                           conflict_bias=bool(conflict_bias),
+                           typed_kv=bool(typed_kv)) for _ in range(layers)
         ])
 
     def forward(self, agent_feat, agent_valid, agent_pose, agent_types, inputs,
@@ -485,6 +591,26 @@ class EgoCausalDisentangler(nn.Module):
         ego_clean = h[:, 0]           # head'e verilen temiz ego (SADECE ego'nun kendi gecmisi + tip)
         nbr_valid = agent_valid[:, 1:]                                                 # [B,N]
         nbr_types = agent_types[:, 1:]                                                 # [B,N] tip-basina K/V
+
+        # --- PREDICATE KANALLARI (channels branch) ---
+        # Kaynak onceligi: (1) cache (inputs, extract_channels damgasi -- training yolu);
+        # (2) on-the-fly (deployment: GF future + ref_path eldeyse compute_channels);
+        # (3) yoksa devre disi (flag'ler etkisiz, eski davranis).
+        need_ch = self.gate_channels or self.typed_kv or self.channel_evidence
+        ch_active = ch_evid = mch_active = mch_evid = None
+        if need_ch:
+            if "channel_active" in inputs:
+                ch_active = inputs["channel_active"][:, :N].bool()
+                ch_evid = inputs["channel_evidence"][:, :N].float()
+                mch_active = inputs["map_channel_active"].bool()
+                mch_evid = inputs["map_channel_evidence"].float()
+            elif neighbor_futures is not None and ref_path is not None:
+                ch_active, ch_evid = compute_channels(
+                    inputs["neighbor_agents_past"][:, :N], inputs["ego_agent_past"],
+                    neighbor_futures[:, :N], ref_path)
+                mch_active, mch_evid = compute_map_channels(
+                    inputs["map_lanes"], inputs["map_crosswalks"],
+                    inputs["route_lanes"], ref_path)
 
         # --- HARITA polygonlari: kendi encoder'larimizla token (agent-free) + polygon->ego kenari ---
         lanes = inputs['map_lanes'][..., :3].float()
@@ -541,17 +667,38 @@ class EgoCausalDisentangler(nn.Module):
             if self.conflict_feats:
                 edge_ego = torch.cat([edge_ego, conf], dim=-1)                          # [B,N,De+4]
 
+        # --- KANAL uygulamalari (channels branch) ---
+        # (1) evidence -> edge concat (sira: geometri + [conflict] + [evidence], ag_edge_dim ile ayni)
+        if self.channel_evidence and ch_evid is not None:
+            edge_ego = torch.cat([edge_ego, ch_evid], dim=-1)
+            edge_map = torch.cat([edge_map, mch_evid], dim=-1)
+        # (2) yapisal gating: hicbir kanali yanmayan girdi softmax'a giremez.
+        #     gate_trust='reliable': zayif-IoU kanallar (collision/intersect/merges) GATE kararina
+        #     sayilmaz -- typed girdileri (ajan gecerliyse) yine kurulur.
+        gated_valid, gated_map_valid = nbr_valid, map_valid
+        if self.gate_channels and ch_active is not None:
+            gate_src = ch_active
+            if self.gate_trust == 'reliable':
+                gate_src = ch_active.clone()
+                gate_src[..., list(UNRELIABLE_CHANNELS)] = False
+            gated_valid = nbr_valid & gate_src.any(-1)
+            gated_map_valid = map_valid & mch_active.any(-1)
+
         # --- STAGE B: ego-merkezli causal-split (ajan + harita, causal/confound) ---
         f_cas = f_cfd = M_cas = M_cfd = M_cas_mp = M_cfd_mp = f_all = None
         ent_cas_mean = ent_cas_headmean = ent_cfd_mean = ent_cfd_headmean = None
         ent_cas_mp_mean = ent_cas_mp_headmean = ent_cfd_mp_mean = ent_cfd_mp_headmean = None
+        M_cas_ty = M_cfd_ty = M_cas_mp_ty = M_cfd_mp_ty = None
         gate_cos_layers = []          # elestiri: katman-basina cos(f_cas, h_ego), bypass/GRU-fix etkilesimi
         for layer in self.layers:
             (h_ego, f_cas, f_cfd, M_cas, M_cfd, M_cas_mp, M_cfd_mp,
              ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
              ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
-             gate_cos, f_all) = layer(
-                h_ego, h_nbr, nbr_types, edge_ego, nbr_valid, h_map, edge_map, map_valid, conflict=conf)
+             gate_cos, f_all, M_cas_ty, M_cfd_ty, M_cas_mp_ty, M_cfd_mp_ty) = layer(
+                h_ego, h_nbr, nbr_types, edge_ego, gated_valid, h_map, edge_map, gated_map_valid,
+                conflict=conf,
+                ch_active=(ch_active if self.typed_kv else None),
+                mch_active=(mch_active if self.typed_kv else None))
             gate_cos_layers.append(gate_cos)
         gate_cos_stack = torch.stack(gate_cos_layers, dim=1)   # [B, L] -- L=len(self.layers)
 
@@ -570,6 +717,12 @@ class EgoCausalDisentangler(nn.Module):
             'M_cfd_map_ent': ent_cfd_mp_mean, 'M_cfd_map_headent': ent_cfd_mp_headmean,
             # ego_clean: hicbir zaman guncellenmeyen ham ego (ego'nun kendi gecmisi + tip); head bunu kullanir.
             'ego_feat': h_ego, 'ego_clean': ego_clean, 'nbr_valid': nbr_valid,
+            # kanal ciktilari (channels branch): typed maskeler [B,N,R]/[B,S,R2], gate'li gecerlilik,
+            # ve kullanilan aktivasyonlar (analiz/faithfulness icin)
+            'M_cas_typed': M_cas_ty, 'M_cfd_typed': M_cfd_ty,
+            'M_cas_map_typed': M_cas_mp_ty, 'M_cfd_map_typed': M_cfd_mp_ty,
+            'gated_valid': gated_valid, 'gated_map_valid': gated_map_valid,
+            'ch_active': ch_active, 'mch_active': mch_active,
             # katman-basina cos(f_cas, h_ego) [B,L] -- ~1'e yakinsa gate marjinal (h_ego bypass'i baskin).
             'gate_cos': gate_cos_stack,
         }
@@ -616,11 +769,14 @@ class CausalPlanner(nn.Module):
     def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, num_maneuvers=5,
                  recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax',
                  conflict_feats=0, conflict_bias=0, compute_conflict=0, aligned_mode='straight',
-                 ego_residual=1):
+                 ego_residual=1, gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all'):
         super().__init__()
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
                                                   gate=gate, conflict_feats=conflict_feats,
-                                                  conflict_bias=conflict_bias)
+                                                  conflict_bias=conflict_bias,
+                                                  gate_channels=gate_channels, typed_kv=typed_kv,
+                                                  channel_evidence=channel_evidence,
+                                                  gate_trust=gate_trust)
         for _l in self.disentangler.layers:
             _l.ego_residual = bool(ego_residual)
         # compute_conflict: feature'lar edge'e girmese/bias olmasa bile hesaplansin (loss icin)
@@ -713,5 +869,10 @@ class CausalPlanner(nn.Module):
             'f_all': dis['f_all'],                 # STEP 2: hedef (loss'ta DETACH edilir)
             'nbr_pred': nbr_pred,                  # STEP 2b: f_cfd -> komsu gelecekleri [B,N,80,2]
             'conflict': dis['conflict'],           # [B,N,4] future-conflict (L_conflict icin)
+            # kanal ciktilari (channels branch)
+            'M_cas_typed': dis['M_cas_typed'], 'M_cfd_typed': dis['M_cfd_typed'],
+            'M_cas_map_typed': dis['M_cas_map_typed'], 'M_cfd_map_typed': dis['M_cfd_map_typed'],
+            'gated_valid': dis['gated_valid'], 'gated_map_valid': dis['gated_map_valid'],
+            'ch_active': dis['ch_active'], 'mch_active': dis['mch_active'],
         }
         return out

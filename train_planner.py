@@ -441,7 +441,10 @@ def model_training(args):
                            conflict_feats=args.conflict_feats, conflict_bias=args.conflict_bias,
                            compute_conflict=(args.compute_conflict or args.lambda_conflict > 0),
                            aligned_mode=args.aligned_mode, ego_residual=args.ego_residual,
-                           nbr_enrich=args.nbr_enrich).to(args.device)
+                           nbr_enrich=args.nbr_enrich,
+                           gate_channels=args.gate_channels, typed_kv=args.typed_kv,
+                           channel_evidence=args.channel_evidence,
+                           gate_trust=args.gate_trust).to(args.device)
 
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 12, 14, 16, 18], gamma=0.5)
@@ -528,6 +531,14 @@ if __name__ == "__main__":
     parser.add_argument("--conflict_terms", type=str, default="all", choices=["all", "reach"],
                         help="L_conflict cezasindaki terimler: all = [d_route, d_ego_aligned, d_ego_reach] "
                              "| reach = yalniz d_ego_reach (olculdu: lider secme 0.565 -> 0.706)")
+    parser.add_argument("--gate_channels", type=int, default=0,
+                        help="channels: yapisal gating -- hicbir kanali yanmayan ajan/eleman softmax'a giremez")
+    parser.add_argument("--typed_kv", type=int, default=0,
+                        help="channels: (ajan,kanal) girdileri + kanal-basina K/V (gating'i yapisal olarak icerir)")
+    parser.add_argument("--channel_evidence", type=int, default=0,
+                        help="channels: 9/8-dim kanal kaniti edge'e concat")
+    parser.add_argument("--gate_trust", type=str, default="all", choices=["all", "reliable"],
+                        help="reliable: zayif-IoU kanallar (collision/intersect/merges) GATE kararina sayilmaz")
     parser.add_argument("--ego_residual", type=int, default=1,
                         help="1 = f_cas = LN(out_fc + h_ego) (CP Eq 6, varsayilan) | 0 = residual YOK, "
                              "ego bilgisi f_cas'a yalniz self_fea uzerinden girer")
