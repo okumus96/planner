@@ -82,7 +82,26 @@ class DrivingData(Dataset):
             c_lat_candidates, c_lat_candidates_global
         )
 
-        return ego, neighbors, map_lanes, map_crosswalks, route_lanes, ego_future_gt, neighbors_future_gt, c_lat_candidates, c_lat_candidates_global
+        # Predicate kanallari (extract_channels.py'nin damgaladigi anahtarlar; channels branch).
+        # Training GF-varyantini okur (train/deploy tutarliligi). Damgasiz eski dosyada sifir-fallback:
+        # hicbir kanal yanmaz -> gating acikken o ornek maskeye ajan sokmaz, eski davranis bozulmaz.
+        from .channels import NUM_CHANNELS, NUM_EVIDENCE, NUM_MAP_CHANNELS, NUM_MAP_EVIDENCE
+        n = self._n_neighbors
+        if 'channel_active_gf' in data:
+            ch_active = data['channel_active_gf'][:n]
+            ch_evidence = data['channel_evidence_gf'][:n]
+            mch_active = data['map_channel_active']
+            mch_evidence = data['map_channel_evidence']
+        else:
+            S = map_lanes.shape[0] + map_crosswalks.shape[0] + route_lanes.shape[0]
+            ch_active = np.zeros((n, NUM_CHANNELS), dtype=bool)
+            ch_evidence = np.zeros((n, NUM_EVIDENCE), dtype=np.float32)
+            mch_active = np.zeros((S, NUM_MAP_CHANNELS), dtype=bool)
+            mch_evidence = np.zeros((S, NUM_MAP_EVIDENCE), dtype=np.float32)
+
+        return (ego, neighbors, map_lanes, map_crosswalks, route_lanes, ego_future_gt,
+                neighbors_future_gt, c_lat_candidates, c_lat_candidates_global,
+                ch_active, ch_evidence, mch_active, mch_evidence)
 
 
 def imitation_loss(gmm, scores, ground_truth):

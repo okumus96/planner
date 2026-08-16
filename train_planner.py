@@ -56,6 +56,13 @@ def read_batch(batch, device):
     ego_future = batch[5].to(device).float()
     neighbors_future = batch[6].to(device).float()
     c_lat_candidates = batch[7].to(device).float()
+    # Predicate kanallari (DrivingData 9-12; channels branch) -- inputs SOZLUGUNUN icinde
+    # tasinir ki read_batch imzasi ve cagri yerleri degismesin (model inputs'u zaten aliyor).
+    if len(batch) > 12:
+        inputs["channel_active"] = batch[9].to(device).bool()
+        inputs["channel_evidence"] = batch[10].to(device).float()
+        inputs["map_channel_active"] = batch[11].to(device).bool()
+        inputs["map_channel_evidence"] = batch[12].to(device).float()
     return inputs, ego_future, neighbors_future, c_lat_candidates
 
 
