@@ -74,6 +74,14 @@ class DrivingData(Dataset):
         c_lat_candidates = data['c_lat_candidates']
         c_lat_candidates_global = data['c_lat_candidates_global'] if 'c_lat_candidates_global' in data else data['c_lat_candidates']
 
+        # Karar etiketleri (dod_meta / H): HAM aday sirasiyla, sort'tan ONCE hesaplanmali —
+        # koridor-goreli lane-change tespiti aday 0 = ego'nun seridi varsayimina dayanir;
+        # asagidaki lateral sort aday 0'i "en soldaki" yapar ve etiketi bozardi (geometrik
+        # fallback'in kavisli yollarda %14.8 yanlis-lateral urettigi olculdu). GT-turevi ->
+        # model-bagimsiz, cache damgasi gerekmez.
+        from .decision_labels import decision_labels_single
+        dec_lon, dec_lat = decision_labels_single(ego_future_gt, c_lat_candidates)
+
         # Adaylari uzamsal sol->sag sirala (ordinal + kararli indeks). Etiket
         # (get_expert_mode_index) geometri-argmin tabanli oldugundan bu re-sort'tan
         # bagimsiz dogru kalir; sadece indeks numarasi degisir. plannerv2 inference'ta
@@ -101,7 +109,8 @@ class DrivingData(Dataset):
 
         return (ego, neighbors, map_lanes, map_crosswalks, route_lanes, ego_future_gt,
                 neighbors_future_gt, c_lat_candidates, c_lat_candidates_global,
-                ch_active, ch_evidence, mch_active, mch_evidence)
+                ch_active, ch_evidence, mch_active, mch_evidence,
+                np.int64(dec_lon), np.int64(dec_lat))
 
 
 def imitation_loss(gmm, scores, ground_truth):

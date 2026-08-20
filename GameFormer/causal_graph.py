@@ -35,7 +35,7 @@ from .relevance_graph import (
     PolylineEncoder, build_edge_features, _polyline_pose_and_valid, EDGE_FEATURE_DIM,
     NODE_TYPE_EGO, NODE_TYPE_VEHICLE, NODE_TYPE_PEDESTRIAN, NODE_TYPE_BICYCLE,
 )
-from .channels import (compute_channels, compute_map_channels,
+from .channels import (compute_channels, compute_map_channels, select_ego_corridor,
                        NUM_CHANNELS, NUM_EVIDENCE, NUM_MAP_CHANNELS, NUM_MAP_EVIDENCE,
                        CH_COLLISION_COURSE, CH_SHARES_INTERSECTION, CH_MERGES)
 
@@ -350,6 +350,12 @@ class EgoCausalLayer(nn.Module):
                 z = has_any[:, None, None].float()
                 M_cas_h = torch.nan_to_num(M_cas_h) * z
                 M_cfd_h = torch.nan_to_num(M_cfd_h) * z
+            if getattr(self, 'uniform_mask', False):
+                # RULES-ONLY baseline: kural hangi girdinin softmax'a girecegini secer,
+                # AGIRLIK ogrenilmez -- gate'ten gecen girdiler uzerinde uniform. Confound
+                # dali dokunulmadan birakilir (plan yolunda degil).
+                u = valid.float()[:, :, None].expand_as(M_cas_h)
+                M_cas_h = u / u.sum(dim=1, keepdim=True).clamp(min=1.0)
             cas = (M_cas_h.unsqueeze(-1) * msg).sum(dim=1).reshape(B, self.dim)   # [B,D]
             cfd = (M_cfd_h.unsqueeze(-1) * msg).sum(dim=1).reshape(B, self.dim)
 
@@ -418,6 +424,10 @@ class EgoCausalLayer(nn.Module):
         M_cfd_h = torch.nan_to_num(M_cfd_h) * z
         M_cas_h = M_cas_h.view(B, S, R, H).masked_fill(~entry_valid[..., None], 0.0)
         M_cfd_h = M_cfd_h.view(B, S, R, H).masked_fill(~entry_valid[..., None], 0.0)
+        if getattr(self, 'uniform_mask', False):
+            # RULES-ONLY: yanan (kaynak, kanal) girdileri uzerinde uniform agirlik
+            u = entry_valid[..., None].float().expand_as(M_cas_h)
+            M_cas_h = u / u.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
         cas = (M_cas_h[..., None] * msg).sum(dim=(1, 2)).reshape(B, self.dim)
         cfd = (M_cfd_h[..., None] * msg).sum(dim=(1, 2)).reshape(B, self.dim)
         M_cas_typed = M_cas_h.mean(-1)                                    # [B,S,R] (head-ort)
@@ -653,11 +663,14 @@ class EgoCausalDisentangler(nn.Module):
             ego_speed = torch.norm(agent_pose[:, 0, 3:5], dim=-1)                       # [B]
             ref_xy = ref_v = None
             if ref_path is not None:
-                # SADECE aday 0. get_candidate_paths ego'ya mesafeye gore SIRALI dondurur
-                # (state_lattice_path_planner.py:55), data_process ayni sirayla yazar -> index 0 =
-                # ego'nun UZERINDE bulundugu seridin yolu. Diger 4'u alternatif rotalar; hepsini
-                # birlestirmek route_lanes'teki hatanin aynisi olurdu (sahnelerin %81'i 2-5 adayli).
-                rp = ref_path[:, 0, :, :2].float()                                      # [B,R,2]
+                # SADECE ego-seridi adayi (2026-08-18: sabit "aday 0" varsayimi kaldirildi --
+                # select_ego_corridor, ego konumuna projeksiyon ile seridinden baslayan adayi
+                # secer; sira-bagimsiz, lateral-sortlu loader c_lat'inda da dogru calisir).
+                # Diger adaylar alternatif rotalar; hepsini birlestirmek route_lanes'teki
+                # hatanin aynisi olurdu (sahnelerin %81'i 2-5 adayli).
+                _sel = select_ego_corridor(ref_path)                                    # [B]
+                rp = ref_path[torch.arange(ref_path.shape[0], device=ref_path.device),
+                              _sel][..., :2].float()                                    # [B,R,2]
                 ref_v = rp.abs().sum(-1) > 1e-6
                 ref_xy = rp
             conf = _conflict_features(neighbor_futures[:, :N], neighbor_states[:, :N],
@@ -736,13 +749,22 @@ class CausalEgoHead(nn.Module):
     baglami YOK (yoksa harita-gate anlamsiz olurdu). GMMPredictor + imitation (WTA GMM).
     """
 
-    def __init__(self, dim=256, modes=6, dropout=0.1, num_maneuvers=5):
+    def __init__(self, dim=256, modes=6, dropout=0.1, num_maneuvers=5,
+                 dod_meta=False, num_lon=9, num_lat=7):
         super().__init__()
         self.dim, self.modes = dim, modes
+        self.dod_meta = bool(dod_meta)
         self.mode_query = nn.Embedding(modes, dim)
-        # DOD (CP III-C): tahmin edilen manevra karari (b* = argmax psi_cas) decoder query'sine besleniyor.
+        # DOD (CP III-C): tahmin edilen karar (b* = argmax psi) decoder query'sine besleniyor.
         # decision_emb[b*] her mode query ile birlesip MLP'den gecer -> q_enh = MLP([q_mode; theta_b*]).
-        self.decision_emb = nn.Embedding(num_maneuvers, dim)
+        # dod_meta (H): 5-sinif geometrik manevra YERINE factored (lon x lat) meta-aksiyon
+        # (nuReasoning taksonomisi, decision_labels.py). Iki embedding TOPLANIR ve AYNI porttan
+        # girer -> karar slotu TEK kalir (paralel yol yok, b*-swap falsification testi temiz).
+        if self.dod_meta:
+            self.decision_emb_lon = nn.Embedding(num_lon, dim)
+            self.decision_emb_lat = nn.Embedding(num_lat, dim)
+        else:
+            self.decision_emb = nn.Embedding(num_maneuvers, dim)
         self.q_enh = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU(), nn.Linear(dim, dim))
         self.cross = CrossTransformer(dim=dim, dropout=dropout)
         self.predictor = GMMPredictor(modalities=modes)
@@ -755,8 +777,13 @@ class CausalEgoHead(nn.Module):
         ctx_pad = torch.zeros(B, 2, dtype=torch.bool, device=f_cas.device)       # ikisi de gecerli
         q = self.mode_query.weight[None].expand(B, -1, -1)                       # [B,M,D]
         if b_star is not None:
-            # DOD: her mode query'ye tahmin edilen manevra kararini (embedding) besle.
-            dec = self.decision_emb(b_star)[:, None].expand(-1, self.modes, -1)  # [B,M,D]
+            # DOD: her mode query'ye tahmin edilen karari (embedding) besle.
+            if self.dod_meta:
+                b_lon, b_lat = b_star                                            # ([B], [B])
+                dec_vec = self.decision_emb_lon(b_lon) + self.decision_emb_lat(b_lat)
+            else:
+                dec_vec = self.decision_emb(b_star)
+            dec = dec_vec[:, None].expand(-1, self.modes, -1)                    # [B,M,D]
             q = self.q_enh(torch.cat([q, dec], dim=-1))                          # [B,M,D] karar-hizali query
         content = self.cross(q, ctx, ctx, mask=ctx_pad)                          # [B,M,D]
         traj, score = self.predictor(content.unsqueeze(1))                       # [B,1,M,80,4], [B,1,M]
@@ -769,8 +796,10 @@ class CausalPlanner(nn.Module):
     def __init__(self, dim=256, heads=8, layers=3, modes=6, dropout=0.1, nbr_enrich=0, num_maneuvers=5,
                  recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax',
                  conflict_feats=0, conflict_bias=0, compute_conflict=0, aligned_mode='straight',
-                 ego_residual=1, gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all'):
+                 ego_residual=1, gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
+                 dod_meta=0, num_lon=9, num_lat=7, uniform_mask=0):
         super().__init__()
+        self.dod_meta = bool(dod_meta)
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
                                                   gate=gate, conflict_feats=conflict_feats,
                                                   conflict_bias=conflict_bias,
@@ -779,16 +808,23 @@ class CausalPlanner(nn.Module):
                                                   gate_trust=gate_trust)
         for _l in self.disentangler.layers:
             _l.ego_residual = bool(ego_residual)
+            _l.uniform_mask = bool(uniform_mask)      # rules-only baseline (inference-time)
         # compute_conflict: feature'lar edge'e girmese/bias olmasa bile hesaplansin (loss icin)
         self.disentangler.compute_conflict = bool(compute_conflict or conflict_feats or conflict_bias)
         self.disentangler.aligned_mode = aligned_mode
-        self.head = CausalEgoHead(dim, modes, dropout, num_maneuvers=num_maneuvers)
+        self.head = CausalEgoHead(dim, modes, dropout, num_maneuvers=num_maneuvers,
+                                  dod_meta=dod_meta, num_lon=num_lon, num_lat=num_lat)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
         # trivial cozuyor (gradyan 0 -> f_cfd sekillenmez). Paylasinca head causal'i dogru tahmin etmek
         # ZORUNDA -> hile yapamaz -> uniform baskisi f_cfd FEATURE'larina akar -> entropy CANLI kalir.
-        # Cikti = 5-sinif MANEVRA (CP get_decision.py) -- SABIT/ogrenilebilir hedef (WTA m* DEGIL).
-        self.psi = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_maneuvers))
+        # Cikti = 5-sinif MANEVRA (CP get_decision.py) VEYA dod_meta=1'de factored (lon x lat)
+        # meta-aksiyon ciftleri (decision_labels.py) -- her iki durumda SABIT GT-turevi hedef.
+        if self.dod_meta:
+            self.psi_lon = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_lon))
+            self.psi_lat = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_lat))
+        else:
+            self.psi = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_maneuvers))
 
         # STEP 2 -- f_cfd COLLAPSE FIX. Olculen kusur: fcfd_var/fcas_var ~ 1e-4 (3 kosuda), yani
         # f_cfd her sahnede AYNI vektor. Sebep: loss ondan tek sey istiyor ("manevrayi ele verme"),
@@ -835,10 +871,19 @@ class CausalPlanner(nn.Module):
         # STEP 2b: komsu gelecekleri YALNIZ f_cfd'den (f_cas'a bakmadan) -> f_cfd sahne icerigi tasimali.
         nbr_pred = self.nbr_head(f_cfd).view(-1, self.num_neighbors, self.future_steps, 2)
 
-        # DOD: psi'yi head'den ONCE hesapla; tahmin edilen manevra karari (b*) decoder query'sine besle.
-        psi_cas = self.psi(f_cas)
-        psi_cfd = self.psi(f_cfd)
-        b_star = psi_cas.argmax(-1)                                      # [B] (argmax non-diff -> psi'ye sizmaz)
+        # DOD: psi'yi head'den ONCE hesapla; tahmin edilen karar (b*) decoder query'sine besle.
+        psi_cas = psi_cfd = None
+        psi_lon_cas = psi_lat_cas = psi_lon_cfd = psi_lat_cfd = None
+        if self.dod_meta:
+            psi_lon_cas, psi_lat_cas = self.psi_lon(f_cas), self.psi_lat(f_cas)
+            psi_lon_cfd, psi_lat_cfd = self.psi_lon(f_cfd), self.psi_lat(f_cfd)
+            b_star = (psi_lon_cas.argmax(-1), psi_lat_cas.argmax(-1))   # (argmax non-diff -> psi'ye sizmaz)
+            b_cfd = (psi_lon_cfd.argmax(-1), psi_lat_cfd.argmax(-1))
+        else:
+            psi_cas = self.psi(f_cas)
+            psi_cfd = self.psi(f_cfd)
+            b_star = psi_cas.argmax(-1)                                  # [B] (argmax non-diff -> psi'ye sizmaz)
+            b_cfd = psi_cfd.argmax(-1)
 
         # ANA plan: head'e TEMIZ ego (ego_clean) + SADECE f_cas + karar-embedding girer. f_cas artik
         # gate'li ajan+harita tasir -> trajectory yalnizca causal ajanlar+harita+ego+karara bagli.
@@ -847,7 +892,7 @@ class CausalPlanner(nn.Module):
         # Tanı/ablasyon amaçlı: f_cfd'den de bir plan üret (aynı EĞİTİLMİŞ head ile). Varsayılan KAPALI.
         traj_cfd = score_cfd = None
         if also_cfd_plan:
-            traj_cfd, score_cfd = self.head(f_cfd, dis['ego_clean'], psi_cfd.argmax(-1))
+            traj_cfd, score_cfd = self.head(f_cfd, dis['ego_clean'], b_cfd)
 
         out = {
             'traj': traj, 'score': score,
@@ -861,10 +906,14 @@ class CausalPlanner(nn.Module):
             'M_cas_map_ent': dis['M_cas_map_ent'], 'M_cas_map_headent': dis['M_cas_map_headent'],
             'M_cfd_map_ent': dis['M_cfd_map_ent'], 'M_cfd_map_headent': dis['M_cfd_map_headent'],
             'f_cas': f_cas, 'f_cfd': f_cfd,
+            'ego_clean': dis['ego_clean'],     # b*-swap/CF: head'i disaridan farkli b* ile yeniden cagirmak icin
             'nbr_valid': dis['nbr_valid'],
             'gate_cos': dis['gate_cos'],                   # katman-basina cos(f_cas, h_ego)
-            'psi_cas': psi_cas,                    # PAYLASILAN head -> manevra (L_KLD, informative)
+            'psi_cas': psi_cas,                    # PAYLASILAN head -> manevra (L_KLD, informative); dod_meta'da None
             'psi_cfd': psi_cfd,                    # AYNI head -> uniform (L_ENT); hile yapamaz -> entropy canli
+            # dod_meta (H): factored karar logitleri (dod_meta=0'da None)
+            'psi_lon_cas': psi_lon_cas, 'psi_lat_cas': psi_lat_cas,
+            'psi_lon_cfd': psi_lon_cfd, 'psi_lat_cfd': psi_lat_cfd,
             'recon_pred': recon_pred,              # STEP 2: [f_cas(dropout'lu); f_cfd] -> f_all tahmini
             'f_all': dis['f_all'],                 # STEP 2: hedef (loss'ta DETACH edilir)
             'nbr_pred': nbr_pred,                  # STEP 2b: f_cfd -> komsu gelecekleri [B,N,80,2]

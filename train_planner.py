@@ -63,6 +63,11 @@ def read_batch(batch, device):
         inputs["channel_evidence"] = batch[10].to(device).float()
         inputs["map_channel_active"] = batch[11].to(device).bool()
         inputs["map_channel_evidence"] = batch[12].to(device).float()
+    # Karar etiketleri (dod_meta / H; DrivingData 13-14) -- model girdisi DEGIL, loss hedefi;
+    # imza degismesin diye inputs sozlugunde tasinir (model bilinmeyen anahtari okumaz).
+    if len(batch) > 14:
+        inputs["decision_lon"] = batch[13].to(device).long()
+        inputs["decision_lat"] = batch[14].to(device).long()
     return inputs, ego_future, neighbors_future, c_lat_candidates
 
 
@@ -77,6 +82,14 @@ def freeze_gameformer(gameformer):
 # GT ego-future'dan turetilen SABIT manevra etiketi. Bedava (GT'den), per-agent label YOK.
 _MANEUVER = {'stationary': 0, 'straight': 1, 'turning_left': 2, 'turning_right': 3, 'U-turn_left': 4}
 NUM_MANEUVERS = 5
+
+# --- dod_meta (H): factored (lon x lat) meta-aksiyon DOD'u (decision_labels.py) ---
+# CE agirliklari ve lon_merge remap'i; main() bayraklara gore gunceller (varsayilan tam 9 sinif).
+from GameFormer.decision_labels import (LON_CE_WEIGHT, LAT_CE_WEIGHT, LON_MERGE_MAP,
+                                        LON_MERGED_CE_WEIGHT, NUM_LON, NUM_LAT, NUM_LON_MERGED)
+_LON_W = torch.tensor(LON_CE_WEIGHT, dtype=torch.float32)
+_LAT_W = torch.tensor(LAT_CE_WEIGHT, dtype=torch.float32)
+_LON_REMAP = None      # lon_merge=1 -> LongTensor[9], etiketleri 6 sinifa katlar
 
 
 def _resample_arc(xy, n):
@@ -135,7 +148,7 @@ def maneuver_labels(ego_future):
 def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0,
                             neighbors_future=None, lambda_nbr=0.0, lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
                             lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5,
-                            lambda_conflict=0.0, conflict_terms='all'):
+                            lambda_conflict=0.0, conflict_terms='all', dec_labels=None):
     """Causal-Planner'a SADIK loss (ref: ~/Causal-Planner lightning_trainer.py). Backdoor/GRL YOK.
 
     CP'nin toplami:
@@ -156,18 +169,42 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
     Doner (loss, metrics_dict)."""
     gt = ego_future[:, None]                                       # [B, 1, 80, 3]
     l_traj, _, best_mode = imitation_loss(out['traj'], out['score'], gt)
-    m_star = maneuver_labels(ego_future)                          # [B] SABIT GT-manevra etiketi (0..4)
-    K = out['psi_cas'].shape[-1]                                   # = NUM_MANEUVERS
+    dod_meta = out.get('psi_lon_cas') is not None
 
-    # --- decision_loss (CP): causal dal GT manevrasini bilsin (m* = kararsiz WTA mod DEGIL) ---
-    l_kld = F.cross_entropy(out['psi_cas'], m_star)
+    def _uniform_ci(logits):
+        """KL(uniform || p) + entropi -- CP decision_causal_inference_loss'un cekirdegi."""
+        lp = F.log_softmax(logits, dim=-1)
+        u = torch.ones_like(logits) / logits.shape[-1]
+        kl = F.kl_div(input=lp, target=u, reduction='batchmean', log_target=False)
+        e = -(lp.exp() * lp).sum(-1).mean()
+        return kl, e
 
-    # --- decision_causal_inference_loss (CP): KL(uniform || p_cfd) + 0.1*(-H) ---
-    log_p_cfd = F.log_softmax(out['psi_cfd'], dim=-1)
-    target_uniform = torch.ones_like(out['psi_cfd']) / K
-    l_kl = F.kl_div(input=log_p_cfd, target=target_uniform, reduction='batchmean', log_target=False)
-    ent = -(log_p_cfd.exp() * log_p_cfd).sum(-1).mean()            # H(p_cfd), tavan = ln K
-    l_ci = l_kl + 0.1 * (-ent)
+    if dod_meta:
+        # --- dod_meta (H): factored (lon x lat) karar, AGIRLIKLI CE (80:1 dengesizlik) ---
+        # Etiketler loader'dan (GT-turevi, ham-aday-sirali koridorla; decision_labels.py).
+        # Iki head'in terimleri ORTALANIR ki lambda_kld/lambda_ci olcekleri 5-sinif kosularla
+        # karsilastirilabilir kalsin.
+        lon_star, lat_star = dec_labels
+        if _LON_REMAP is not None:                                 # lon_merge: 9 -> 6 sinif
+            lon_star = _LON_REMAP.to(lon_star.device)[lon_star]
+        w_lon = _LON_W.to(out['psi_lon_cas'].device)
+        w_lat = _LAT_W.to(out['psi_lat_cas'].device)
+        l_kld = 0.5 * (F.cross_entropy(out['psi_lon_cas'], lon_star, weight=w_lon)
+                       + F.cross_entropy(out['psi_lat_cas'], lat_star, weight=w_lat))
+        kl1, e1 = _uniform_ci(out['psi_lon_cfd'])
+        kl2, e2 = _uniform_ci(out['psi_lat_cfd'])
+        l_kl, ent = 0.5 * (kl1 + kl2), 0.5 * (e1 + e2)
+        l_ci = l_kl + 0.1 * (-ent)
+        m_star = None
+    else:
+        m_star = maneuver_labels(ego_future)                      # [B] SABIT GT-manevra etiketi (0..4)
+
+        # --- decision_loss (CP): causal dal GT manevrasini bilsin (m* = kararsiz WTA mod DEGIL) ---
+        l_kld = F.cross_entropy(out['psi_cas'], m_star)
+
+        # --- decision_causal_inference_loss (CP): KL(uniform || p_cfd) + 0.1*(-H) ---
+        l_kl, ent = _uniform_ci(out['psi_cfd'])
+        l_ci = l_kl + 0.1 * (-ent)
 
     # --- soft_mask_loss (CP): her iliski icin comp+excl+norm, sonra iliskiler TOPLANIR ---
     def _soft_mask(M_cas, M_cfd, valid):
@@ -274,8 +311,15 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
         fde = torch.norm(traj_xy[:, :, -1] - gt_xy[:, :, -1], dim=-1)  # [B, M]
         minfde = fde.gather(1, best[:, None]).mean().item()
 
-        cas_acc = (out['psi_cas'].argmax(-1) == m_star).float().mean().item()   # yuksek olmali
-        cfd_acc = (out['psi_cfd'].argmax(-1) == m_star).float().mean().item()   # ~1/K (bilgisiz olmali)
+        if dod_meta:
+            # iki factored head'in ortalama dogrulugu (yuksek olmali / ~sans olmali)
+            cas_acc = 0.5 * ((out['psi_lon_cas'].argmax(-1) == lon_star).float().mean()
+                             + (out['psi_lat_cas'].argmax(-1) == lat_star).float().mean()).item()
+            cfd_acc = 0.5 * ((out['psi_lon_cfd'].argmax(-1) == lon_star).float().mean()
+                             + (out['psi_lat_cfd'].argmax(-1) == lat_star).float().mean()).item()
+        else:
+            cas_acc = (out['psi_cas'].argmax(-1) == m_star).float().mean().item()   # yuksek olmali
+            cfd_acc = (out['psi_cfd'].argmax(-1) == m_star).float().mean().item()   # ~1/K (bilgisiz olmali)
         nvb = out['nbr_valid']
         # M_cas komsular uzerinde dagilim -> mean yaniltici, PEAK'e bak.
         mcas_peak = out['M_cas'].masked_fill(~nvb, 0.0).max(-1).values.mean().item()   # en causal ajan
@@ -320,8 +364,14 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
         # ENTROPI MAKASI (CP lightning_trainer.py:232-236 ile ayni mantik): causal dal PEAKED
         # (dusuk entropi, decision_loss ile denetleniyor), confound dal UNIFORM (yuksek entropi).
         # Ayrisma = aradaki makas. casent'i olcmeden makasi goremiyorduk; asil izlenecek sayi bu.
-        log_p_cas = F.log_softmax(out['psi_cas'], dim=-1)
-        casent = -(log_p_cas.exp() * log_p_cas).sum(-1).mean().item()
+        if dod_meta:
+            lp1 = F.log_softmax(out['psi_lon_cas'], dim=-1)
+            lp2 = F.log_softmax(out['psi_lat_cas'], dim=-1)
+            casent = 0.5 * (-(lp1.exp() * lp1).sum(-1).mean()
+                            - (lp2.exp() * lp2).sum(-1).mean()).item()
+        else:
+            log_p_cas = F.log_softmax(out['psi_cas'], dim=-1)
+            casent = -(log_p_cas.exp() * log_p_cas).sum(-1).mean().item()
         entgap = ent.item() - casent                     # BUYUK olmali (cfd tavanda, cas dipte)
 
     metrics = {
@@ -387,7 +437,9 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                                                          neighbors_future, lambda_nbr,
                                                          lambda_budget, budget_rho, budget_lo,
                                                          lambda_bc, lambda_peak, peak_tau,
-                                                         lambda_conflict, conflict_terms)
+                                                         lambda_conflict, conflict_terms,
+                                                         dec_labels=(inputs.get('decision_lon'),
+                                                                     inputs.get('decision_lat')))
 
             if train:
                 optimizer.zero_grad()
@@ -409,6 +461,13 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
 
 
 def model_training(args):
+    # dod_meta + lon_merge: CE agirliklarini ve etiket remap'ini birlesik siniflara gecir
+    # (loss fonksiyonu modul-global _LON_W/_LON_REMAP uzerinden okur).
+    global _LON_W, _LON_REMAP
+    if args.dod_meta and args.lon_merge:
+        _LON_W = torch.tensor(LON_MERGED_CE_WEIGHT, dtype=torch.float32)
+        _LON_REMAP = torch.tensor(LON_MERGE_MAP, dtype=torch.long)
+
     log_path = f"./training_log/{args.name}/"
     os.makedirs(log_path, exist_ok=True)
     initLogging(log_file=log_path + "train.log")
@@ -444,7 +503,10 @@ def model_training(args):
                            nbr_enrich=args.nbr_enrich,
                            gate_channels=args.gate_channels, typed_kv=args.typed_kv,
                            channel_evidence=args.channel_evidence,
-                           gate_trust=args.gate_trust).to(args.device)
+                           gate_trust=args.gate_trust,
+                           dod_meta=args.dod_meta,
+                           num_lon=(NUM_LON_MERGED if args.lon_merge else NUM_LON),
+                           num_lat=NUM_LAT).to(args.device)
 
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 12, 14, 16, 18], gamma=0.5)
@@ -539,6 +601,13 @@ if __name__ == "__main__":
                         help="channels: 9/8-dim kanal kaniti edge'e concat")
     parser.add_argument("--gate_trust", type=str, default="all", choices=["all", "reliable"],
                         help="reliable: zayif-IoU kanallar (collision/intersect/merges) GATE kararina sayilmaz")
+    parser.add_argument("--dod_meta", type=int, default=0,
+                        help="H: DOD karar slotu 5-sinif geometrik manevra YERINE factored (lon x lat) "
+                             "meta-aksiyon (nuReasoning taksonomisi, decision_labels.py; lon ilk 4s / "
+                             "lat tam 8s, koridor-goreli LC). psi -> psi_lon+psi_lat, agirlikli CE.")
+    parser.add_argument("--lon_merge", type=int, default=0,
+                        help="dod_meta ile: quickly/gently katla (9 -> 6 lon sinifi). psi_lon confusion "
+                             "matrisi ayrimi ogrenemezse acilir; extractor'a dokunmaz.")
     parser.add_argument("--ego_residual", type=int, default=1,
                         help="1 = f_cas = LN(out_fc + h_ego) (CP Eq 6, varsayilan) | 0 = residual YOK, "
                              "ego bilgisi f_cas'a yalniz self_fea uzerinden girer")
