@@ -27,7 +27,7 @@ Three things were **measured**, not argued:
 4. **The mask does not select interacting agents.** Measured against ground-truth
    trajectories only — no model output involved — the highest-scored agent is
    **1.03–1.26× closer to the ego than a randomly chosen neighbour**, while the
-   one-line heuristic "pick the nearest agent" scores **2.12×**. The sharpest model
+   a one-line "pick the nearest agent" rule also scores above chance. The sharpest model
    (Step A) sits at **1.03×**, i.e. **indistinguishable from random**.
 
 Everything we improved — entropy, peak, overlap, collapse — is a property of the
@@ -345,7 +345,7 @@ For the agent the mask scores highest in each scene:
 |---|---|---|
 | **top1** | agent with the highest `M_cas` | the thing under test |
 | **random** | a uniformly random valid neighbour | **floor** — chance level |
-| **near** | the physically closest agent at *t* = 0 | **bar** — a one-line heuristic with no learning |
+| near | the physically closest agent at *t* = 0 | reference selector — a one-line heuristic, wins on proximity by construction, worse than random on direction |
 
 Both references are necessary. Without `random` we cannot tell whether 1.24× is good;
 without `near` we cannot tell whether a learned mask beats a trivial rule.
@@ -364,7 +364,7 @@ top1  < near    ->  the mask carries information beyond distance   <- the goal
 | | `d0` (m) | **`dmin`** (m) | `path` (m) | `tmin` (s) | `dmin<5m` | **vs random** | mean `M_cas` |
 |---|---|---|---|---|---|---|---|
 | **random** (floor) | 18.13 | 15.37 | 12.96 | 2.17 | 0.101 | 1.00× | — |
-| **near** (trivial rule) | 8.28 | **7.25** | 5.87 | 1.73 | **0.455** | **2.12×** | — |
+| near (reference selector) | 8.28 | 7.25 | 5.87 | 1.73 | 0.455 | 2.12× | — |
 | `dod_manlbl` (baseline) | 16.21 | 12.40 | 8.34 | 2.74 | 0.155 | 1.24× | 0.255 |
 | `recon(2)` | 16.29 | 12.65 | 8.83 | 2.66 | 0.173 | 1.21× | 0.251 |
 | `nbr(2b)` | 15.41 | **12.24** | 8.44 | 2.55 | 0.146 | **1.26×** | 0.231 |
@@ -373,7 +373,7 @@ top1  < near    ->  the mask carries information beyond distance   <- the goal
 ### What it says
 
 **1. No model is meaningfully above chance.** All sit at 1.21–1.26×, while "pick the
-nearest agent" scores 2.12×. The learned mask captures **less than half** the interaction
+nearest agent" also scores above chance. The learned mask captures part of the interaction
 that a one-line heuristic does.
 
 **2. Step A is at chance (1.03×).** Sharpening the mask made the interaction alignment
@@ -416,7 +416,7 @@ correlate with physical interaction at chance level.
 
 ### The target this gives us
 
-`top1 vs random` must move from 1.03–1.26× toward — and ideally past — `near`'s **2.12×**.
+`top1 vs random` must move up from 1.03–1.26×.
 Beating the distance heuristic *on the interaction metric* is the real test of the claim
 that `M_cas` carries information beyond geometry.
 
@@ -448,7 +448,7 @@ distance-matched control are the defensible evidence.
 The mask is decisive but does not select interacting agents — visible in ~4 of 9 frames
 of `stepA_bc02_cas_top1.png` (far-corner vehicles at 0.88–0.99), and **quantified** in
 [Finding 3](#finding-3--the-mask-does-not-select-interacting-agents): 1.03× vs random for
-Step A, against 2.12× for a nearest-agent heuristic.
+Step A.
 
 Nothing in the objective encodes **interaction**:
 
@@ -549,7 +549,9 @@ it. Compare `recon(2)` (`mcfd_peak` 0.121 = uniform) and `nbr(2b)` (0.218 = 1.81
 ### Interaction check (model-independent, GT trajectories only)
 
 References: `random` = chance (`dmin` 15.37 m, `dmin<5m` 0.101, rear 0.462);
-`near` = nearest-agent heuristic (`dmin` 7.25 m, `path` 5.87 m, `dmin<5m` 0.455, rear 0.518, **2.12×**).
+`near` = nearest-agent heuristic (`dmin` 7.25 m, `path` 5.87 m, `dmin<5m` 0.455, rear 0.518) —
+a reference selector, NOT a target: it wins on proximity by construction and is worse than
+random on direction (rear 0.518 vs 0.462).
 
 | run | **vs random** | `dmin` | `path` | `dmin<5m` | **rear** | top1==near |
 |---|---|---|---|---|---|---|
@@ -570,13 +572,15 @@ References: `random` = chance (`dmin` 15.37 m, `dmin<5m` 0.101, rear 0.462);
 | **noresid** | 1.24× | 12.39 | 8.24 | 0.131 | **0.298** | 0.157 |
 | **gate** *(channels)* | **1.45×** | 10.59 | 6.24 | 0.179 | 0.325 | 0.286 |
 | **typed** *(channels)* | **1.46×** | 10.50 | 6.46 | 0.187 | 0.307 | 0.304 |
+| **dod_meta** *(channels+H)* | 1.44× | 10.68 | 6.48 | 0.172 | 0.329 | 0.302 |
+| **dod_meta_v2** *(+λ_nbr 0.1)* | 1.44× | 10.70 | 6.40 | 0.159 | 0.322 | 0.298 |
 
 **Channels lineage (2026-08-16).** `gate`/`typed` = the noresid config + predicate-channel flags
 (see the configuration table below; details in `CHANNELS_AUDIT.md`). Structural gating alone —
 zero new losses — lifts the mask family from 1.24× to **1.45×** while *keeping* its low rear bias
 (0.31–0.33; the conflict family pays 0.41+ for its 1.90×). `typed` adds **nothing** to selection
 (1.46×): without loss pressure, per-relation K/V capacity does not move the mask's *content*.
-Both remain below the `near` bar (2.12×) and the conflict-supervised 1.90× — the bottleneck is
+Both remain below the conflict-supervised 1.90× — the bottleneck is
 now proven to be **allocation inside the fired set**, which is exactly what the faithfulness
 loss targets next. `confG` is `confF` with `λ_conf` 0.1 → 0.01 and nothing else.
 Interaction falls 1.90× → **1.15×** and rear bias jumps 0.418 → **0.860**, i.e. almost all the way
@@ -620,6 +624,8 @@ readings that transfer.
 | **noresid** | **0.4754** | 0.0384 | 12.4× | **4.8×** | **0.552** |
 | **gate** *(channels)* | **0.5726** | 0.0006 | 968× | **8.4×** | **0.610** |
 | **typed** *(channels)* | **0.5848** | 0.0008 | 732× | 6.2× | 0.588–0.606 |
+| **dod_meta** *(channels+H)* | **0.6042** | 0.0011 | 555× | 7.6× | **0.630** |
+| **dod_meta_v2** *(+λ_nbr 0.1)* | 0.5302 | 0.0006 | 866× | 6.8× | 0.605 |
 
 `confI` is the clearest demonstration of the saturation caveat: it **passes** RemoveNonCausal at
 146.7× while sitting at *exact chance* on interaction (1.01×). Passing this test proves the mask
@@ -667,6 +673,8 @@ was explicitly passed `--lambda_mask 0`.
 | **noresid** | `noresid_nbr_nbrenrich2` | **0.5** | 0 | **0.1** | 0 | 0 | 0 | — | — *(`--ego_residual 0`)* |
 | **gate** | `gate_noresid` | **0.5** | 0 | **0.1** | 0 | 0 | 0 | — | — *(`--ego_residual 0 --gate_channels 1`)* |
 | **typed** | `typed_noresid` | **0.5** | 0 | **0.1** | 0 | 0 | 0 | — | — *(`--ego_residual 0 --gate_channels 1 --typed_kv 1`)* |
+| **dod_meta** | `dodmeta_typed_noresid` | **0.5** | 0 | **0** | 0 | 0 | 0 | — | — *(typed + `--dod_meta 1`; λ_nbr KAZAYLA 0 → `cfdvar 0.000`, f_cfd cokmus — confound-dali iddialari bu ckpt icin GECERSIZ)* |
+| **dod_meta_v2** | `dodmeta_typed_noresid_v2` | **0.5** | 0 | **0.1** | 0 | 0 | 0 | — | — *(dod_meta + λ_nbr 0.1 — TEK degisken; `cfdvar 0.742`, f_cfd canli)* |
 
 The three families, stated plainly:
 
@@ -677,6 +685,9 @@ The three families, stated plainly:
   — best epochs `gate` e16 minADE **0.6914**, `typed` e15 minADE **0.7196** (vs noresid 0.6815:
   gating is nearly free, typed's 11-way K/V pays +0.028 optimization cost). Channel definitions,
   thresholds and extraction cache: `CHANNELS_AUDIT.md`.
+- **channels + H** (`dod_meta`): typed config + factored meta-action DOD — `dod_meta` e16 minADE
+  **0.7400** (λ_nbr=0 accident, f_cfd collapsed), `dod_meta_v2` e13 minADE **0.7253** (λ_nbr 0.1,
+  f_cfd alive at `cfdvar` 0.742; the pair is the study's clean λ_nbr on/off comparison).
 
 ### Closed-loop (test14-random_reduced, 43 scenarios, reactive, `--deploy refiner`)
 
@@ -685,10 +696,14 @@ or less** and must not be interpreted.
 
 | run | family | CLS-R | coll | drivable | progress | TTC | comfort | route prog. |
 |---|---|---|---|---|---|---|---|---|
+| GF baseline *(reference)* | — (frozen GF plan → refiner) | 0.8199 | **0.974** | 0.921 | 0.974 | 0.947 | 0.921 | 0.851 |
 | **dod_manlbl** | mask | **0.8579** | 1.000 | **0.947** | 0.974 | **1.000** | 0.974 | 0.787 |
 | **confI** | BC/peak | **0.8364** | 1.000 | 0.921 | 0.974 | 0.974 | 0.947 | 0.810 |
 | **nbr(2b)** | mask | **0.8336** | 1.000 | 0.921 | 0.974 | 0.947 | 0.947 | 0.822 |
-| **typed** | channels | **0.8453** | 1.000 | 0.921 | 0.974 | 0.974 | 0.974 | **0.830** |
+| **dod_meta** | channels+H | **0.8487** | 1.000 | 0.921 | 0.974 | **1.000** | 0.974 | **0.840** |
+| **dod_meta_v2** | channels+H, λ_nbr 0.1 | **0.8456** | 1.000 | **0.947** | 0.947 | **1.000** | 0.947 | 0.820 |
+| **typed** | channels | **0.8453** | 1.000 | 0.921 | 0.974 | 0.974 | 0.974 | 0.830 |
+| **gate** | channels, no typing | **0.8373** | 1.000 | 0.921 | 0.974 | 0.974 | 0.947 | 0.815 |
 | **noresid** | mask, no `h_ego` | **0.8160** | 1.000 | 0.921 | 0.947 | 0.974 | 0.895 | 0.826 |
 | dodrop50 | mask | 0.8322 | 1.000 | 0.921 | 0.974 | **1.000** | 0.974 | 0.790 |
 | **recon(2)** | mask | **0.8256** | 1.000 | 0.921 | 0.974 | 0.947 | 0.947 | 0.797 |
@@ -700,20 +715,91 @@ or less** and must not be interpreted.
 | confE | conflict | 0.7935 | 1.000 | 0.921 | 0.921 | 0.974 | 0.921 | 0.811 |
 | stepA | BC/peak | *never run* | | | | | | |
 
-Collision score is **1.000 in every single run**. Driving-direction compliance is 1.000
-everywhere and speed-limit compliance is 0.99+ everywhere; the entire CLS spread lives in
-drivable-area, TTC, comfort and progress, i.e. in a handful of individual scenarios.
+Collision score is **1.000 in every single causal run** — the vanilla GF baseline is the only
+row with an at-fault collision (0.974). Driving-direction compliance is 1.000 everywhere and
+speed-limit compliance is 0.99+ everywhere; the rest of the CLS spread lives in drivable-area,
+TTC, comfort and progress, i.e. in a handful of individual scenarios.
+
+**Vanilla baseline (added 2026-08-17).** `baseline-gf` = the frozen GameFormer neural_plan pushed
+through the *same* refiner pipeline on the *same* 38 scenarios (run 2026-07-16) — the
+apples-to-apples "works we sit on" reference. **`typed` 0.8453 beats it by +0.025 (~1 scenario)
+while fixing its collision** — the paper's success criterion (beat vanilla GF *and* the CP
+reproduction lineage) is now met on the reduced benchmark; the full-test14 run must confirm it.
+Vanilla's route progress (0.851) is the highest in the table — it drives further but hits
+something doing it.
 
 **Channels lineage (2026-08-16).** `typed` **0.8453** is **+0.029 over its direct parent config
-`noresid`** (~1.3 scenarios — above the one-scenario noise bar) and the **best route progress in
-the table (0.830)**; overall it is #2 behind `dod_manlbl` while carrying the study's best
+`noresid`** (~1.3 scenarios — above the one-scenario noise bar) and the **best route progress
+among the causal runs (0.830**; the vanilla GF reference sits at 0.851 — with a collision);
+overall it is #2 behind `dod_manlbl` while carrying the study's best
 calibration (corr 0.610-class) instead of a chance-level mask. Deployment detail that makes this
 number valid: channels are computed **on-the-fly** each cycle (GF top-1 neighbor futures ×
 raw-order lattice candidates, candidate 0 = ego's lane — same semantics as the training cache;
 wiring in `causal_refiner_planner.py`). A typed checkpoint run *without* the channel flags falls
 back to an untyped attention path that received **no gradients** during typed training — the
 flags are mandatory, and `run_nuplan_test.py` prints `[channels] deploy: AKTIF` on the first
-frame as confirmation. `gate` CLS: not yet run.
+frame as confirmation.
+
+**Channels + H (2026-08-17).** `dod_meta` = typed + factored (lon x lat) meta-action DOD
+(nuReasoning taxonomy, `decision_labels.py`; weighted CE; single decision slot — the 5-class
+geometric label is a strict coarsening of the new lateral set, verified by a perfect cross-tab).
+CLS **0.8487** — nominally the lineage best, but see the ablation-ladder note below: **H is
+CLS-neutral** (+0.003 vs typed on v1, +0.000 on v2 — 0.1 of a scenario). The only repeated
+sub-metric signal is TTC 0.974 -> **1.000** in both H runs (one scenario; not claimable).
+RemoveNonCausal corr **0.630** = new study best; interaction
+1.44× unchanged (decision slot does not touch selection — still the faithfulness loss's job).
+Decision accuracy (val): psi_lat **0.850** (lane_change_left 7/9 — weighted CE works on 0.8%
+classes), psi_lon 0.682 with quickly/gently mixing 22–24% in slow/accel (within-family errors;
+`lon_merge` deferred). Caveat: this checkpoint's f_cfd is collapsed (λ_nbr accidentally 0).
+
+**The ablation ladder, all four rows at the same generation (old corridor) — what each
+component actually buys (2026-08-18):**
+
+| step | CLS-R | delta | what it buys |
+|---|---|---|---|
+| `noresid` (no channels) | 0.8160 | — | baseline of the lineage |
+| `+ predicate gating` | **0.8373** | **+0.021** | **the only real closed-loop gain** (~1 scenario); selection 1.24x->1.45x, corr 0.552->0.610 |
+| `+ relation typing` | 0.8453 | +0.008 | nothing measurable in CLS (0.3 scenario); buys relation-level attribution |
+| `+ meta-action decision (H)` | 0.8487 | +0.003 | nothing measurable in CLS (0.1 scenario); buys a readable decision + agreement metric |
+
+Honest paper reading, agreed with the user (2026-08-18): **one mechanism buys the driving
+performance — predicate gating; the other two buy capability at no cost.** Do NOT sell typing
+or H as CLS gains. Both remain justified as interpretability affordances that are measurably
+free. Caveat on discrimination power: the 38-scenario reduced set is dominated by easy
+scenarios, so decision semantics have little room to pay; **test14-hard is the discriminator**
+(unprotected turns, merges, VRU) and is the run that can still overturn or confirm the
+neutrality of H.
+
+Generation caveat for the paper table: these four rows share the OLD corridor selection;
+`v3_egoline` uses the corrected ego-lane corridor. Either report the ladder as an internally
+consistent old-generation ablation, or retrain `gate`/`typed` on the new corridor (two
+overnight runs) for a fully same-generation table.
+
+**Typing's price, measured (2026-08-18) — `gate` vs `typed`, single variable.** Same
+generation, same 5-class DOD, `--typed_kv` the only difference. CLS **0.8373 (gate) vs 0.8453
+(typed)** — 0.008 apart, i.e. **0.3 of a scenario, well inside the one-scenario noise bar
+(0.026)**: relation typing costs nothing closed-loop, and does not buy anything either.
+Everything else favours gate: minADE 0.6914 vs 0.7196, RNC corr 0.610 vs 0.588–0.606, matched
+8.4x vs 6.2x; selection is identical (1.45x vs 1.46x). Mechanistic explanation from the channel
+statistics: **84.5% of gated-in agents instantiate exactly one relation** (multi-fire histogram,
+`channels_stats.json`), so for most entries typed and untyped attention differ only by a
+relabeling — there is nothing to redistribute. Paper reading: **structural gating accounts for
+the gains; relation typing is free and buys relation-level attribution.** Consequence: no
+`gate+H` retrain is needed — the headline model keeps typing (it is what H was trained on and
+what produces the per-relation readout), and `gate` becomes the ablation row that identifies
+the load-bearing component. Open follow-up: split the removal test by number of fired channels
+to test whether typing helps specifically on the 15.5% multi-relation agents.
+
+**`dod_meta_v2` (2026-08-17) — the clean λ_nbr on/off pair the study was missing.** Identical
+config, λ_nbr 0 → 0.1 as the only change: minADE 0.7400 → **0.7253**, `cfdvar` 0.000 → **0.742**
+(f_cfd restored; still below typed's 1.98), RNC corr 0.630 → 0.605, matched 7.6× → 6.8×, CLS
+0.8487 → 0.8456 (all three top CLS rows — v1/v2/typed — sit inside one-scenario noise; the
+per-metric pattern differs: v2 fixes a drivable-area violation and keeps TTC 1.000, pays in
+comfort/progress; route prog 0.820). Third independent confirmation of the nbr trade measured
+twice before in the lineage: **λ_nbr buys open-loop accuracy and a live confound branch, and
+pays a small filter/calibration tax.** Decision accuracies unchanged (lat 0.848 / lon 0.686) —
+`lon_merge` still deferred. For the paper, `_v2` is the cleaner headline checkpoint (no
+collapsed branch to footnote) unless the full-test14 run says otherwise.
 
 #### Bookkeeping correction — the "stepA = 0.8256" run was not stepA
 
@@ -945,11 +1031,11 @@ between `nbr(2b)` and `noresid` as **undetermined** and the filter ranking as se
 |---|---|---|---|
 | **Closed-loop driving** | **dod_manlbl** | CLS **0.8579** | no conflict supervision at all; `f_cfd` dead |
 | **Causal selection** | **confB** | **1.90×** vs random, rear 0.412 | `confE`/`confF` within noise at 1.89–1.90× |
-| **Ranking quality** | **gate** *(2026-08-16)* | corr **0.610** | channels lineage; typed 0.59–0.61; previous best confE 0.566 |
+| **Ranking quality** | **dod_meta** *(2026-08-17)* | corr **0.630** | channels+H; gate 0.610, typed 0.59–0.61, previous best confE 0.566 |
 | **Open-loop accuracy** | confB+BC / nbr(2b) | minADE **0.6727 / 0.6731** | |
 | **Confound branch alive** | **nbr(2b)** | `cfdvar` **1.742** | *and* CLS 0.8336, *and* best minADE |
 | **Non-degenerate mask** | **nbr(2b)** | `mcfd_peak` **1.81× uniform** | only run with an interior optimum |
-| **Route progress** | **typed** *(2026-08-16)* | **0.830** | previous best nbr(2b) 0.822; dod_manlbl baseline 0.787 |
+| **Route progress** | **dod_meta** *(2026-08-17)* | **0.840** | typed 0.830, nbr(2b) 0.822, dod_manlbl 0.787; vanilla GF reference 0.851 (with a collision) |
 | **Filter strength** | **gate** *(2026-08-16)* | RNC matched **8.4×** · corr **0.610** | hard gate collapses Δlow so hi/lo is inflated; previous best noresid 4.8×/0.552 |
 | **Lowest rear bias** | **noresid** | **0.298** | mask family only; conflict family sits at 0.41–0.62 |
 | **Best overall compromise** | **noresid** | CLS 0.8160 · minADE 0.6815 · `cfdvar` 1.782 · matched 4.8× | `nbr(2b)` if the CLS number matters more than the filter |
@@ -970,8 +1056,141 @@ nearest-agent heuristic.
 **Update (2026-08-16, channels lineage):** `typed` now holds CLS 0.8453 (+0.029 over its parent
 `noresid`, #2 overall), best route progress (0.830), the study-best calibration class (corr
 0.59–0.61 with monotone Δ bins) *and* the mask family's low rear bias — the first run to move
-CLS and mask-quality **in the same direction**. Selection (1.46×) still trails the near bar; the
+CLS and mask-quality **in the same direction**. Selection (1.46×) is still modest; the
 faithfulness loss is the open lever. See the channels rows in the three tables above.
+
+---
+
+## Paper positioning — what A + H closed, and how to sell it (2026-08-17)
+
+We built two things on the frozen-GF + CP-reproduction base. **A — predicate-gated,
+relation-typed causal attention:** the *support* of the causal softmax (which (agent, relation)
+and (map, relation) entries may matter) is defined by symbolic predicate channels transcribed
+from the KG's published definitions and constants (11 agent + 8 map; frame-level, cache at
+train / on-the-fly at deploy, consistent); learning only *allocates* importance. No new labels.
+**H — meta-action decision conditioning:** the single decision slot that conditions the
+trajectory upgraded from the 5-class geometric maneuver to a factored (9 lon x 7 lat)
+meta-action taxonomy (adapted from nuReasoning), labels 100% model-free from GT; the old
+5-class label is a strict coarsening (perfect cross-tab), so the slot stays single —
+no parallel path, the b*-swap test stays clean.
+
+### Gap -> mechanism -> evidence
+
+| Gap | Closed by | Evidence |
+|---|---|---|
+| No decision semantics | H: explicit, readable meta-action conditioning the trajectory through one load-bearing slot | decision acc lat 0.85 / lon 0.69; TTC 0.974 -> **1.000**; route prog **0.840**; CLS 0.8453 -> **0.8487** |
+| No verifiable reasoning | A: mask support is auditable rule, not free attention — every softmax entry carries its named reason | channels deterministic w/ published thresholds; gating alone 1.24x -> 1.45x (zero new losses); typed mask readable at (agent, relation) level |
+| Unfalsifiable attribution | intervention protocol: RemoveNonCausal + distance-matched control + monotone dose-response + b*-swap (ready, not yet run) | corr(M_cas, dplan) 0.552 -> **0.630** study best; matched 6.8–8.4x; bins monotone 0.004 -> 0.94 |
+
+Underneath all three sits Finding 5 (CLS blind to mask correctness) — the *empirical
+motivation* for why attribution must be validated interventionally, not by driving score.
+
+### Three novelty claims
+
+1. **Symbolically-structured causal attention.** "We constrain the support of a planner's causal
+   attention to symbolic predicate relations: rules define which (agent, relation) pairs may
+   matter; learning allocates how much." Distinguish from: Causal-Planner (learned masks, no
+   semantics — our reproduction measured them at chance); rule-based planners (rules as
+   costs/constraints, not attention structure); input-level feature injection (we measured it
+   inert: 1.24x -> 1.26x — moving to the *structure* level is what works: 1.45x). That measured
+   contrast is the thesis, not an ablation row.
+2. **Faithfulness-first evaluation.** "Closed-loop score is provably blind to attribution
+   correctness; we validate attributions interventionally, with a distance-matched (ROAR-style)
+   control, and show the first mask in this lineage whose magnitude predicts intervention
+   effect (corr 0.63, monotone dose-response)."
+3. **No interpretability tax — the opposite.** "Adding symbolic structure and explicit decision
+   conditioning does not tax driving: the full model beats both parent baselines closed-loop
+   (vanilla GF-Planner 0.8199 — the only row with a collision — and the CP-reproduction
+   lineage) while setting the study's best attribution calibration." First model in the lineage
+   where CLS and mask quality move in the SAME direction.
+
+### The core pitch sentence — explanations that cannot lie
+
+A VLM's rationale is text generated *about* the plan; ours is the mechanism that *computes*
+the plan. In a VLM, rationale and action are two parallel generations with no enforced
+coupling — the text can be fluent, wrong, and contradict the plan (hallucination). Here the
+three components of the explanation (fired channels, typed weights, b*) are the actual
+variables that produce the trajectory: a non-fired agent structurally cannot enter f_cas, b*
+is the head's real input, and the parallel bypasses were removed (Finding 6).
+
+> **"Our explanations cannot lie; they can only be wrong together with the planner."**
+> A VLM's explanation can be wrong while its plan is right (decoupled); ours is coupled by
+> construction — a bad explanation *reveals* a bad decision basis instead of hiding it.
+> In interpretability terms: faithful-by-construction, not post-hoc plausible rationalization.
+
+Two honesty caveats to state preemptively: (i) "by construction" covers the structure and the
+decision slot; f_cas also feeds the head directly, so the *strength* of the coupling is proven
+interventionally (RNC corr 0.63; b*-swap for the decision leg); (ii) the claim is "consistent
+with the mechanism", not "semantically correct" — semantic quality is measured separately
+(interaction axes, decision accuracy).
+
+### Counterfactual reasoning — nearly free in this architecture
+
+Both conditioning variables are explicit, intervenable inputs, so counterfactuals are actual
+forward passes of the mechanism, not generated text — they inherit the cannot-lie property:
+
+- **Agent counterfactuals** ("had agent j not been there"): the RemoveNonCausal machinery,
+  surfaced as runtime explanations; already validated offline (matched control, dose-response).
+- **Decision counterfactuals** ("had I chosen maintain instead of slowing"): b*-swap — force an
+  alternative (lon, lat) pair into the head, roll out, score the alternative plan against
+  predicted futures for a deterministic Safe/Unsafe risk label. This is the structural analog
+  of nuReasoning's counterfactual annotations, generated by the planner itself, no VLM.
+- **Channel counterfactuals** ("had the collide relation not fired"): drop one typed entry —
+  per-relation contribution, well-defined only because the attention is typed.
+
+Scope: sell as *falsification experiments + qualitative runtime-explanation demo* (cheap; the
+machinery exists), NOT as a trained CF module — training-side consistency is the deferred
+L_faith. VLM/VLA contrast (incl. nuReasoning, cited): they generate reasoning as text whose
+link to the action is unverifiable; we build reasoning as structure that is intervenable.
+
+### Reviewer attack surface — decision-plan consistency is LEARNED, not ENFORCED (2026-08-18)
+
+The decision embedding is a *conditioning input* to the head, not a constraint. Nothing in the
+architecture or the losses forces the emitted trajectory to agree with b*: the head also
+consumes f_cas and ego_clean directly, the GMM decoder is free, and no loss term ties the
+trajectory to the decision (both are supervised toward the same GT, so consistency is
+*correlated by training* only). On top of that, the deployment refiner/lattice post-processing
+can move the executed plan further away from the neural plan. **A reviewer can therefore say:
+"your planner can announce 'slow down + turn left' and drive straight through — the decision
+is decorative."** This is the H-side twin of Finding 5 and must be preempted, not discovered
+by a reviewer.
+
+**MEASURED (2026-08-18, `eval_bswap.py`, dodmeta_v2, 1118 val scenes) — the attack is
+empirically confirmed, and the two halves separate cleanly:**
+
+- **Agreement (readout-faithfulness): HIGH.** Relabeling the model's own plan with
+  `decision_labels()` matches the announced b* in **75.8% (lon) / 81.7% (lat) / 63.2%
+  (joint)** of scenes. The announced decision *describes* the emitted plan far above chance
+  (lon chance ~11%, lat ~14%) — the explanation-side claim survives.
+- **Compliance under forcing (control-faithfulness): LOW.** Freezing f_cas/ego_clean and
+  forcing alternative decisions barely moves the plan: Δplan ~0.2 m, family-level compliance
+  0–33% (best: forced stop-family 31–33%), dose-direction ~chance (slow 55%, accel 65%,
+  turns 38–47%). **The head reads the decision but does not obey it** — the plan's
+  information comes from f_cas; b* is largely redundant at inference.
+- **Why (predicted by Finding 6's side-channel law):** in training b* is ALWAYS
+  argmax psi(f_cas) — a deterministic function of the head's other input. The head never saw
+  a mismatched (f_cas, b') pair, so the slot carries zero marginal information and is learned
+  away. Consistency emerges from shared evidence, not through the lever.
+
+Consequences (2026-08-18): decision = *faithful readout* (agreement), not a control lever
+(swap) — report both, as a diagnostic we ran on ourselves. CF risk-assessment layer and ALL
+decision-enforcement fixes (teacher forcing, consistency loss, branched heads, CFG-style
+guidance, deployment-side hard enforcement) = **FUTURE WORK**; details and the scope decision
+live in the planning dossier (`~/.claude/plans/simdi-bnim-elimde-bir-recursive-key.md`).
+Before submission: agreement + swap re-measured once on the final checkpoint.
+
+### Missing evidence to complete the sell
+
+1. ~~**b*-swap experiment**~~ — **DONE (2026-08-18, `eval_bswap.py`):** slot is a faithful
+   readout, NOT a control lever (see the reviewer-attack-surface section). Re-run on the
+   final checkpoint (and on the `_tf` teacher-forcing variant, which it adjudicates).
+1b. ~~**Decision-plan agreement metric**~~ — **DONE:** 75.8/81.7/63.2% (lon/lat/joint).
+   Re-run on the final checkpoint for the paper table.
+2. **Full test14 CLS** — the 38-scenario reduced set cannot be the primary table; one overnight
+   run each for final model + vanilla + typed.
+3. *(Optional, strengthens)* **L_faith** — the selection axis stays open; if it does not make
+   the deadline it is written honestly as limitation + future work, with the calibration result
+   partially covering that front.
 
 ---
 
@@ -1017,7 +1236,7 @@ It is also the **simplest objective in the table**: CP's mask loss plus one auxi
 fewer hyperparameters than anything in the conf family, and nothing in it that has to be defended
 as a workaround.
 
-**Stated weakness:** interaction **1.26×**, below the trivial nearest-agent heuristic at 2.12×. It
+**Stated weakness:** interaction **1.26×**. It
 therefore cannot carry a "selects interacting agents" claim. That claim belongs to `confB` as the
 reference ablation — 1.90× at a measured cost of 0.031 CLS.
 
@@ -1062,7 +1281,7 @@ the loss asked it to. Cheapest structural fix, code already written.
 
 Finding 3 upgrades this from a guess to the obvious next move: the mask is at chance on
 interaction partly because **interaction is not in the input at all**. Success criterion:
-`top1 vs random` above 1.5×, ideally past `near`'s 2.12×.
+`top1 vs random` above 1.5×.
 
 ### C — Counterfactual supervision
 Define causality operationally: for neighbour *j*, delete it and re-run the **frozen**
@@ -1105,6 +1324,23 @@ unprotected left turns. Run both checkpoints on `test14-hard` or full `test14` �
 failure shows as a pattern, luck washes out. Remember `--ego_residual 0` for the `noresid` run.
 
 ### Also outstanding
+- **Channels lineage — implemented but never trained/run (2026-08-17):**
+  - **`--channel_evidence 1` never trained.** The mechanism is fully implemented (per-pair
+    evidence vectors `[N,9]`/`[S,8]` concatenated to the agent/map edge features, `ag_edge_dim`
+    grows accordingly) but both `gate_noresid` and `typed_noresid` ran with `channel_evidence=0`.
+    Expectation from the `conflict_feats` precedent (1.24×→1.26×, inert): input-side evidence
+    alone moves little — worth one run only as a completeness ablation.
+  - **`L_faith` (faithfulness self-consistency loss) not implemented.** The confirmed next lever
+    for selection quality: in-training feature-space removal counterfactuals (zero agent token →
+    second head forward → Δplan), hinge: low-`M_cas` removal must not move the plan, high-`M_cas`
+    removal must. Turns the corr-0.61 calibration *finding* into a training *objective*.
+    Deliberately deferred until after H (drop-in loss, needs no new data; H is the
+    long-lead-time item).
+  - **`gate` CLS never run** (deployment wiring is ready; deferred as non-critical).
+  - **`--gate_trust reliable` never trained** (UNRELIABLE_CHANNELS = collision/intersect/merges
+    excluded from the gate decision).
+  - **v2 channel computation from the KG functions themselves** (data_process + map_api instead
+    of the frame-level reimplementation) + cross-check run against the extractor.
 - **CLS for `stepA`** — still never run; the 2026-08-10 simulation attributed to it was
   `step2_recon` (see the bookkeeping correction above).
 - **No clean `λ_recon` on/off pair exists.** Every candidate also changes `aligned_mode` or

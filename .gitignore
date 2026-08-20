@@ -6,3 +6,6 @@ testing_log/
 training_log/
 # viz ciktilari (binary png) repoya girmesin
 viz_out/
+*.png
+*.jpg
+*.json
