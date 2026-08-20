@@ -172,11 +172,10 @@ def plot_scene(ax, s, mode, thr, topn, branch="cas", show_channels=False):
     _draw_car(ax, s["ego"][0], s["ego"][1], s["ego"][2], 4.8, 2.0,
               facecolor="#222222", edgecolor="black", lw=1.0, z=6)
     ax.plot(s["ego_plan"][:, 0], s["ego_plan"][:, 1], "--", color="#2ca02c", lw=1.8, zorder=7)
-    # DOD karari: head'in kullandigi b* = argmax psi_cas (modelin TAHMINI, GT degil).
+    # DOD karari: head'in kullandigi b* (modelin TAHMINI, GT degil). dod_meta'da "lon + lat" cifti.
     # Panel kose etiketi (ego uzerine yazinca komsu ajan etiketleriyle cakisiyordu).
-    if s.get("dod") is not None:
-        b, p = s["dod"]
-        ax.text(0.02, 0.97, f"DOD: {MANEUVER_SHORT[b]} ({p:.2f})", transform=ax.transAxes,
+    if s.get("dod_text"):
+        ax.text(0.02, 0.97, s["dod_text"], transform=ax.transAxes,
                 color="#1b5e20", fontsize=7, ha="left", va="top", fontweight="bold", zorder=9,
                 bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.2))
 
@@ -267,14 +266,34 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
         M_cas_map = out[map_key]; map_valid = out["map_valid"]
         # typed (ajan,kanal) maskesi [B,N,R] (typed_kv=0 ise None); dal ile tutarli anahtar
         M_typed = out.get("M_cas_typed" if branch == "cas" else "M_cfd_typed")
-        # DOD karari: head'in query'sine giden b* = argmax psi_cas (+softmax guveni)
-        psi_prob = torch.softmax(out["psi_cas"], dim=-1)                 # [B,K]
-        dod_idx = psi_prob.argmax(-1)                                    # [B]
+        # DOD karari: head'in query'sine giden b* (+softmax guveni). dod_meta'da factored (lon x lat).
+        if out.get("psi_cas") is not None:
+            psi_prob = torch.softmax(out["psi_cas"], dim=-1)             # [B,K]
+            dod_idx = psi_prob.argmax(-1)                                # [B]
+            dod_texts = [f"DOD: {MANEUVER_SHORT[int(dod_idx[b])]} ({float(psi_prob[b, dod_idx[b]]):.2f})"
+                         for b in range(dod_idx.shape[0])]
+        else:
+            from GameFormer.decision_labels import LON_CLASSES, LAT_CLASSES, LON_MERGED_CLASSES
+            lon_names = LON_MERGED_CLASSES if out["psi_lon_cas"].shape[-1] == len(LON_MERGED_CLASSES) else LON_CLASSES
+            p1 = torch.softmax(out["psi_lon_cas"], dim=-1)
+            p2 = torch.softmax(out["psi_lat_cas"], dim=-1)
+            i1, i2 = p1.argmax(-1), p2.argmax(-1)
+            dod_texts = [f"DOD: {lon_names[int(i1[b])]} ({float(p1[b, i1[b]]):.2f}) + "
+                         f"{LAT_CLASSES[int(i2[b])]} ({float(p2[b, i2[b]]):.2f})"
+                         for b in range(i1.shape[0])]
         actors = enc["actors"][:, :, -1]
         traj_key, score_key = ("traj_cfd", "score_cfd") if branch == "cfd" else ("traj", "score")
         traj = out[traj_key][:, 0, :, :, :2]
         best = out[score_key][:, 0].argmax(-1)
-        ref0 = ref_path[:, ref_idx, :, :2]                       # [B,R,2] lattice planner referans yolu (aday 0)
+        if ref_idx < 0:
+            # otomatik: ego'nun SERIDINDEN baslayan aday (2026-08-18; loader'in lateral sort'u
+            # yuzunden sabit indeks yanlis seridi cizebiliyordu -- "koridor baska seritten
+            # basliyor" gorunumunun sebebi buydu)
+            from GameFormer.channels import select_ego_corridor
+            _sel = select_ego_corridor(ref_path)
+            ref0 = ref_path[torch.arange(ref_path.shape[0], device=ref_path.device), _sel][..., :2]
+        else:
+            ref0 = ref_path[:, ref_idx, :, :2]                   # [B,R,2] manuel aday secimi
         ego_spd = torch.norm(actors[:, 0, 3:5], dim=-1)     # [B] anlik ego hizi
         reach = (ego_spd * 0.1 * 80).clamp(min=10.0)        # L_conflict'teki reach ile AYNI formul
         dims = inputs["neighbor_agents_past"][:, :, -1, 6:8]
@@ -307,8 +326,8 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
                               if out.get("ch_active") is not None else None),
                 # typed (ajan,kanal) M agirliklari [N,R] (typed_kv=0 -> None; per-agent M = satir toplami)
                 "M_typed": (M_typed[b].cpu().numpy() if M_typed is not None else None),
-                # DOD: (manevra sinifi, softmax guveni) -- psi_cas'ten, modelin tahmini
-                "dod": (int(dod_idx[b]), float(psi_prob[b, dod_idx[b]])),
+                # DOD: hazir-formatli etiket metni (5-sinif VEYA dod_meta lon+lat) -- modelin tahmini
+                "dod_text": dod_texts[b],
                 # arka plan stillemesi icin poly tip sayilari (lanes, crosswalks, routes)
                 "map_counts": (inputs["map_lanes"].shape[1], inputs["map_crosswalks"].shape[1],
                                inputs["route_lanes"].shape[1]),
@@ -334,7 +353,7 @@ def main(args):
     gameformer.load_state_dict(torch.load(args.pretrained_path, map_location=dev))
     gameformer = gameformer.to(dev); freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust).to(dev)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9)).to(dev)
     # strict=False: eski checkpoint'ler (ornegin Step 2 oncesi) cfd_recon agirliklarini icermez.
     # O modul viz yolunda HIC kullanilmaz, o yuzden eksik olmasi zararsiz -- ama ne eksikse yazdir,
     # sessizce gercek bir uyumsuzlugu yutmayalim.
@@ -432,14 +451,19 @@ if __name__ == "__main__":
     p.add_argument("--decoder_levels", type=int, default=2)
     p.add_argument("--graph_layers", type=int, default=1)
     p.add_argument("--nbr_enrich", type=int, default=0)
-    p.add_argument("--ref_idx", type=int, default=0,
-                   help="c_lat_candidates icinden hangi aday cizilecek (0 = ego'ya en yakin)")
+    p.add_argument("--ref_idx", type=int, default=-1,
+                   help="-1 (varsayilan) = ego'nun seridinden baslayan aday OTOMATIK secilir "
+                        "(select_ego_corridor); >=0 = manuel aday indeksi")
     p.add_argument("--show_channels", type=int, default=0,
                    help="1 = her ajanin altina yanan predicate kanallarini yaz (ahead/near/vru...)")
     p.add_argument("--gate_channels", type=int, default=0)
     p.add_argument("--typed_kv", type=int, default=0)
     p.add_argument("--channel_evidence", type=int, default=0)
     p.add_argument("--gate_trust", type=str, default="all", choices=["all", "reliable"])
+    p.add_argument("--dod_meta", type=int, default=0,
+                   help="ckpt hangi degerle egitildiyse o: factored (lon x lat) meta-aksiyon DOD'u")
+    p.add_argument("--lon_merge", type=int, default=0,
+                   help="ckpt lon_merge=1 ile egitildiyse o (6 lon sinifi)")
     p.add_argument("--ego_residual", type=int, default=1,
                    help="checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)")
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"],
