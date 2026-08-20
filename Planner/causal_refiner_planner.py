@@ -27,7 +27,8 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 class CausalRefinerPlanner(PlannerV2):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
                  use_causal=True, remove='none', remove_k=1, plan_source='cas', nbr_enrich=0, ego_residual=1,
-                 gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all', device=None):
+                 gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
+                 dod_meta=0, lon_merge=0, uniform_mask=0, device=None):
         super().__init__(model_path=causal_path, device=device, debug=False,
                          debug_dir=None, debug_max_plots=0, oracle_mode=False)
         self._backbone_path = backbone_path
@@ -45,6 +46,10 @@ class CausalRefinerPlanner(PlannerV2):
         self._typed_kv = typed_kv
         self._channel_evidence = channel_evidence
         self._gate_trust = gate_trust
+        # dod_meta (H): ckpt hangi degerle egitildiyse o (psi_lon/psi_lat + factored embedding'ler)
+        self._dod_meta = dod_meta
+        self._lon_merge = lon_merge
+        self._uniform_mask = uniform_mask
         self._ch_logged = False          # ilk frame'de kanal durumunu bir kez yazdir
         self._ch_missing_warned = False  # kanal istendi ama ref path yok uyarisi (bir kez)
         self._use_causal = use_causal    # neural_plan: CausalPlanner (True) vs GameFormer (False)
@@ -97,7 +102,10 @@ class CausalRefinerPlanner(PlannerV2):
         self.causal = CausalPlanner(layers=self._graph_layers, modes=self._modes, nbr_enrich=self._nbr_enrich,
                                     ego_residual=self._ego_residual,
                                     gate_channels=self._gate_channels, typed_kv=self._typed_kv,
-                                    channel_evidence=self._channel_evidence, gate_trust=self._gate_trust)
+                                    channel_evidence=self._channel_evidence, gate_trust=self._gate_trust,
+                                    dod_meta=self._dod_meta,
+                                    num_lon=(6 if self._lon_merge else 9),
+                                    uniform_mask=self._uniform_mask)
         # strict=False: model sonradan modul kazandi (gate_bias, nbr_head, cfd_recon); eski checkpoint'ler
         # bu anahtarlari icermez. Ucu de PLAN YOLUNUN DISINDA: gate_bias yalniz gate='sigmoid' dalinda
         # okunur (planner softmax kurar), nbr_head/cfd_recon yalniz egitim loss'larini besler. Yine de
@@ -112,17 +120,15 @@ class CausalRefinerPlanner(PlannerV2):
     def _channels_ref_path(self, ego_state, traffic_light_data):
         """Kanal hesabi icin aday rotalar [1,5,P,6] — extract_channels/cache ile AYNI semantik.
 
-        HAM lattice sirasi kullanilir (aday 0 = ego'nun UZERINDE bulundugu seridin yolu,
-        get_candidate_paths mesafe-sirali dondurur — data_process npz'yi ayni sirayla yazdi ve
-        kanal cache'i o siradan hesaplandi). DOD yolundaki sort_candidates_by_lateral BILEREK
-        uygulanmaz: kanallar aday-0'in "ego koridoru" olmasina dayanir, sol->sag siralama bunu bozar.
-        Rota yoksa (aday 0 bos) None doner -> kanallar o frame hesaplanamaz.
+        Ego-koridoru adayini compute_channels icindeki select_ego_corridor secer (2026-08-18:
+        sabit aday-0 varsayimi kaldirildi; secim sira-bagimsiz, lattice sirasi fark etmez).
+        Rota yoksa (tum adaylar bos) None doner -> kanallar o frame hesaplanamaz.
         """
         if not (self._gate_channels or self._typed_kv or self._channel_evidence):
             return None
         c_lat, _ = self.get_multimodal_reference_paths2(
             ego_state, traffic_light_data, points_per_route=MAX_LEN * 10)
-        if np.abs(c_lat[0]).sum() < 1e-6:
+        if np.abs(c_lat).sum() < 1e-6:                     # TUM adaylar bos -> rota yok
             return None
         return torch.tensor(c_lat, dtype=torch.float32, device=self._device).unsqueeze(0)
 

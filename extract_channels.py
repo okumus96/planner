@@ -34,7 +34,9 @@ from GameFormer.channels import (compute_channels, compute_map_channels,
                                  NUM_CHANNELS, NUM_EVIDENCE, NUM_MAP_CHANNELS,
                                  CHANNEL_NAMES, MAP_CHANNEL_NAMES)
 
-VERSION = "channels-v1.0"
+# v1.1 (2026-08-18): ego-koridoru adayi select_ego_corridor ile secilir (sabit aday-0 degil).
+# Surum farkli oldugu icin v1.0 damgali dosyalar --force gerekmeden otomatik yeniden basilir.
+VERSION = "channels-v1.1"
 
 
 @torch.no_grad()

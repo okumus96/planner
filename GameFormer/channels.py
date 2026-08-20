@@ -104,9 +104,50 @@ def _wrap(a):
     return torch.atan2(torch.sin(a), torch.cos(a))
 
 
+def select_ego_corridor(ref_path):
+    """ref_path [B,R,P,>=3] -> [B] EGO'NUN SERIDINDEN baslayan aday indeksi.
+
+    "Aday 0 = ego'nun seridi" VARSAYIMI KALDIRILDI (2026-08-18): aday 0 ham npz sirasinda
+    ~%95 ego seridiydi ama garanti degildi; loader'in lateral sort'u gibi yeniden siralamalar
+    altinda tamamen bozuluyordu (viz'de gorulen "koridor baska seritten basliyor" bunun
+    sonucuydu). Kural: her adayi ego konumuna (ego-frame orijini) projeksiyon yap;
+    |d_lat| <= LANE_W/2 ve |heading farki| <= MAP_DIR_RAD saglayanlardan en kucuk |d_lat|'lisi
+    secilir; hicbiri saglamazsa (ego donus ortasinda / rota disi) min-|d_lat| fallback.
+    Secim SIRA-BAGIMSIZ -> ham npz sirasi, lateral-sortlu loader sirasi ve deployment
+    lattice sirasi ayni sonucu verir."""
+    xy = ref_path[..., :2].float()                                  # [B,R,P,2]
+    yaw = ref_path[..., 2].float()
+    valid = xy.abs().sum(-1) > 1e-6                                 # [B,R,P]
+    d = xy.norm(dim=-1).masked_fill(~valid, 1e9)                    # orijine mesafe
+    idx = d.argmin(dim=-1)                                          # [B,R] en yakin nokta
+    g = lambda t: torch.gather(t, 2, idx.unsqueeze(-1)).squeeze(-1)
+    y0, px, py = g(yaw), g(xy[..., 0]), g(xy[..., 1])
+    dlat = (torch.sin(y0) * px - torch.cos(y0) * py).abs()          # |lateral ofset(ego)|
+    hd = torch.atan2(torch.sin(y0), torch.cos(y0)).abs()            # ego heading = 0
+    cand_ok = valid.any(-1)
+    inlane = cand_ok & (dlat <= LANE_W / 2) & (hd <= MAP_DIR_RAD)
+    # Beraberlik kirici (SIRA-BAGIMSIZ): ayni start seridini paylasan adaylar ego'da ayni
+    # |d_lat|'a sahiptir (duz-git vs don, ikisi de ego seridinden baslar) -> argmin tek basina
+    # siraya bagli kalirdi. Ikincil anahtar: ilk 20 m'de ego heading'ine ortalama hizalanma
+    # ("su anki koridor" semantigi); ucuncul: daha uzun aday. Katsayilar olcek ayirici
+    # (dlat metre duzeyinde baskin, hizalanma beraberlikte belirleyici).
+    seg = (xy[:, :, 1:] - xy[:, :, :-1]).norm(dim=-1)               # [B,R,P-1]
+    cum = torch.cat([torch.zeros_like(seg[..., :1]), seg.cumsum(-1)], dim=-1)  # [B,R,P]
+    near20 = valid & (cum <= 20.0)
+    hd_all = torch.atan2(torch.sin(yaw), torch.cos(yaw)).abs()      # [B,R,P]
+    hd20 = ((hd_all * near20).sum(-1) / near20.sum(-1).clamp(min=1))
+    smax = torch.where(valid, cum, torch.zeros_like(cum)).amax(-1)  # [B,R] toplam uzunluk
+    score = dlat + 0.3 * hd20 + 1e-3 * (200.0 - smax.clamp(max=200.0))
+    pick_fb = score.masked_fill(~cand_ok, 1e9).argmin(dim=-1)       # fallback: en iyi skor
+    pick_in = score.masked_fill(~inlane, 1e9).argmin(dim=-1)
+    return torch.where(inlane.any(-1), pick_in, pick_fb)            # [B]
+
+
 def _corridor_arrays(ref_path):
-    """ref_path [B,R,P,>=3] -> aday 0'in (xy [B,P,2], yaw [B,P], cum_s [B,P], valid [B,P])."""
-    r0 = ref_path[:, 0]
+    """ref_path [B,R,P,>=3] -> EGO-SERIDI adayinin (xy [B,P,2], yaw [B,P], cum_s, valid).
+    Aday secimi select_ego_corridor ile (sabit indeks 0 DEGIL)."""
+    sel = select_ego_corridor(ref_path)                             # [B]
+    r0 = ref_path[torch.arange(ref_path.shape[0], device=ref_path.device), sel]
     xy = r0[..., :2].float()
     yaw = r0[..., 2].float()
     valid = xy.abs().sum(-1) > 1e-6
