@@ -122,14 +122,26 @@ class CausalRefinerPlanner(PlannerV2):
 
         Ego-koridoru adayini compute_channels icindeki select_ego_corridor secer (2026-08-18:
         sabit aday-0 varsayimi kaldirildi; secim sira-bagimsiz, lattice sirasi fark etmez).
-        Rota yoksa (tum adaylar bos) None doner -> kanallar o frame hesaplanamaz.
+        Rota yoksa (tum adaylar bos) DUZ KORIDOR sentezlenir (2026-08-20): eskiden None
+        donuyordu -> kanallar kapaniyordu -> model egitimde HIC gormedigi girdiyle calisiyordu
+        (v3: egitilmemis untyped dal; v4: tum bloklar sifir) -> hard sette 0.0'lanan senaryolar.
+        Sentez = "mevcut serit duz devam ediyor" hipotezi (ego-frame +x, -2..120 m); kanallar
+        boylece HER frame hesaplanir, girdi dagilim-ici kalir.
         """
         if not (self._gate_channels or self._typed_kv or self._channel_evidence):
             return None
         c_lat, _ = self.get_multimodal_reference_paths2(
             ego_state, traffic_light_data, points_per_route=MAX_LEN * 10)
-        if np.abs(c_lat).sum() < 1e-6:                     # TUM adaylar bos -> rota yok
-            return None
+        if np.abs(c_lat).sum() < 1e-6:                     # TUM adaylar bos -> sentezle
+            self._synth_frames = getattr(self, '_synth_frames', 0) + 1
+            if self._synth_frames == 1 or self._synth_frames % 100 == 0:
+                print(f"[channels] ref_path yok -> duz koridor sentezlendi "
+                      f"(toplam {self._synth_frames} frame)")
+            P = MAX_LEN * 10
+            synth = np.zeros((5, P, 6), dtype=np.float32)
+            synth[0, :, 0] = np.linspace(-2.0, float(MAX_LEN), P)   # x: -2 m -> 120 m
+            synth[0, :, 4] = 15.0                                    # v_max varsayilan
+            return torch.tensor(synth, dtype=torch.float32, device=self._device).unsqueeze(0)
         return torch.tensor(c_lat, dtype=torch.float32, device=self._device).unsqueeze(0)
 
     @torch.no_grad()
