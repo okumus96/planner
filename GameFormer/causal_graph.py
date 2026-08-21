@@ -428,11 +428,16 @@ class EgoCausalLayer(nn.Module):
             # RULES-ONLY: yanan (kaynak, kanal) girdileri uzerinde uniform agirlik
             u = entry_valid[..., None].float().expand_as(M_cas_h)
             M_cas_h = u / u.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
-        cas = (M_cas_h[..., None] * msg).sum(dim=(1, 2)).reshape(B, self.dim)
-        cfd = (M_cfd_h[..., None] * msg).sum(dim=(1, 2)).reshape(B, self.dim)
+        # ILISKI-BASINA toplam: kaynaklar uzerinde topla, KANALLARI AYIRMA -> [B,R,D].
+        # Eski davranis bunun kanal-toplami (asagida .sum(1)); rel_bottleneck bunu ayri kullanir.
+        cas_rel = (M_cas_h[..., None] * msg).sum(dim=1).reshape(B, R, self.dim)
+        cfd_rel = (M_cfd_h[..., None] * msg).sum(dim=1).reshape(B, R, self.dim)
+        cas = cas_rel.sum(dim=1)
+        cfd = cfd_rel.sum(dim=1)
         M_cas_typed = M_cas_h.mean(-1)                                    # [B,S,R] (head-ort)
         M_cfd_typed = M_cfd_h.mean(-1)
-        return cas, cfd, M_cas_typed.sum(-1), M_cfd_typed.sum(-1), M_cas_typed, M_cfd_typed
+        return (cas, cfd, M_cas_typed.sum(-1), M_cfd_typed.sum(-1), M_cas_typed, M_cfd_typed,
+                cas_rel, cfd_rel)
 
     @staticmethod
     def _per_type(mods, x, types):
@@ -459,10 +464,12 @@ class EgoCausalLayer(nn.Module):
         if self.conflict_bias and conflict is not None:
             cb = (F.softplus(self.conflict_w) * conflict[..., :3]).sum(-1)          # [B,N] >= 0
         M_cas_typed = M_cfd_typed = None
+        ag_cas_rel = ag_cfd_rel = None
         if self.typed_kv and ch_active is not None:
             # TYPED: girdiler = yanan (ajan, kanal); node K/V kanal setinden, edge paylasilir.
             entry_valid = nbr_valid[:, :, None] & ch_active
-            (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag, M_cas_typed, M_cfd_typed) = self._attend_typed(
+            (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag, M_cas_typed, M_cfd_typed,
+             ag_cas_rel, ag_cfd_rel) = self._attend_typed(
                 q_ag, h_nbr, ek_ag, ev_ag, entry_valid, self.Wk_ch, self.Wv_ch,
                 self.attn_cas_ch, self.attn_cfd_ch, conflict_bias=cb)
             ent_cas_mean = ent_cas_headmean = ent_cfd_mean = ent_cfd_headmean = \
@@ -480,9 +487,11 @@ class EgoCausalLayer(nn.Module):
         ek_mp = self.We_k_mp(edge_map).view(B, S, H, dh)
         ev_mp = self.We_v_mp(edge_map).view(B, S, H, dh)
         M_cas_mp_typed = M_cfd_mp_typed = None
+        mp_cas_rel = mp_cfd_rel = None
         if self.typed_kv and mch_active is not None:
             entry_valid_mp = map_valid[:, :, None] & mch_active
-            (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp, M_cas_mp_typed, M_cfd_mp_typed) = self._attend_typed(
+            (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp, M_cas_mp_typed, M_cfd_mp_typed,
+             mp_cas_rel, mp_cfd_rel) = self._attend_typed(
                 q_mp, h_map, ek_mp, ev_mp, entry_valid_mp, self.Wk_mch, self.Wv_mch,
                 self.attn_cas_mch, self.attn_cfd_mch)
             ent_cas_mp_mean = ent_cas_mp_headmean = ent_cfd_mp_mean = ent_cfd_mp_headmean = \
@@ -529,7 +538,8 @@ class EgoCausalLayer(nn.Module):
         return (h_ego_new, f_cas, f_cfd, M_cas_ag, M_cfd_ag, M_cas_mp, M_cfd_mp,
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
                 ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
-                gate_cos, f_all, M_cas_typed, M_cfd_typed, M_cas_mp_typed, M_cfd_mp_typed)
+                gate_cos, f_all, M_cas_typed, M_cfd_typed, M_cas_mp_typed, M_cfd_mp_typed,
+                ag_cas_rel, ag_cfd_rel, mp_cas_rel, mp_cfd_rel, self_fea)
 
 
 class EgoCausalDisentangler(nn.Module):
@@ -707,7 +717,8 @@ class EgoCausalDisentangler(nn.Module):
             (h_ego, f_cas, f_cfd, M_cas, M_cfd, M_cas_mp, M_cfd_mp,
              ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
              ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
-             gate_cos, f_all, M_cas_ty, M_cfd_ty, M_cas_mp_ty, M_cfd_mp_ty) = layer(
+             gate_cos, f_all, M_cas_ty, M_cfd_ty, M_cas_mp_ty, M_cfd_mp_ty,
+             ag_cas_rel, ag_cfd_rel, mp_cas_rel, mp_cfd_rel, self_fea) = layer(
                 h_ego, h_nbr, nbr_types, edge_ego, gated_valid, h_map, edge_map, gated_map_valid,
                 conflict=conf,
                 ch_active=(ch_active if self.typed_kv else None),
@@ -736,6 +747,10 @@ class EgoCausalDisentangler(nn.Module):
             'M_cas_map_typed': M_cas_mp_ty, 'M_cfd_map_typed': M_cfd_mp_ty,
             'gated_valid': gated_valid, 'gated_map_valid': gated_map_valid,
             'ch_active': ch_active, 'mch_active': mch_active,
+            # rel_bottleneck: SON katmanin iliski-basina toplamlari [B,R,D] (+ ego blogu).
+            # Kanal yanmadiysa o blok tam SIFIR -> "bu iliski hicbir sey katmadi".
+            'ag_cas_rel': ag_cas_rel, 'ag_cfd_rel': ag_cfd_rel,
+            'mp_cas_rel': mp_cas_rel, 'mp_cfd_rel': mp_cfd_rel, 'self_fea': self_fea,
             # katman-basina cos(f_cas, h_ego) [B,L] -- ~1'e yakinsa gate marjinal (h_ego bypass'i baskin).
             'gate_cos': gate_cos_stack,
         }
@@ -797,9 +812,13 @@ class CausalPlanner(nn.Module):
                  recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax',
                  conflict_feats=0, conflict_bias=0, compute_conflict=0, aligned_mode='straight',
                  ego_residual=1, gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
-                 dod_meta=0, num_lon=9, num_lat=7, uniform_mask=0):
+                 dod_meta=0, num_lon=9, num_lat=7, uniform_mask=0,
+                 rel_bottleneck=0, rel_block=32, ego_block=64, ego_drop=0.0):
         super().__init__()
+        self.dim = dim
         self.dod_meta = bool(dod_meta)
+        self.rel_bottleneck = bool(rel_bottleneck)
+        self.ego_drop = float(ego_drop)      # egitimde ego blogunu p olasilikla sifirla (psi girdisinde)
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
                                                   gate=gate, conflict_feats=conflict_feats,
                                                   conflict_bias=conflict_bias,
@@ -820,11 +839,23 @@ class CausalPlanner(nn.Module):
         # ZORUNDA -> hile yapamaz -> uniform baskisi f_cfd FEATURE'larina akar -> entropy CANLI kalir.
         # Cikti = 5-sinif MANEVRA (CP get_decision.py) VEYA dod_meta=1'de factored (lon x lat)
         # meta-aksiyon ciftleri (decision_labels.py) -- her iki durumda SABIT GT-turevi hedef.
-        if self.dod_meta:
-            self.psi_lon = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_lon))
-            self.psi_lat = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_lat))
+        # rel_bottleneck (concept-bottleneck mantigi): karar head'i TEK f_cas yerine BLOK-YAPILI
+        # bir vektor okur -- her iliskinin kendi projeksiyonu, kendi boyutlari. Hicbir iliski
+        # baskasinin boyutlarina yazamaz, dolayisiyla bir iliskiyi kapatmak o blogu SIFIRLAR ve
+        # digerleri telafi EDEMEZ. Trajectory head'e DOKUNULMAZ (tam f_cas'i almaya devam eder),
+        # boylece surus performansina risk minimumda kalir.
+        if self.rel_bottleneck:
+            self.rel_proj_ag = nn.ModuleList([nn.Linear(dim, rel_block) for _ in range(NUM_CHANNELS)])
+            self.rel_proj_mp = nn.ModuleList([nn.Linear(dim, rel_block) for _ in range(NUM_MAP_CHANNELS)])
+            self.ego_proj = nn.Linear(dim, ego_block)
+            psi_in = ego_block + rel_block * (NUM_CHANNELS + NUM_MAP_CHANNELS)
         else:
-            self.psi = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_maneuvers))
+            psi_in = dim
+        if self.dod_meta:
+            self.psi_lon = nn.Sequential(nn.Linear(psi_in, 128), nn.ReLU(), nn.Linear(128, num_lon))
+            self.psi_lat = nn.Sequential(nn.Linear(psi_in, 128), nn.ReLU(), nn.Linear(128, num_lat))
+        else:
+            self.psi = nn.Sequential(nn.Linear(psi_in, 128), nn.ReLU(), nn.Linear(128, num_maneuvers))
 
         # STEP 2 -- f_cfd COLLAPSE FIX. Olculen kusur: fcfd_var/fcas_var ~ 1e-4 (3 kosuda), yani
         # f_cfd her sahnede AYNI vektor. Sebep: loss ondan tek sey istiyor ("manevrayi ele verme"),
@@ -846,6 +877,30 @@ class CausalPlanner(nn.Module):
         self.num_neighbors, self.future_steps = num_neighbors, future_steps
         self.nbr_head = nn.Sequential(nn.Linear(dim, 2 * dim), nn.ReLU(),
                                       nn.Linear(2 * dim, num_neighbors * future_steps * 2))
+
+    def _rel_blocks(self, ag_rel, mp_rel, self_fea, fallback):
+        """[B,R_ag,D] + [B,R_mp,D] + ego -> blok-yapili psi girdisi [B, ego_block + rel_block*R].
+
+        Kanallar hesaplanamadiysa (deployment'ta ego rota disi -> ref_path yok -> typed dal
+        kapali) bloklari SIFIR GIRDIYLE kurariz: egitimde yanmayan bir iliskinin blogu zaten
+        Linear(0) oldugu icin semantik ayni ("bu iliski hicbir sey katmadi") ve psi'nin girdi
+        boyutu sabit kalir. f_cas'a geri dusmek boyut uyusmazligi verirdi (672 vs 256)."""
+        zero = None
+        if ag_rel is None or mp_rel is None:
+            zero = torch.zeros(self_fea.shape[0], self.dim, device=self_fea.device,
+                               dtype=self_fea.dtype)
+        ego_b = self.ego_proj(self_fea)
+        if self.training and self.ego_drop > 0:
+            # dodrop50 mantigi, ego yoluna uygulanmis hali: psi ego'suz kaldiginda karari
+            # ILISKI bloklarindan cikarmayi ogrenmek zorunda kalir (CBM-tarzi baski).
+            keep = (torch.rand(ego_b.shape[0], 1, device=ego_b.device) >= self.ego_drop).float()
+            ego_b = ego_b * keep
+        blocks = [ego_b]
+        blocks += [self.rel_proj_ag[r](zero if ag_rel is None else ag_rel[:, r])
+                   for r in range(len(self.rel_proj_ag))]
+        blocks += [self.rel_proj_mp[r](zero if mp_rel is None else mp_rel[:, r])
+                   for r in range(len(self.rel_proj_mp))]
+        return torch.cat(blocks, dim=-1)
 
     def forward(self, encoder_outputs, inputs, num_agents,
                 neighbor_futures=None, neighbor_states=None, also_cfd_plan=False, ref_path=None):
@@ -874,14 +929,18 @@ class CausalPlanner(nn.Module):
         # DOD: psi'yi head'den ONCE hesapla; tahmin edilen karar (b*) decoder query'sine besle.
         psi_cas = psi_cfd = None
         psi_lon_cas = psi_lat_cas = psi_lon_cfd = psi_lat_cfd = None
+        z_cas, z_cfd = f_cas, f_cfd                     # psi'nin girdisi (varsayilan: f_cas/f_cfd)
+        if self.rel_bottleneck:
+            z_cas = self._rel_blocks(dis['ag_cas_rel'], dis['mp_cas_rel'], dis['self_fea'], f_cas)
+            z_cfd = self._rel_blocks(dis['ag_cfd_rel'], dis['mp_cfd_rel'], dis['self_fea'], f_cfd)
         if self.dod_meta:
-            psi_lon_cas, psi_lat_cas = self.psi_lon(f_cas), self.psi_lat(f_cas)
-            psi_lon_cfd, psi_lat_cfd = self.psi_lon(f_cfd), self.psi_lat(f_cfd)
+            psi_lon_cas, psi_lat_cas = self.psi_lon(z_cas), self.psi_lat(z_cas)
+            psi_lon_cfd, psi_lat_cfd = self.psi_lon(z_cfd), self.psi_lat(z_cfd)
             b_star = (psi_lon_cas.argmax(-1), psi_lat_cas.argmax(-1))   # (argmax non-diff -> psi'ye sizmaz)
             b_cfd = (psi_lon_cfd.argmax(-1), psi_lat_cfd.argmax(-1))
         else:
-            psi_cas = self.psi(f_cas)
-            psi_cfd = self.psi(f_cfd)
+            psi_cas = self.psi(z_cas)
+            psi_cfd = self.psi(z_cfd)
             b_star = psi_cas.argmax(-1)                                  # [B] (argmax non-diff -> psi'ye sizmaz)
             b_cfd = psi_cfd.argmax(-1)
 
@@ -923,5 +982,9 @@ class CausalPlanner(nn.Module):
             'M_cas_map_typed': dis['M_cas_map_typed'], 'M_cfd_map_typed': dis['M_cfd_map_typed'],
             'gated_valid': dis['gated_valid'], 'gated_map_valid': dis['gated_map_valid'],
             'ch_active': dis['ch_active'], 'mch_active': dis['mch_active'],
+            # rel_bottleneck: iliski-basina bloklar (analiz/mudahale icin disari acilir)
+            'ag_cas_rel': dis['ag_cas_rel'], 'ag_cfd_rel': dis['ag_cfd_rel'],
+            'mp_cas_rel': dis['mp_cas_rel'], 'mp_cfd_rel': dis['mp_cfd_rel'],
+            'self_fea': dis['self_fea'], 'psi_in_cas': z_cas, 'psi_in_cfd': z_cfd,
         }
         return out

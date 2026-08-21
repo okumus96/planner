@@ -353,7 +353,7 @@ def main(args):
     gameformer.load_state_dict(torch.load(args.pretrained_path, map_location=dev))
     gameformer = gameformer.to(dev); freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9)).to(dev)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, rel_bottleneck=args.rel_bottleneck, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9)).to(dev)
     # strict=False: eski checkpoint'ler (ornegin Step 2 oncesi) cfd_recon agirliklarini icermez.
     # O modul viz yolunda HIC kullanilmaz, o yuzden eksik olmasi zararsiz -- ama ne eksikse yazdir,
     # sessizce gercek bir uyumsuzlugu yutmayalim.
@@ -460,6 +460,7 @@ if __name__ == "__main__":
     p.add_argument("--typed_kv", type=int, default=0)
     p.add_argument("--channel_evidence", type=int, default=0)
     p.add_argument("--gate_trust", type=str, default="all", choices=["all", "reliable"])
+    p.add_argument("--rel_bottleneck", type=int, default=0)
     p.add_argument("--dod_meta", type=int, default=0,
                    help="ckpt hangi degerle egitildiyse o: factored (lon x lat) meta-aksiyon DOD'u")
     p.add_argument("--lon_merge", type=int, default=0,

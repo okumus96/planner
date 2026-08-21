@@ -91,7 +91,7 @@ def main(args):
     gameformer = gameformer.to(dev)
     freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9)).to(dev)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, rel_bottleneck=args.rel_bottleneck, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9)).to(dev)
     causal.load_state_dict(torch.load(args.causal_path, map_location=dev))
     causal.eval()
 
@@ -261,6 +261,7 @@ if __name__ == "__main__":
     p.add_argument("--typed_kv", type=int, default=0)
     p.add_argument("--channel_evidence", type=int, default=0)
     p.add_argument("--gate_trust", type=str, default="all", choices=["all", "reliable"])
+    p.add_argument("--rel_bottleneck", type=int, default=0)
     p.add_argument("--dod_meta", type=int, default=0)
     p.add_argument("--lon_merge", type=int, default=0)
     p.add_argument("--ego_residual", type=int, default=1,

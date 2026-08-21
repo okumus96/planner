@@ -504,7 +504,8 @@ def model_training(args):
                            gate_channels=args.gate_channels, typed_kv=args.typed_kv,
                            channel_evidence=args.channel_evidence,
                            gate_trust=args.gate_trust,
-                           dod_meta=args.dod_meta,
+                           dod_meta=args.dod_meta, rel_bottleneck=args.rel_bottleneck,
+                           ego_drop=args.ego_drop,
                            num_lon=(NUM_LON_MERGED if args.lon_merge else NUM_LON),
                            num_lat=NUM_LAT).to(args.device)
 
@@ -605,6 +606,14 @@ if __name__ == "__main__":
                         help="H: DOD karar slotu 5-sinif geometrik manevra YERINE factored (lon x lat) "
                              "meta-aksiyon (nuReasoning taksonomisi, decision_labels.py; lon ilk 4s / "
                              "lat tam 8s, koridor-goreli LC). psi -> psi_lon+psi_lat, agirlikli CE.")
+    parser.add_argument("--ego_drop", type=float, default=0.0,
+                        help="rel_bottleneck ile: egitimde psi'nin ego blogunu bu olasilikla sifirla "
+                             "-> karar iliski bloklarina yaslanmayi ogrenir (dodrop50 mantigi).")
+    parser.add_argument("--rel_bottleneck", type=int, default=0,
+                        help="karar head'i tek f_cas yerine BLOK-YAPILI vektor okur: her iliskinin "
+                             "kendi projeksiyonu/boyutlari (concept-bottleneck). Bir iliskiyi "
+                             "kapatmak o blogu sifirlar, digerleri telafi edemez. Trajectory "
+                             "head'e dokunulmaz.")
     parser.add_argument("--lon_merge", type=int, default=0,
                         help="dod_meta ile: quickly/gently katla (9 -> 6 lon sinifi). psi_lon confusion "
                              "matrisi ayrimi ogrenemezse acilir; extractor'a dokunmaz.")

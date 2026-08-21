@@ -49,7 +49,8 @@ def main(a):
     gf = gf.to(dev); freeze_gameformer(gf)
     m = CausalPlanner(layers=a.graph_layers, modes=a.modes, nbr_enrich=a.nbr_enrich,
                       ego_residual=a.ego_residual, gate_channels=1, typed_kv=a.typed_kv,
-                      dod_meta=a.dod_meta, num_lon=(6 if a.lon_merge else 9)).to(dev)
+                      dod_meta=a.dod_meta, num_lon=(6 if a.lon_merge else 9),
+                      rel_bottleneck=a.rel_bottleneck).to(dev)
     miss, unexp = m.load_state_dict(torch.load(a.causal_path, map_location=dev), strict=False)
     if miss or unexp:
         print(f"[load] missing={list(miss)} unexpected={list(unexp)}")
@@ -150,6 +151,7 @@ if __name__ == "__main__":
     p.add_argument("--nbr_enrich", type=int, default=2)
     p.add_argument("--typed_kv", type=int, default=1)
     p.add_argument("--dod_meta", type=int, default=1)
+    p.add_argument("--rel_bottleneck", type=int, default=0)
     p.add_argument("--lon_merge", type=int, default=0)
     p.add_argument("--ego_residual", type=int, default=0)
     p.add_argument("--modes", type=int, default=6)

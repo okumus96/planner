@@ -194,7 +194,7 @@ def main(args):
             gate_channels=args.gate_channels, typed_kv=args.typed_kv,
             channel_evidence=args.channel_evidence, gate_trust=args.gate_trust,
             dod_meta=args.dod_meta, lon_merge=args.lon_merge,
-            uniform_mask=args.uniform_mask, device=args.device,
+            uniform_mask=args.uniform_mask, rel_bottleneck=args.rel_bottleneck, device=args.device,
         )
         print(f"[CAUSAL+REFINER] causal={args.causal_path}  "
               f"plan={'GameFormer' if args.baseline else 'CausalPlanner'}  remove={args.remove}x{args.remove_k}  "
@@ -380,6 +380,9 @@ if __name__ == "__main__":
                         help='ckpt hangi degerle egitildiyse o: factored (lon x lat) meta-aksiyon DOD\'u (H).')
     parser.add_argument('--lon_merge', type=int, default=0,
                         help='ckpt lon_merge=1 ile egitildiyse o (6 lon sinifi).')
+    parser.add_argument('--rel_bottleneck', type=int, default=0,
+                        help='ckpt hangi degerle egitildiyse o: karar head\'i blok-yapili '
+                             '(iliski-basina) vektor okur.')
     parser.add_argument('--uniform_mask', type=int, default=0,
                         help='RULES-ONLY baseline: kural girdiyi secer, AGIRLIK ogrenilmez -- '
                              'gate\'ten gecen girdiler uzerinde uniform. Ogrenilmis tahsisin '

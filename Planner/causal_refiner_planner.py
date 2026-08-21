@@ -28,7 +28,7 @@ class CausalRefinerPlanner(PlannerV2):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
                  use_causal=True, remove='none', remove_k=1, plan_source='cas', nbr_enrich=0, ego_residual=1,
                  gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
-                 dod_meta=0, lon_merge=0, uniform_mask=0, device=None):
+                 dod_meta=0, lon_merge=0, uniform_mask=0, rel_bottleneck=0, device=None):
         super().__init__(model_path=causal_path, device=device, debug=False,
                          debug_dir=None, debug_max_plots=0, oracle_mode=False)
         self._backbone_path = backbone_path
@@ -50,6 +50,7 @@ class CausalRefinerPlanner(PlannerV2):
         self._dod_meta = dod_meta
         self._lon_merge = lon_merge
         self._uniform_mask = uniform_mask
+        self._rel_bottleneck = rel_bottleneck
         self._ch_logged = False          # ilk frame'de kanal durumunu bir kez yazdir
         self._ch_missing_warned = False  # kanal istendi ama ref path yok uyarisi (bir kez)
         self._use_causal = use_causal    # neural_plan: CausalPlanner (True) vs GameFormer (False)
@@ -105,7 +106,8 @@ class CausalRefinerPlanner(PlannerV2):
                                     channel_evidence=self._channel_evidence, gate_trust=self._gate_trust,
                                     dod_meta=self._dod_meta,
                                     num_lon=(6 if self._lon_merge else 9),
-                                    uniform_mask=self._uniform_mask)
+                                    uniform_mask=self._uniform_mask,
+                                    rel_bottleneck=self._rel_bottleneck)
         # strict=False: model sonradan modul kazandi (gate_bias, nbr_head, cfd_recon); eski checkpoint'ler
         # bu anahtarlari icermez. Ucu de PLAN YOLUNUN DISINDA: gate_bias yalniz gate='sigmoid' dalinda
         # okunur (planner softmax kurar), nbr_head/cfd_recon yalniz egitim loss'larini besler. Yine de
