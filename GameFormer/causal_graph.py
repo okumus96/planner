@@ -297,6 +297,16 @@ class EgoCausalLayer(nn.Module):
         # Bias -2 ile baslar (sigmoid(-2)~0.12): aksi halde sigmoid(0)=0.5 ile sahnenin YARISI
         # bastan "nedensel" olur ve ilk epoch'lar bunu geri cekmekle gecer.
         self.gate_bias = nn.Parameter(torch.full((4,), -2.0))   # [cas_ag, cfd_ag, cas_mp, cfd_mp]
+        # JOINT SOFTMAX (--joint_softmax): ajan ve harita girdileri AYRI degil ORTAK bir softmax
+        # paydasini paylasir. Boylece Sum_ajan M_cas artik sabit 1 DEGIL -- model "bu sahnede ajanlar
+        # onemsiz, kutle haritaya gitsin" diyebilir (ayri softmax'ta imkansizdi: her iki dagilim da
+        # ayri ayri 1'e toplanmak ZORUNDAYDI).
+        # family_bias: iki logit ailesi farkli attn tablolarindan/edge MLP'lerinden geliyor, olcekleri
+        # birbirine gore kalibre DEGIL -> ogrenilebilir skaler ofset. Tek yorumlanabilir sayi olarak
+        # loglanir; harita 6:1 token ustunlugu ile ajanlari ezerse burada gorunur.
+        # NOT: family_bias parametresi SADECE joint acikken olusturulur (CausalPlanner.__init__),
+        # aksi halde joint kullanmayan tum eski checkpoint'ler strict=True ile yuklenemezdi.
+        self.joint_softmax = False
         # birlestirme (Eq 6): [self ; ajan ; harita] -> f_cas / f_cfd
         self.self_fc = nn.Sequential(nn.Linear(dim, dim), nn.ReLU())
         # AYRI cikis projeksiyonu + LayerNorm (CP hdgt_encoder.py ile ayni: out_fc_causal/out_fc_confound
@@ -394,6 +404,56 @@ class EgoCausalLayer(nn.Module):
         return (cas, cfd, M_cas_mean, M_cfd_mean,
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean)
 
+    def _typed_logits(self, q1, h_src, ek, edge_v, entry_valid, Wk_list, Wv_list,
+                      attn_cas_ch, attn_cfd_ch, conflict_bias=None):
+        """Tek aile icin (softmax ONCESI) logitleri ve mesajlari uretir -- _attend_typed'in
+        softmax'a kadarki yarisi. Joint modda iki ailenin logitleri birlestirilip TEK softmax
+        alinabilsin diye ayrildi. Doner: a_cas/a_cfd [B,S,R,H], msg [B,S,R,H,dh]."""
+        B, S, D = h_src.shape
+        H, dh = self.heads, self.dh
+        R = entry_valid.shape[-1]
+        k_ch = torch.stack([m(h_src) for m in Wk_list], dim=2).view(B, S, R, H, dh)
+        v_ch = torch.stack([m(h_src) for m in Wv_list], dim=2).view(B, S, R, H, dh)
+        msg = v_ch + edge_v[:, :, None]                                   # edge value paylasilir
+        s_ = self.leaky(q1[:, :, None] + k_ch + ek[:, :, None])           # [B,S,R,H,dh]
+        a_cas = (s_ * attn_cas_ch[None, None]).sum(-1)                    # [B,S,R,H]
+        a_cfd = (s_ * attn_cfd_ch[None, None]).sum(-1)
+        if conflict_bias is not None:
+            a_cas = a_cas - conflict_bias[:, :, None, None]
+        return a_cas, a_cfd, msg
+
+    def _attend_typed_joint(self, fam_ag, fam_mp):
+        """ORTAK softmax: ajan ve harita girdileri ayni paydayi paylasir.
+        fam_* = (a_cas, a_cfd, msg, entry_valid). Doner ajan ve harita icin ayri ayri
+        (cas, cfd, M_typed_cas, M_typed_cfd) + ham (normalize EDILMEMIS) aile kutleleri."""
+        outs, flat_cas, flat_cfd, shapes = [], [], [], []
+        for i, (a_cas, a_cfd, msg, ev) in enumerate((fam_ag, fam_mp)):
+            B, S, R, H = a_cas.shape
+            inv = ~ev[..., None]
+            neg_inf = torch.finfo(a_cas.dtype).min
+            # aile ofseti: iki ailenin logit olcegini model kalibre etsin
+            flat_cas.append((a_cas + self.family_bias[i]).masked_fill(inv, neg_inf).view(B, S * R, H))
+            flat_cfd.append((a_cfd + self.family_bias[i]).masked_fill(inv, neg_inf).view(B, S * R, H))
+            shapes.append((B, S, R, H, msg, ev))
+        cat_cas = torch.cat(flat_cas, dim=1)                              # [B, (S*R)_ag + (S*R)_mp, H]
+        cat_cfd = torch.cat(flat_cfd, dim=1)
+        M_cas = torch.softmax(cat_cas, dim=1)                             # <-- TEK PAYDA
+        M_cfd = torch.softmax(cat_cfd, dim=1)
+        has_any = torch.cat([f[3].view(f[3].shape[0], -1) for f in (fam_ag, fam_mp)], dim=1).any(dim=1)
+        z = has_any[:, None, None].float()
+        M_cas = torch.nan_to_num(M_cas) * z
+        M_cfd = torch.nan_to_num(M_cfd) * z
+        off = 0
+        for (B, S, R, H, msg, ev) in shapes:
+            n = S * R
+            mc = M_cas[:, off:off + n].view(B, S, R, H).masked_fill(~ev[..., None], 0.0)
+            mf = M_cfd[:, off:off + n].view(B, S, R, H).masked_fill(~ev[..., None], 0.0)
+            off += n
+            cas = (mc[..., None] * msg).sum(dim=(1, 2)).reshape(B, self.dim)
+            cfd = (mf[..., None] * msg).sum(dim=(1, 2)).reshape(B, self.dim)
+            outs.append((cas, cfd, mc.mean(-1), mf.mean(-1)))             # M_typed [B,S,R]
+        return outs
+
     def _attend_typed(self, q1, h_src, ek, edge_v, entry_valid, Wk_list, Wv_list,
                       attn_cas_ch, attn_cfd_ch, conflict_bias=None):
         """TYPED attention: softmax YANAN (kaynak, kanal) girdileri uzerinde.
@@ -459,7 +519,20 @@ class EgoCausalLayer(nn.Module):
         if self.conflict_bias and conflict is not None:
             cb = (F.softplus(self.conflict_w) * conflict[..., :3]).sum(-1)          # [B,N] >= 0
         M_cas_typed = M_cfd_typed = None
-        if self.typed_kv and ch_active is not None:
+        agent_mass = map_mass = M_cas_raw = M_cas_map_raw = None
+        joint = (self.joint_softmax and self.typed_kv
+                 and ch_active is not None and mch_active is not None)
+        if joint:
+            # ORTAK SOFTMAX: harita logitleri de gerektigi icin ajan tarafi asagida, harita
+            # blogunun yaninda tek seferde cozulur. Burada sadece logitleri hazirla.
+            fam_ag = self._typed_logits(q_ag, h_nbr, ek_ag, ev_ag,
+                                        nbr_valid[:, :, None] & ch_active,
+                                        self.Wk_ch, self.Wv_ch,
+                                        self.attn_cas_ch, self.attn_cfd_ch, conflict_bias=cb)
+            fam_ag = fam_ag + (nbr_valid[:, :, None] & ch_active,)
+            ent_cas_mean = ent_cas_headmean = ent_cfd_mean = ent_cfd_headmean = \
+                torch.zeros(B, device=h_ego.device)
+        elif self.typed_kv and ch_active is not None:
             # TYPED: girdiler = yanan (ajan, kanal); node K/V kanal setinden, edge paylasilir.
             entry_valid = nbr_valid[:, :, None] & ch_active
             (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag, M_cas_typed, M_cfd_typed) = self._attend_typed(
@@ -480,7 +553,31 @@ class EgoCausalLayer(nn.Module):
         ek_mp = self.We_k_mp(edge_map).view(B, S, H, dh)
         ev_mp = self.We_v_mp(edge_map).view(B, S, H, dh)
         M_cas_mp_typed = M_cfd_mp_typed = None
-        if self.typed_kv and mch_active is not None:
+        if joint:
+            ev_mp_valid = map_valid[:, :, None] & mch_active
+            fam_mp = self._typed_logits(q_mp, h_map, ek_mp, ev_mp, ev_mp_valid,
+                                        self.Wk_mch, self.Wv_mch,
+                                        self.attn_cas_mch, self.attn_cfd_mch) + (ev_mp_valid,)
+            (ag_out, mp_out) = self._attend_typed_joint(fam_ag, fam_mp)
+            ag_cas, ag_cfd, M_cas_typed, M_cfd_typed = ag_out
+            mp_cas, mp_cfd, M_cas_mp_typed, M_cfd_mp_typed = mp_out
+            # HAM aile kutleleri: joint'in getirdigi YENI bilgi (ayri softmax'ta ikisi de sabit 1.0).
+            agent_mass = M_cas_typed.sum(dim=(1, 2))                       # [B]
+            map_mass = M_cas_mp_typed.sum(dim=(1, 2))                      # [B]
+            # RAPORLAMA: eski araclar (RNC/viz/interaction) M_cas'in 1'e toplandigini varsayiyor ->
+            # aile-ici yeniden normalize et. Toplama YUKARIDA ham joint agirliklarla yapildi;
+            # burada degisen sadece disari verilen maske, feature degil.
+            # HAM (normalize edilmemis) ajan maskesi -- viz icin: "bu ajan TUM dikkatin yuzde
+            # kacini aldi". Normalize edilmis surum asagida, eski araclarla uyum icin.
+            M_cas_raw = M_cas_typed.sum(-1)
+            M_cas_ag = M_cas_typed.sum(-1) / agent_mass[:, None].clamp(min=1e-9)
+            M_cfd_ag = M_cfd_typed.sum(-1) / M_cfd_typed.sum(dim=(1, 2))[:, None].clamp(min=1e-9)
+            M_cas_map_raw = M_cas_mp_typed.sum(-1)
+            M_cas_mp = M_cas_mp_typed.sum(-1) / map_mass[:, None].clamp(min=1e-9)
+            M_cfd_mp = M_cfd_mp_typed.sum(-1) / M_cfd_mp_typed.sum(dim=(1, 2))[:, None].clamp(min=1e-9)
+            ent_cas_mp_mean = ent_cas_mp_headmean = ent_cfd_mp_mean = ent_cfd_mp_headmean = \
+                torch.zeros(B, device=h_ego.device)
+        elif self.typed_kv and mch_active is not None:
             entry_valid_mp = map_valid[:, :, None] & mch_active
             (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp, M_cas_mp_typed, M_cfd_mp_typed) = self._attend_typed(
                 q_mp, h_map, ek_mp, ev_mp, entry_valid_mp, self.Wk_mch, self.Wv_mch,
@@ -529,7 +626,8 @@ class EgoCausalLayer(nn.Module):
         return (h_ego_new, f_cas, f_cfd, M_cas_ag, M_cfd_ag, M_cas_mp, M_cfd_mp,
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
                 ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
-                gate_cos, f_all, M_cas_typed, M_cfd_typed, M_cas_mp_typed, M_cfd_mp_typed)
+                gate_cos, f_all, M_cas_typed, M_cfd_typed, M_cas_mp_typed, M_cfd_mp_typed,
+                agent_mass, map_mass, M_cas_raw, M_cas_map_raw)
 
 
 class EgoCausalDisentangler(nn.Module):
@@ -707,7 +805,8 @@ class EgoCausalDisentangler(nn.Module):
             (h_ego, f_cas, f_cfd, M_cas, M_cfd, M_cas_mp, M_cfd_mp,
              ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
              ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
-             gate_cos, f_all, M_cas_ty, M_cfd_ty, M_cas_mp_ty, M_cfd_mp_ty) = layer(
+             gate_cos, f_all, M_cas_ty, M_cfd_ty, M_cas_mp_ty, M_cfd_mp_ty,
+             agent_mass, map_mass, M_cas_raw, M_cas_map_raw) = layer(
                 h_ego, h_nbr, nbr_types, edge_ego, gated_valid, h_map, edge_map, gated_map_valid,
                 conflict=conf,
                 ch_active=(ch_active if self.typed_kv else None),
@@ -718,6 +817,9 @@ class EgoCausalDisentangler(nn.Module):
         return {
             'f_cas': f_cas, 'f_cfd': f_cfd, 'M_cas': M_cas, 'M_cfd': M_cfd,
             'M_cas_map': M_cas_mp, 'M_cfd_map': M_cfd_mp, 'map_valid': map_valid,
+            # joint_softmax'in getirdigi YENI olcum: ajan/harita kutle paylasimi (ayri softmax'ta
+            # ikisi de tanim geregi 1.0 -- yani olculemezdi). None = joint kapali.
+            'agent_mass': agent_mass, 'map_mass': map_mass, 'M_cas_raw': M_cas_raw, 'M_cas_map_raw': M_cas_map_raw,
             'f_all': f_all,                               # [B,3D] gate'siz tam-sahne ozeti (recon hedefi)
             'conflict': conf,                             # [B,N,4] future-conflict (L_conflict hedefi)
             # elestiri #3: M_cas/M_cfd'nin (head-ortalamasi) entropisi vs head-basina entropinin
@@ -797,7 +899,7 @@ class CausalPlanner(nn.Module):
                  recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax',
                  conflict_feats=0, conflict_bias=0, compute_conflict=0, aligned_mode='straight',
                  ego_residual=1, gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
-                 dod_meta=0, num_lon=9, num_lat=7, uniform_mask=0):
+                 dod_meta=0, num_lon=9, num_lat=7, uniform_mask=0, joint_softmax=0):
         super().__init__()
         self.dod_meta = bool(dod_meta)
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
@@ -809,6 +911,9 @@ class CausalPlanner(nn.Module):
         for _l in self.disentangler.layers:
             _l.ego_residual = bool(ego_residual)
             _l.uniform_mask = bool(uniform_mask)      # rules-only baseline (inference-time)
+            _l.joint_softmax = bool(joint_softmax)    # ajan+harita ORTAK softmax paydasi
+            if joint_softmax:
+                _l.family_bias = nn.Parameter(torch.zeros(2, device=_l.attn_cas.device))
         # compute_conflict: feature'lar edge'e girmese/bias olmasa bile hesaplansin (loss icin)
         self.disentangler.compute_conflict = bool(compute_conflict or conflict_feats or conflict_bias)
         self.disentangler.aligned_mode = aligned_mode
@@ -899,6 +1004,10 @@ class CausalPlanner(nn.Module):
             'traj_cfd': traj_cfd, 'score_cfd': score_cfd,
             'M_cas': dis['M_cas'], 'M_cfd': dis['M_cfd'],                # ajan causal/confound [B,N]
             'M_cas_map': dis['M_cas_map'], 'M_cfd_map': dis['M_cfd_map'],  # harita causal/confound [B,S]
+            'agent_mass': dis['agent_mass'], 'map_mass': dis['map_mass'],  # joint_softmax; yoksa None
+            # joint: normalize EDILMEMIS maskeler. Ajan ve harita AYNI paydadan gelir, yani
+            # dogrudan kiyaslanabilir -- viz --joint_norm bunlari ORTAK renk olceginde cizer.
+            'M_cas_raw': dis['M_cas_raw'], 'M_cas_map_raw': dis['M_cas_map_raw'],
             'map_valid': dis['map_valid'],
             # elestiri #3: M_cas/M_cfd head-ortalamasi vs head-basina entropi (bkz EgoCausalDisentangler)
             'M_cas_ent': dis['M_cas_ent'], 'M_cas_headent': dis['M_cas_headent'],

@@ -26,6 +26,8 @@ def main():
     p.add_argument("--decoder_levels", type=int, default=2)
     p.add_argument("--graph_layers", type=int, default=1)
     p.add_argument("--nbr_enrich", type=int, default=0)
+    p.add_argument("--joint_softmax", type=int, default=0,
+        help="1 = ajan+harita ORTAK softmax paydasi (Sum_ajan M_cas serbest). Checkpoint hangi modda EGITILDIYSE o verilmeli -- agirliksiz davranis anahtari, strict=False uyarmaz.")
     p.add_argument("--ego_residual", type=int, default=1,
                    help="checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)")
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"],
@@ -45,7 +47,7 @@ def main():
     gameformer.load_state_dict(torch.load(args.pretrained_path, map_location=dev))
     freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual).to(dev)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, joint_softmax=args.joint_softmax).to(dev)
     # strict=False: model yeni modul kazandikca (gate_bias, nbr_head, cfd_recon) eski checkpoint'ler
     # o anahtarlari icermez. Kullanilmayan modullerin eksik olmasi zararsiz -- ama ne eksikse yazdir.
     missing, unexpected = causal.load_state_dict(torch.load(args.causal_path, map_location=dev), strict=False)

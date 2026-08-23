@@ -84,12 +84,15 @@ def _draw_agent(ax, x, y, heading, length, width, atype, facecolor, edgecolor, l
         _draw_car(ax, x, y, heading, length, width, facecolor, edgecolor, lw, z=z)
 
 
-def _plot_map_causal(ax, polys, mcas, valid):
+def _plot_map_causal(ax, polys, mcas, valid, vmax_shared=None):
     """Draw map polylines colored by M_cas_map (light->dark red, per-scene scaled).
     Map is COLORED ONLY (no selection / no labels) -- selection is agents-only."""
-    vm = mcas[valid]
-    vmax = float(vm.max()) if vm.size else 1.0
-    vmax = max(vmax, 1e-6)
+    if vmax_shared is not None:
+        vmax = max(float(vmax_shared), 1e-6)      # --joint_norm: ajan+harita TEK olcek
+    else:
+        vm = mcas[valid]
+        vmax = float(vm.max()) if vm.size else 1.0
+        vmax = max(vmax, 1e-6)
     order = np.argsort(mcas)                                 # low first -> causal drawn on top
     for e in order:
         if not valid[e]:
@@ -166,7 +169,8 @@ def plot_scene(ax, s, mode, thr, topn, branch="cas", show_channels=False):
     (mask/data used was already selected upstream in collect_scenes)."""
     tag_word = "causal" if branch == "cas" else "confound"
     _plot_map_background(ax, s)                                           # baglam: soluk bantlar
-    _plot_map_causal(ax, s["map_polys"], s["map_mcas"], s["map_valid"])   # map: colored only
+    _plot_map_causal(ax, s["map_polys"], s["map_mcas"], s["map_valid"],
+                     vmax_shared=s.get("vmax_shared"))   # map: colored only
 
     # ego (idx 0) -> origin, black
     _draw_car(ax, s["ego"][0], s["ego"][1], s["ego"][2], 4.8, 2.0,
@@ -192,9 +196,15 @@ def plot_scene(ax, s, mode, thr, topn, branch="cas", show_channels=False):
     # HARITA ile AYNI normalizasyon: renk = m / (sahne-ici max M_cas), boyle harita ile
     # kiyaslanabilir olur (onceden ham/mutlak degerle boyaniyordu -> harita hep daha "kesin"
     # gorunuyordu, gercekte agent/map peak'leri farkli olcekte -- bkz peak/uniform oranlari).
-    m_valid = s["M_cas"][s["valid"]]
-    m_vmax = float(m_valid.max()) if m_valid.size else 1.0
-    m_vmax = max(m_vmax, 1e-6)
+    if s.get("vmax_shared") is not None:
+        # --joint_norm: ajan ve harita AYNI softmax paydasindan gelir -> ORTAK olcek. Aksi halde
+        # her aile kendi max'ina bolunur ve dikkatin %9'unu alan ajan da KIPKIRMIZI cizilir;
+        # joint'in getirdigi "ajanlar bu sahnede onemsiz" bilgisi gorunmez olur.
+        m_vmax = max(float(s["vmax_shared"]), 1e-6)
+    else:
+        m_valid = s["M_cas"][s["valid"]]
+        m_vmax = float(m_valid.max()) if m_valid.size else 1.0
+        m_vmax = max(m_vmax, 1e-6)
     xs, ys = [s["ego"][0]], [s["ego"][1]]
     for j in range(s["N"]):
         if not s["valid"][j]:
@@ -241,19 +251,25 @@ def plot_scene(ax, s, mode, thr, topn, branch="cas", show_channels=False):
     if man.get("stopping"):
         tag = "stop+" + tag
     ax.set_title(f"[{tag}]  {tag_word} agents: {int(agent_sel.sum())}  |  "
-                 f"maxA={s['M_cas'][s['valid']].max():.2f}  maxMap={s['map_mcas'][s['map_valid']].max():.2f}",
+                 f"maxA={s['M_cas'][s['valid']].max():.2f}  maxMap={s['map_mcas'][s['map_valid']].max():.2f}"
+                 + (f"  agmass={s['agent_mass']:.2f}" if s.get("agent_mass") is not None else ""),
                  fontsize=8)
 
 
 @torch.no_grad()
 def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device,
-                   scenario, mode, thr, topn, branch="cas", ref_idx=0):
+                   scenario, mode, thr, topn, branch="cas", ref_idx=0, joint_norm=False):
     """branch='cas' (varsayilan) -> M_cas/M_cas_map + f_cas'ten uretilen plan (ANA, deploy edilen).
     branch='cfd' -> M_cfd/M_cfd_map + f_cfd'den uretilen plan (traj_cfd/score_cfd, tani/ablasyon amacli,
     hicbir ajan silinmez)."""
     scenes = []
     Na = num_neighbors + 1
     mask_key = "M_cas" if branch == "cas" else "M_cfd"
+    map_key_raw = None
+    if joint_norm:
+        if branch != "cas":
+            raise SystemExit("--joint_norm yalniz --branch cas ile")
+        mask_key, map_key_raw = "M_cas_raw", "M_cas_map_raw"
     map_key = "M_cas_map" if branch == "cas" else "M_cfd_map"
     for batch in loader:
         inputs, ego_future, _, ref_path = read_batch(batch, device)
@@ -262,8 +278,11 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
         out = causal(enc, inputs, num_agents=Na, neighbor_futures=top1_fut, neighbor_states=nbr_states,
                      also_cfd_plan=(branch == "cfd"))
 
-        M_cas = out[mask_key]; valid = out["nbr_valid"]
-        M_cas_map = out[map_key]; map_valid = out["map_valid"]
+        M_cas = out[mask_key]
+        if M_cas is None:
+            raise SystemExit("--joint_norm icin model --joint_softmax 1 ile egitilmis olmali")
+        valid = out["nbr_valid"]
+        M_cas_map = out[map_key_raw or map_key]; map_valid = out["map_valid"]
         # typed (ajan,kanal) maskesi [B,N,R] (typed_kv=0 ise None); dal ile tutarli anahtar
         M_typed = out.get("M_cas_typed" if branch == "cas" else "M_cfd_typed")
         # DOD karari: head'in query'sine giden b* (+softmax guveni). dod_meta'da factored (lon x lat).
@@ -321,6 +340,10 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
             scenes.append({
                 "man": man, "N": num_neighbors,
                 "M_cas": mca, "valid": vv,
+                "agent_mass": (float(out["agent_mass"][b]) if out.get("agent_mass") is not None else None),
+                "vmax_shared": (max(float(mca[vv].max()) if vv.any() else 0.0,
+                                    float(M_cas_map[b][map_valid[b]].max()))
+                                if joint_norm else None),
                 # yanan predicate kanallari [N,R] (channels branch; kanal yoksa None)
                 "ch_active": (out["ch_active"][b].cpu().numpy()
                               if out.get("ch_active") is not None else None),
@@ -353,7 +376,7 @@ def main(args):
     gameformer.load_state_dict(torch.load(args.pretrained_path, map_location=dev))
     gameformer = gameformer.to(dev); freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9)).to(dev)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9), joint_softmax=args.joint_softmax).to(dev)
     # strict=False: eski checkpoint'ler (ornegin Step 2 oncesi) cfd_recon agirliklarini icermez.
     # O modul viz yolunda HIC kullanilmaz, o yuzden eksik olmasi zararsiz -- ama ne eksikse yazdir,
     # sessizce gercek bir uyumsuzlugu yutmayalim.
@@ -367,7 +390,7 @@ def main(args):
 
     scenes = collect_scenes(gameformer, causal, loader, args.num_neighbors, args.num_scenes, dev,
                             args.scenario, args.select, args.threshold, args.topn, branch=args.branch,
-                            ref_idx=args.ref_idx)
+                            ref_idx=args.ref_idx, joint_norm=args.joint_norm)
     if args.select == "none":
         sel_desc = "yok (secim kapali, sadece normalize renklendirme)"
     elif args.select == "topn":
@@ -464,6 +487,13 @@ if __name__ == "__main__":
                    help="ckpt hangi degerle egitildiyse o: factored (lon x lat) meta-aksiyon DOD'u")
     p.add_argument("--lon_merge", type=int, default=0,
                    help="ckpt lon_merge=1 ile egitildiyse o (6 lon sinifi)")
+    p.add_argument("--joint_softmax", type=int, default=0,
+                   help="1 = ajan+harita ORTAK softmax paydasi. Checkpoint hangi modda egitildiyse "
+                        "o verilmeli (agirliksiz anahtar, strict=False uyarmaz).")
+    p.add_argument("--joint_norm", action="store_true",
+                   help="joint_softmax modelinde: HAM (ortak paydali) maskeler + ajan ve haritayi "
+                        "TEK renk olceginde ciz. Varsayilan aile-ici normalize -- eski koslarla "
+                        "sayi kiyasi icin dogru, ama joint'in yeni bilgisini gizler.")
     p.add_argument("--ego_residual", type=int, default=1,
                    help="checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)")
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"],

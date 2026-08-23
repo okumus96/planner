@@ -23,7 +23,7 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 
 class CausalPurePlanner(AbstractPlanner):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
-                 plan_source='cas', nbr_enrich=0, ego_residual=1,
+                 plan_source='cas', nbr_enrich=0, ego_residual=1, joint_softmax=0,
                  gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
                  dod_meta=0, lon_merge=0, device=None):
         # Pure planner'da lattice ref path YOK -> predicate kanallari deployment'ta hesaplanamaz.
@@ -41,6 +41,7 @@ class CausalPurePlanner(AbstractPlanner):
         self._modes = modes
         self._nbr_enrich = nbr_enrich
         self._ego_residual = ego_residual
+        self._joint_softmax = joint_softmax
         self._dod_meta = dod_meta
         self._lon_merge = lon_merge
         # 'cas' (varsayilan, ANA plan) vs 'cfd': plani f_cfd'den uretir (refiner YOK, ciplak head).
@@ -65,7 +66,7 @@ class CausalPurePlanner(AbstractPlanner):
         # causal head (trained module)
         self._causal = CausalPlanner(layers=self._graph_layers, modes=self._modes, nbr_enrich=self._nbr_enrich,
                                      ego_residual=self._ego_residual, dod_meta=self._dod_meta,
-                                     num_lon=(6 if self._lon_merge else 9))
+                                     num_lon=(6 if self._lon_merge else 9), joint_softmax=self._joint_softmax)
         # strict=False: model sonradan modul kazandi (gate_bias, nbr_head, cfd_recon); eski checkpoint'ler
         # bu anahtarlari icermez. Ucu de PLAN YOLUNUN DISINDA: gate_bias yalniz gate='sigmoid' dalinda
         # okunur (planner softmax kurar), nbr_head/cfd_recon yalniz egitim loss'larini besler. Yine de

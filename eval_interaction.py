@@ -67,6 +67,8 @@ def main():
     p.add_argument("--gate_trust", type=str, default="all", choices=["all", "reliable"])
     p.add_argument("--dod_meta", type=int, default=0)
     p.add_argument("--lon_merge", type=int, default=0)
+    p.add_argument("--joint_softmax", type=int, default=0,
+        help="1 = ajan+harita ORTAK softmax paydasi (Sum_ajan M_cas serbest). Checkpoint hangi modda EGITILDIYSE o verilmeli -- agirliksiz davranis anahtari, strict=False uyarmaz.")
     p.add_argument("--ego_residual", type=int, default=1,
                    help="checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)")
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"])
@@ -74,6 +76,9 @@ def main():
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_batches", type=int, default=0, help="0 = tum validation")
     p.add_argument("--conflict_thr", type=float, default=5.0, help="dmin bu esigin altinda ise 'etkilesiyor'")
+    p.add_argument("--rank", action="store_true",
+                   help="sahne-ici dmin sirasini da bildir (0=en yakin, 0.5=sans). Oran metriginin "
+                        "aksine yogunluktan BAGIMSIZ -- seyrek/kalabalik kovalar kiyaslanabilir.")
     p.add_argument("--device", type=str, default="cuda")
     args = p.parse_args()
 
@@ -84,7 +89,7 @@ def main():
     freeze_gameformer(gameformer)
 
     causal = CausalPlanner(layers=args.graph_layers, modes=args.modes,
-                           nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9)).to(dev)
+                           nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9), joint_softmax=args.joint_softmax).to(dev)
     missing, unexpected = causal.load_state_dict(torch.load(args.causal_path, map_location=dev), strict=False)
     if missing or unexpected:
         print(f"[load] missing={list(missing)}  unexpected={list(unexpected)}")
@@ -96,6 +101,7 @@ def main():
     N = args.num_neighbors
     acc = {k: {m: [] for m in ("d0", "dmin", "tmin", "path", "behind")} for k in ("top1", "random", "near")}
     mcas_sel = []
+    ranks, n_gated = [], []   # --rank: sahne-ici dmin sirasi (0=en yakin, 0.5=sans, 1=en uzak)
 
     for bi, batch in enumerate(loader):
         if args.num_batches and bi >= args.num_batches:
@@ -124,6 +130,17 @@ def main():
                 "near": int(vj[np.argmin(rng_d)]),
             }
             mcas_sel.append(float(M[b, picks["top1"]]))
+            if args.rank:
+                # RANK: oran metrigi (random_dmin/top1_dmin) yogunluga BAGLI -- kalabalik sahnede
+                # random zaten yakin oldugu icin oranin tavani duser, seyrek sahneyle kiyaslanamaz.
+                # Sahne-ici sira ise her yogunlukta random=0.5 verir -> kovalar kiyaslanabilir.
+                dd = np.array([_pairwise_min(ego_gt[b], nbr_gt[b, j], t_valid[b, j])[0] for j in vj])
+                ok = ~np.isnan(dd)
+                if ok.sum() >= 2:
+                    dsel = dd[vj == picks["top1"]]
+                    if len(dsel) and not np.isnan(dsel[0]):
+                        ranks.append(float((dd[ok] < dsel[0]).sum()) / (ok.sum() - 1))
+                        n_gated.append(int(ok.sum()))
             for k, j in picks.items():
                 dmin, tmin, path = _pairwise_min(ego_gt[b], nbr_gt[b, j], t_valid[b, j])
                 if np.isnan(dmin):
@@ -149,6 +166,14 @@ def main():
               f"{np.mean(a['dmin']):9.2f} (med {np.median(a['dmin']):5.1f})"
               f"{np.mean(a['path']):9.2f} (med {np.median(a['path']):5.1f})"
               f"{np.mean(a['tmin']):10.2f}{frac:10.3f}{np.mean(a['behind']):9.3f}")
+
+    if args.rank and ranks:
+        rk, ng = np.array(ranks), np.array(n_gated)
+        print(f"\n  RANK (sahne-ici dmin sirasi; 0=en yakin, 0.5=SANS, 1=en uzak) : {rk.mean():.3f}")
+        print(f"{'  gecerli ajan':>16s}{'sahne':>9s}{'rank':>9s}")
+        for lab, m in (("2", ng == 2), ("3-5", (ng >= 3) & (ng <= 5)), (">=6", ng >= 6)):
+            if m.sum() >= 5:
+                print(f"{lab:>16s}{int(m.sum()):9d}{rk[m].mean():9.3f}")
 
     t, r, nr = np.array(acc["top1"]["dmin"]), np.array(acc["random"]["dmin"]), np.array(acc["near"]["dmin"])
     print(f"\n  top1 vs random : {np.mean(r) / max(np.mean(t), 1e-6):.2f}x daha yakin "

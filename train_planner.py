@@ -381,6 +381,9 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
         'comp': l_comp.item(), 'excl': l_excl.item(), 'norm': l_norm.item(),
         'recon': l_recon.item(), 'nbr': l_nbr.item(), 'budget': l_budget.item(),
         'bc': l_bc.item(), 'peak_hinge': l_peak.item(), 'conflict': l_conflict.item(),
+        # joint_softmax: ajan ailesinin softmax kutlesi. Ayri softmax'ta tanim geregi 1.0 (olculemez).
+        # Baslangicta ~0.12 (girdi sayisi orani) -- egitimde yukselmezse harita ajanlari ezmis demektir.
+        'agmass': (out['agent_mass'].mean().item() if out.get('agent_mass') is not None else 0.0),
         # STEP 3 uyelik metrikleri: sigmoid'de M artik bir dagilim degil, 'ajan iceride mi' skoru.
         # gcas_mean = sahnenin ne kadari nedensel ilan edildi; frac05 = kac ajan g>0.5.
         'gcas_mean': g_mean.item(),
@@ -500,6 +503,7 @@ def model_training(args):
                            conflict_feats=args.conflict_feats, conflict_bias=args.conflict_bias,
                            compute_conflict=(args.compute_conflict or args.lambda_conflict > 0),
                            aligned_mode=args.aligned_mode, ego_residual=args.ego_residual,
+                           joint_softmax=args.joint_softmax,
                            nbr_enrich=args.nbr_enrich,
                            gate_channels=args.gate_channels, typed_kv=args.typed_kv,
                            channel_evidence=args.channel_evidence,
@@ -547,12 +551,14 @@ def model_training(args):
             f"cfdacc={train_m['cfdacc']:.3f} peak={train_m['mcas_peak']:.3f} cfdpk={train_m['mcfd_peak']:.3f} "
             f"hgap={train_m['mcas_ent'] - train_m['mcas_headent']:.3f} "
             f"hgap_mp={train_m['mcas_map_ent'] - train_m['mcas_map_headent']:.3f} "
-            f"gcos={train_m['gate_cos_last']:.3f} | "
+            f"gcos={train_m['gate_cos_last']:.3f} "
+            f"{('agmass=%.3f ' % train_m['agmass']) if train_m.get('agmass') else ''}| "
             f"val: minADE={val_m['minADE']:.3f} casacc={val_m['casacc']:.3f} "
             f"cfdacc={val_m['cfdacc']:.3f} peak={val_m['mcas_peak']:.3f} cfdpk={val_m['mcfd_peak']:.3f} "
             f"hgap={val_m['mcas_ent'] - val_m['mcas_headent']:.3f} "
             f"hgap_mp={val_m['mcas_map_ent'] - val_m['mcas_map_headent']:.3f} "
             f"gcos={val_m['gate_cos_last']:.3f} "
+            f"{('agmass=%.3f ' % val_m['agmass']) if val_m.get('agmass') else ''}"
             f"cfdvar={val_m['fcfd_var'] / max(val_m['fcas_var'], 1e-8):.3f}"   # ->0 = f_cfd cokuyor
         )
 
@@ -608,6 +614,10 @@ if __name__ == "__main__":
     parser.add_argument("--lon_merge", type=int, default=0,
                         help="dod_meta ile: quickly/gently katla (9 -> 6 lon sinifi). psi_lon confusion "
                              "matrisi ayrimi ogrenemezse acilir; extractor'a dokunmaz.")
+    parser.add_argument("--joint_softmax", type=int, default=0,
+                        help="1 = ajan ve harita girdileri ORTAK softmax paydasini paylasir "
+                             "(Sum_ajan M_cas serbest kalir) | 0 = ayri softmax (varsayilan). "
+                             "typed_kv + gate_channels gerektirir.")
     parser.add_argument("--ego_residual", type=int, default=1,
                         help="1 = f_cas = LN(out_fc + h_ego) (CP Eq 6, varsayilan) | 0 = residual YOK, "
                              "ego bilgisi f_cas'a yalniz self_fea uzerinden girer")

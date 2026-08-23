@@ -177,7 +177,7 @@ def main(args):
             backbone_path=args.model_path, causal_path=args.causal_path,
             num_neighbors=args.num_neighbors, graph_layers=args.graph_layers,
             modes=args.modes, plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, ego_residual=args.ego_residual,
-            gate_channels=args.gate_channels, typed_kv=args.typed_kv,
+            gate_channels=args.gate_channels, typed_kv=args.typed_kv, joint_softmax=args.joint_softmax,
             channel_evidence=args.channel_evidence, gate_trust=args.gate_trust,
             dod_meta=args.dod_meta, lon_merge=args.lon_merge, device=args.device,
         )
@@ -191,7 +191,7 @@ def main(args):
             modes=args.modes,
             use_causal=(not args.baseline), remove=args.remove, remove_k=args.remove_k,
             plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, ego_residual=args.ego_residual,
-            gate_channels=args.gate_channels, typed_kv=args.typed_kv,
+            gate_channels=args.gate_channels, typed_kv=args.typed_kv, joint_softmax=args.joint_softmax,
             channel_evidence=args.channel_evidence, gate_trust=args.gate_trust,
             dod_meta=args.dod_meta, lon_merge=args.lon_merge,
             uniform_mask=args.uniform_mask, device=args.device,
@@ -346,6 +346,9 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', type=str, help='path to data')
     parser.add_argument('--map_path', type=str, help='path to nuplan maps')
     parser.add_argument('--model_path', type=str, help='path to model (frozen GameFormer backbone)')
+    parser.add_argument('--joint_softmax', type=int, default=0,
+                        help='1 = ajan+harita ORTAK softmax paydasi. Checkpoint hangi modda '
+                             'egitildiyse o verilmeli (agirliksiz anahtar, strict=False uyarmaz).')
     parser.add_argument('--ego_residual', type=int, default=1,
                         help='checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)')
     parser.add_argument('--causal_path', type=str, default=None,

@@ -60,6 +60,9 @@ def _gf_futures(gameformer, sample, num_neighbors, device):
 def run_dataset(args):
     files = sorted(glob.glob(os.path.join(args.data, "*.npz")))
     assert files, f"npz bulunamadi: {args.data}"
+    if args.shuffle:
+        import random as _rnd
+        _rnd.Random(args.seed).shuffle(files)     # tekrarlanabilir rastgele ornekleme
     do_r1 = args.mode in ("all", "r1")
     do_r2 = args.mode in ("all", "r2")
     print(f"{len(files)} senaryo bulundu (mode={args.mode}).")
@@ -530,6 +533,8 @@ if __name__ == "__main__":
     p.add_argument("--mode", type=str, default="all", choices=["all", "r1", "r2"],
                    help="r1 = sadece ajan kanallari, r2 = sadece harita kanallari; "
                         "istatistik + JSON + viz + legend HEPSI bu moda uyar")
+    p.add_argument("--shuffle", action="store_true", help="sahneleri rastgele sirala (viz orneklemesi icin)")
+    p.add_argument("--seed", type=int, default=0, help="--shuffle tohumu; farkli sayfalar icin degistir")
     p.add_argument("--out", type=str, default="channels_bev.png")
     p.add_argument("--json", type=str, default=None)
     p.add_argument("--device", type=str, default="cpu")

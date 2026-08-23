@@ -26,7 +26,7 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 
 class CausalRefinerPlanner(PlannerV2):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
-                 use_causal=True, remove='none', remove_k=1, plan_source='cas', nbr_enrich=0, ego_residual=1,
+                 use_causal=True, remove='none', remove_k=1, plan_source='cas', nbr_enrich=0, ego_residual=1, joint_softmax=0,
                  gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
                  dod_meta=0, lon_merge=0, uniform_mask=0, device=None):
         super().__init__(model_path=causal_path, device=device, debug=False,
@@ -38,6 +38,7 @@ class CausalRefinerPlanner(PlannerV2):
         self._modes = modes
         self._nbr_enrich = nbr_enrich
         self._ego_residual = ego_residual
+        self._joint_softmax = joint_softmax
         # Predicate kanallari (channels branch). Checkpoint hangi bayraklarla EGITILDIYSE ayni
         # bayraklar verilmeli; ozellikle typed_kv=1 ckpt'lerde untyped attention dali (Wk_ag/attn_cas)
         # egitimde HIC gradyan almadi -> kanallar deployment'ta uretilemezse model o egitilmemis
@@ -105,7 +106,7 @@ class CausalRefinerPlanner(PlannerV2):
                                     channel_evidence=self._channel_evidence, gate_trust=self._gate_trust,
                                     dod_meta=self._dod_meta,
                                     num_lon=(6 if self._lon_merge else 9),
-                                    uniform_mask=self._uniform_mask)
+                                    uniform_mask=self._uniform_mask, joint_softmax=self._joint_softmax)
         # strict=False: model sonradan modul kazandi (gate_bias, nbr_head, cfd_recon); eski checkpoint'ler
         # bu anahtarlari icermez. Ucu de PLAN YOLUNUN DISINDA: gate_bias yalniz gate='sigmoid' dalinda
         # okunur (planner softmax kurar), nbr_head/cfd_recon yalniz egitim loss'larini besler. Yine de

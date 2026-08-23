@@ -91,7 +91,7 @@ def main(args):
     gameformer = gameformer.to(dev)
     freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9)).to(dev)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9), joint_softmax=args.joint_softmax).to(dev)
     causal.load_state_dict(torch.load(args.causal_path, map_location=dev))
     causal.eval()
 
@@ -263,6 +263,8 @@ if __name__ == "__main__":
     p.add_argument("--gate_trust", type=str, default="all", choices=["all", "reliable"])
     p.add_argument("--dod_meta", type=int, default=0)
     p.add_argument("--lon_merge", type=int, default=0)
+    p.add_argument("--joint_softmax", type=int, default=0,
+        help="1 = ajan+harita ORTAK softmax paydasi (Sum_ajan M_cas serbest). Checkpoint hangi modda EGITILDIYSE o verilmeli -- agirliksiz davranis anahtari, strict=False uyarmaz.")
     p.add_argument("--ego_residual", type=int, default=1,
                    help="checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)")
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"],
