@@ -28,7 +28,8 @@ class CausalRefinerPlanner(PlannerV2):
     def __init__(self, backbone_path, causal_path, num_neighbors=10, graph_layers=3, modes=6,
                  use_causal=True, remove='none', remove_k=1, plan_source='cas', nbr_enrich=0, ego_residual=1, joint_softmax=0,
                  gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
-                 dod_meta=0, lon_merge=0, uniform_mask=0, device=None):
+                 dod_meta=0, lon_merge=0, uniform_mask=0, dec_moe=0, lat_moe=0, cc_select=0,
+                 device=None):
         super().__init__(model_path=causal_path, device=device, debug=False,
                          debug_dir=None, debug_max_plots=0, oracle_mode=False)
         self._backbone_path = backbone_path
@@ -50,6 +51,13 @@ class CausalRefinerPlanner(PlannerV2):
         # dod_meta (H): ckpt hangi degerle egitildiyse o (psi_lon/psi_lat + factored embedding'ler)
         self._dod_meta = dod_meta
         self._lon_merge = lon_merge
+        self._dec_moe = dec_moe          # dec_moe ckpt: 5x5 sozluk + aile-dallari; routing b*'dan
+        self._lat_moe = lat_moe          # lat_moe ckpt: 4x5 sozluk + lat-sinifi GMM expert'leri
+        # cc_select (egitimsiz, 2026-08-26): KARAR-TUTARLI mod secimi — 6 mod icinden ilan
+        # edilen b*'a uyan en yuksek skorlu secilir (oncelik: lon&lat -> lat -> lon -> argmax).
+        # Skorcu karar-kor oldugu icin argmax baglam-tercihli modu secebiliyordu; bu kural
+        # eval'deki karar-tutarli compliance'i deployment davranisina tasir. Retrain yok.
+        self._cc_select = cc_select
         self._uniform_mask = uniform_mask
         self._ch_logged = False          # ilk frame'de kanal durumunu bir kez yazdir
         self._ch_missing_warned = False  # kanal istendi ama ref path yok uyarisi (bir kez)
@@ -104,8 +112,11 @@ class CausalRefinerPlanner(PlannerV2):
                                     ego_residual=self._ego_residual,
                                     gate_channels=self._gate_channels, typed_kv=self._typed_kv,
                                     channel_evidence=self._channel_evidence, gate_trust=self._gate_trust,
-                                    dod_meta=self._dod_meta,
-                                    num_lon=(6 if self._lon_merge else 9),
+                                    dod_meta=self._dod_meta, dec_moe=self._dec_moe,
+                                    lat_moe=self._lat_moe,
+                                    num_lon=(4 if self._lat_moe else 5 if self._dec_moe
+                                             else 6 if self._lon_merge else 9),
+                                    num_lat=(5 if (self._dec_moe or self._lat_moe) else 7),
                                     uniform_mask=self._uniform_mask, joint_softmax=self._joint_softmax)
         # strict=False: model sonradan modul kazandi (gate_bias, nbr_head, cfd_recon); eski checkpoint'ler
         # bu anahtarlari icermez. Ucu de PLAN YOLUNUN DISINDA: gate_bias yalniz gate='sigmoid' dalinda
@@ -172,11 +183,41 @@ class CausalRefinerPlanner(PlannerV2):
         return out
 
     @torch.no_grad()
+    def _cc_pick(self, traj, score, out, ch_ref, fallback):
+        """Karar-tutarli mod secimi: ilan edilen b*'a uyan modlar icinden en yuksek skorlu.
+        Oncelik: (lon & lat) -> lat -> lon -> argmax (fallback). Relabel, egitim/eval ile
+        AYNI fonksiyon (decision_labels), ckpt sozlugune katlanir."""
+        from GameFormer.decision_labels import (decision_labels, LON4_MAP, LAT5V_MAP,
+                                                LON5_MAP, LAT5_MAP)
+        M = traj.shape[0]
+        xy = traj[:, :, :2].detach().cpu()
+        d = xy[:, 1:] - xy[:, :-1]
+        hd = torch.atan2(d[..., 1], d[..., 0])
+        hd = torch.cat([hd[:, :1], hd], dim=1)
+        plans = torch.cat([xy, hd.unsqueeze(-1)], dim=-1)                 # [M,80,3]
+        rl, rt = decision_labels(plans, ch_ref.cpu().expand(M, -1, -1, -1))
+        if self._lat_moe:
+            rl, rt = torch.tensor(LON4_MAP)[rl], torch.tensor(LAT5V_MAP)[rt]
+        elif self._dec_moe:
+            rl, rt = torch.tensor(LON5_MAP)[rl], torch.tensor(LAT5_MAP)[rt]
+        bl = int(out['psi_lon_cas'][0].argmax())
+        bt = int(out['psi_lat_cas'][0].argmax())
+        sc = score.detach().cpu()
+        for ok in ((rl == bl) & (rt == bt), (rt == bt), (rl == bl)):
+            if bool(ok.any()):
+                s2 = sc.clone()
+                s2[~ok] = -1e9
+                return int(s2.argmax())
+        return fallback
+
     def _causal_neural_plan(self, features, ch_ref_path=None):
         out = self._run_causal(features, ch_ref_path)
         traj_key, score_key = ('traj_cfd', 'score_cfd') if self._plan_source == 'cfd' else ('traj', 'score')
         traj = out[traj_key][0, 0]                    # [M,80,4]
         best = int(out[score_key][0, 0].argmax().item())
+        if (self._cc_select and self._dod_meta and ch_ref_path is not None
+                and out.get('psi_lon_cas') is not None):
+            best = self._cc_pick(traj, out[score_key][0, 0], out, ch_ref_path, best)
         xy = traj[best, :, :2].detach().cpu().numpy()   # [80,2] ego-frame
         diffs = np.diff(xy, axis=0)
         heading = np.arctan2(diffs[:, 1], diffs[:, 0])

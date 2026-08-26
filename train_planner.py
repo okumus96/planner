@@ -86,10 +86,15 @@ NUM_MANEUVERS = 5
 # --- dod_meta (H): factored (lon x lat) meta-aksiyon DOD'u (decision_labels.py) ---
 # CE agirliklari ve lon_merge remap'i; main() bayraklara gore gunceller (varsayilan tam 9 sinif).
 from GameFormer.decision_labels import (LON_CE_WEIGHT, LAT_CE_WEIGHT, LON_MERGE_MAP,
-                                        LON_MERGED_CE_WEIGHT, NUM_LON, NUM_LAT, NUM_LON_MERGED)
+                                        LON_MERGED_CE_WEIGHT, NUM_LON, NUM_LAT, NUM_LON_MERGED,
+                                        LON5_MAP, LAT5_MAP, LON5_CE_WEIGHT, LAT5_CE_WEIGHT,
+                                        NUM_LON5, NUM_LAT5,
+                                        LON4_MAP, LAT5V_MAP, LON4_CE_WEIGHT, LAT5V_CE_WEIGHT,
+                                        NUM_LON4, NUM_LAT5V)
 _LON_W = torch.tensor(LON_CE_WEIGHT, dtype=torch.float32)
 _LAT_W = torch.tensor(LAT_CE_WEIGHT, dtype=torch.float32)
 _LON_REMAP = None      # lon_merge=1 -> LongTensor[9], etiketleri 6 sinifa katlar
+_LAT_REMAP = None      # dec_moe=1 -> LongTensor[7], etiketleri 5 sinifa katlar
 
 
 def _resample_arc(xy, n):
@@ -185,8 +190,10 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
         # Iki head'in terimleri ORTALANIR ki lambda_kld/lambda_ci olcekleri 5-sinif kosularla
         # karsilastirilabilir kalsin.
         lon_star, lat_star = dec_labels
-        if _LON_REMAP is not None:                                 # lon_merge: 9 -> 6 sinif
+        if _LON_REMAP is not None:                                 # lon_merge: 9->6 / dec_moe: 9->5
             lon_star = _LON_REMAP.to(lon_star.device)[lon_star]
+        if _LAT_REMAP is not None:                                 # dec_moe: 7 -> 5 sinif
+            lat_star = _LAT_REMAP.to(lat_star.device)[lat_star]
         w_lon = _LON_W.to(out['psi_lon_cas'].device)
         w_lat = _LAT_W.to(out['psi_lat_cas'].device)
         l_kld = 0.5 * (F.cross_entropy(out['psi_lon_cas'], lon_star, weight=w_lon)
@@ -466,10 +473,30 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
 def model_training(args):
     # dod_meta + lon_merge: CE agirliklarini ve etiket remap'ini birlesik siniflara gecir
     # (loss fonksiyonu modul-global _LON_W/_LON_REMAP uzerinden okur).
-    global _LON_W, _LON_REMAP
+    global _LON_W, _LON_REMAP, _LAT_W, _LAT_REMAP
     if args.dod_meta and args.lon_merge:
         _LON_W = torch.tensor(LON_MERGED_CE_WEIGHT, dtype=torch.float32)
         _LON_REMAP = torch.tensor(LON_MERGE_MAP, dtype=torch.long)
+    if args.dec_moe:
+        # dec_moe: HER IKI eksen 5 sinifa katlanir (LON5/LAT5); lon_merge ile birlesmez.
+        assert args.dod_meta and not args.lon_merge, "dec_moe: dod_meta=1, lon_merge=0 gerektirir"
+        _LON_W = torch.tensor(LON5_CE_WEIGHT, dtype=torch.float32)
+        _LON_REMAP = torch.tensor(LON5_MAP, dtype=torch.long)
+        _LAT_W = torch.tensor(LAT5_CE_WEIGHT, dtype=torch.float32)
+        _LAT_REMAP = torch.tensor(LAT5_MAP, dtype=torch.long)
+    if args.dod_tf:
+        # dod_tf: ham 9x7 etiket embedding'e gider -> lon_merge (6-sinif embedding) ile uyumsuz.
+        # Sozluk/loss AYNEN 9x7 kalir: agirlik/remap degismez.
+        assert args.dod_meta and not args.lon_merge and not args.dec_moe, \
+            "dod_tf: dod_meta=1, lon_merge=0, dec_moe=0 gerektirir"
+    if args.lat_moe:
+        # lat_moe (v2): 4x5 GERCEK sozluk (LON4/LAT5V) + lat-sinifi basina GMM expert.
+        assert args.dod_meta and not (args.lon_merge or args.dec_moe or args.dod_tf), \
+            "lat_moe: dod_meta=1; lon_merge/dec_moe/dod_tf ile birlesmez"
+        _LON_W = torch.tensor(LON4_CE_WEIGHT, dtype=torch.float32)
+        _LON_REMAP = torch.tensor(LON4_MAP, dtype=torch.long)
+        _LAT_W = torch.tensor(LAT5V_CE_WEIGHT, dtype=torch.float32)
+        _LAT_REMAP = torch.tensor(LAT5V_MAP, dtype=torch.long)
 
     log_path = f"./training_log/{args.name}/"
     os.makedirs(log_path, exist_ok=True)
@@ -508,9 +535,12 @@ def model_training(args):
                            gate_channels=args.gate_channels, typed_kv=args.typed_kv,
                            channel_evidence=args.channel_evidence,
                            gate_trust=args.gate_trust,
-                           dod_meta=args.dod_meta,
-                           num_lon=(NUM_LON_MERGED if args.lon_merge else NUM_LON),
-                           num_lat=NUM_LAT).to(args.device)
+                           dod_meta=args.dod_meta, dec_moe=args.dec_moe, dod_tf=args.dod_tf,
+                           lat_moe=args.lat_moe,
+                           num_lon=(NUM_LON4 if args.lat_moe else NUM_LON5 if args.dec_moe
+                                    else NUM_LON_MERGED if args.lon_merge else NUM_LON),
+                           num_lat=(NUM_LAT5V if args.lat_moe
+                                    else NUM_LAT5 if args.dec_moe else NUM_LAT)).to(args.device)
 
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 12, 14, 16, 18], gamma=0.5)
@@ -523,6 +553,8 @@ def model_training(args):
 
     for epoch in range(args.train_epochs):
         logging.info(f"Epoch {epoch + 1}/{args.train_epochs}")
+        # scheduled sampling: p(tahminle kosulla) 0 -> ss_max lineer rampa (yalniz TF varyantlari okur)
+        causal.ss_p = args.ss_max * epoch / max(1, args.train_epochs - 1)
         train_m = _run_epoch(train_loader, gameformer, causal, args.device, args.num_neighbors,
                              args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_recon, args.lambda_nbr,
                              args.lambda_budget, args.budget_rho, args.budget_lo,
@@ -614,6 +646,26 @@ if __name__ == "__main__":
     parser.add_argument("--lon_merge", type=int, default=0,
                         help="dod_meta ile: quickly/gently katla (9 -> 6 lon sinifi). psi_lon confusion "
                              "matrisi ayrimi ogrenemezse acilir; extractor'a dokunmaz.")
+    parser.add_argument("--lat_moe", type=int, default=0,
+                        help="v2 (2026-08-25): 4x5 GERCEK sozluk (LON4: stop/slow/accel/maintain, "
+                             "LAT5V: turn_l/turn_r/to_left/to_right/none) + CA sonrasi LAT SINIFI "
+                             "basina GMM expert (5; olculmus lateral mode collapse'a karsi). Lon "
+                             "dallanmaz (embedding+TF). Egitimde GT routing (TF); --ss_max ile "
+                             "scheduled sampling. dod_meta gerektirir.")
+    parser.add_argument("--ss_max", type=float, default=0.0,
+                        help="scheduled sampling tavani: egitimde GT yerine TAHMINLE kosullama "
+                             "olasiligi 0'dan bu degere lineer rampa (TF varyantlari icin; 0 = saf TF).")
+    parser.add_argument("--dod_tf", type=int, default=0,
+                        help="YALNIZ teacher forcing (dec_moe ablasyon basamagi): egitimde karar "
+                             "embedding'ine psi'nin tahmini yerine GT (lon,lat) verilir; sozluk "
+                             "9x7 AYNEN, dal yok. dod_meta gerektirir; lon_merge/dec_moe ile birlesmez.")
+    parser.add_argument("--dec_moe", type=int, default=0,
+                        help="karar-kapili expert decoder (hard MoE / CIL-branch, FAKTORLU cift-eksen): "
+                             "sozluk 5x5'e katlanir (LON5/LAT5); lat AILESI (left/right/none) q_enh "
+                             "dalini, lon AILESI (brake/hold/cruise) predictor dalini secer. Egitimde "
+                             "GT karar (teacher forcing/oracle routing), inference'ta b*. Amac: karari "
+                             "yapisal baglayici kilmak (b*-swap compliance teshisinin mimari cozumu). "
+                             "dod_meta=1 gerektirir, lon_merge ile birlesmez.")
     parser.add_argument("--joint_softmax", type=int, default=0,
                         help="1 = ajan ve harita girdileri ORTAK softmax paydasini paylasir "
                              "(Sum_ajan M_cas serbest kalir) | 0 = ayri softmax (varsayilan). "

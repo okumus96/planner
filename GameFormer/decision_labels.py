@@ -58,6 +58,51 @@ LON_MERGED_CLASSES = ['remain_stopped', 'stop', 'slow', 'accel', 'maintain', 're
 NUM_LON_MERGED = len(LON_MERGED_CLASSES)
 LON_MERGED_CE_WEIGHT = [0.74, 7.31, 2.26, 0.46, 0.53, 1.0]   # birlesik sayimlardan ayni formul
 
+# ---------------------------------------------------------------------------
+# dec_moe (karar-kapili expert decoder, tasarim 2026-08-25): HER IKI eksende
+# azaltilmis 5x5 sozluk + aile haritalari. Cache'teki etiketler 9x7 KALIR
+# (yeniden extraction yok); katlama egitim aninda remap ile (lon_merge kalibi).
+#
+# LON 9 -> 5: quickly/gently katlanir; reverse (20k train'de 0 ornek) remain_stopped'a.
+# LAT 7 -> 5: inlane_left/right -> none (surukleme, karar degil); LC ilanda kalir.
+# CE agirliklari ayni formul (w = N/(K*n), cap 10) 20k sayimlardan:
+#   lon5 n = [4499, 456, 1475, 7256, 6314], lat5 n = [6130, 2955, 235, 291, 10389].
+LON5_MAP = [0, 1, 1, 2, 2, 3, 3, 4, 0]        # LON_CLASSES(9) -> LON5
+LON5_CLASSES = ['remain_stopped', 'stop', 'slow', 'accel', 'maintain']
+NUM_LON5 = len(LON5_CLASSES)
+LON5_CE_WEIGHT = [0.89, 8.77, 2.71, 0.55, 0.63]
+LAT5_MAP = [0, 1, 2, 3, 4, 4, 4]              # LAT_CLASSES(7) -> LAT5
+LAT5_CLASSES = ['turn_left', 'turn_right', 'lane_change_left', 'lane_change_right', 'none']
+NUM_LAT5 = len(LAT5_CLASSES)
+LAT5_CE_WEIGHT = [0.65, 1.35, 10.0, 10.0, 0.39]
+
+# Expert AILELERI — faktorlu cift-eksen gating: lon ailesi PREDICTOR dalini (hiz
+# profili yasasi), lat ailesi Q_ENH dalini (yon/mod hedefi) secer. 3+3 modul 9
+# kombinasyonu kapsar; her modul kendi ekseninin TUM verisini gorur (joint 3x3=9
+# expert'te HOLDxRIGHT %0.5'e duserdi -> aclik). Aileler binding-test olcum
+# aileleriyle (SLOW/HOLD/GO) hizali: unbrake = predictor-dal degisimi.
+LON5_FAMILY = [1, 0, 0, 2, 2]                 # 0=BRAKE{stop,slow} 1=HOLD{remain} 2=CRUISE{accel,maintain}
+LON_FAMILY_NAMES = ['brake', 'hold', 'cruise']
+LAT5_FAMILY = [0, 1, 0, 1, 2]                 # 0=LEFT{turn_l,lc_l} 1=RIGHT{turn_r,lc_r} 2=NONE
+LAT_FAMILY_NAMES = ['left', 'right', 'none']
+NUM_FAMILIES = 3
+
+# ---------------------------------------------------------------------------
+# lat_moe (v2 sozlugu, kullanici karari 2026-08-25): 4x5 GERCEK etiket uzayi.
+# LON 9 -> 4: stop{remain_stopped,stop_q,stop_g} / slow / accel / maintain; reverse (0 ornek)
+# stop'a katlanir. LAT 7 -> 5: turn_left / turn_right / to_left{lc_l,inlane_l} /
+# to_right{lc_r,inlane_r} / none. Sinif = aile (ayri aile katmani yok).
+# CE agirliklari ayni formul (w = N/(K*n)) 20k train sayimlarindan:
+#   lon4 n = [4955, 1475, 7256, 6314], lat5v n = [6130, 2955, 758, 907, 9250].
+LON4_MAP = [0, 0, 0, 1, 1, 2, 2, 3, 0]        # LON_CLASSES(9) -> LON4
+LON4_CLASSES = ['stop', 'slow', 'accel', 'maintain']
+NUM_LON4 = len(LON4_CLASSES)
+LON4_CE_WEIGHT = [1.01, 3.39, 0.69, 0.79]
+LAT5V_MAP = [0, 1, 2, 3, 2, 3, 4]             # LAT_CLASSES(7) -> LAT5V
+LAT5V_CLASSES = ['turn_left', 'turn_right', 'to_left', 'to_right', 'none']
+NUM_LAT5V = len(LAT5V_CLASSES)
+LAT5V_CE_WEIGHT = [0.65, 1.35, 5.28, 4.41, 0.43]
+
 DT = 0.1                 # [s] frame araligi
 LON_WINDOW = 40          # longitudinal pencere: ilk 4 s
 V_STOP = 0.5             # [m/s] altinda "duruk" sayilir

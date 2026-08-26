@@ -38,6 +38,9 @@ from .relevance_graph import (
 from .channels import (compute_channels, compute_map_channels, select_ego_corridor,
                        NUM_CHANNELS, NUM_EVIDENCE, NUM_MAP_CHANNELS, NUM_MAP_EVIDENCE,
                        CH_COLLISION_COURSE, CH_SHARES_INTERSECTION, CH_MERGES)
+from .decision_labels import (LON5_MAP, LAT5_MAP, NUM_LON5, NUM_LAT5,
+                              LON5_FAMILY, LAT5_FAMILY, NUM_FAMILIES,
+                              LON4_MAP, LAT5V_MAP, NUM_LON4, NUM_LAT5V)
 
 NUM_AGENT_TYPES = 4  # ego, vehicle, pedestrian, bicycle
 CONFLICT_FEATURE_DIM = 4  # [d_route, d_ego_aligned, d_ego_spatial, approaching]
@@ -852,10 +855,13 @@ class CausalEgoHead(nn.Module):
     """
 
     def __init__(self, dim=256, modes=6, dropout=0.1, num_maneuvers=5,
-                 dod_meta=False, num_lon=9, num_lat=7):
+                 dod_meta=False, num_lon=9, num_lat=7, dec_moe=False, lat_moe=False):
         super().__init__()
         self.dim, self.modes = dim, modes
         self.dod_meta = bool(dod_meta)
+        self.dec_moe = bool(dec_moe)
+        self.lat_moe = bool(lat_moe)
+        assert not (self.dec_moe and self.lat_moe), "dec_moe ile lat_moe birlesmez"
         self.mode_query = nn.Embedding(modes, dim)
         # DOD (CP III-C): tahmin edilen karar (b* = argmax psi) decoder query'sine besleniyor.
         # decision_emb[b*] her mode query ile birlesip MLP'den gecer -> q_enh = MLP([q_mode; theta_b*]).
@@ -867,9 +873,42 @@ class CausalEgoHead(nn.Module):
             self.decision_emb_lat = nn.Embedding(num_lat, dim)
         else:
             self.decision_emb = nn.Embedding(num_maneuvers, dim)
-        self.q_enh = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU(), nn.Linear(dim, dim))
         self.cross = CrossTransformer(dim=dim, dropout=dropout)
-        self.predictor = GMMPredictor(modalities=modes)
+        if self.dec_moe:
+            # dec_moe (hard MoE / CIL-branch, FAKTORLU cift-eksen): lat AILESI
+            # (left/right/none) q_enh dalini, lon AILESI (brake/hold/cruise) predictor
+            # dalini secer. Embedding-kosullama korunur (aile ICI nuans) ama tek kanal
+            # artik o degil: aile degisince MODUL degisir -> karar YAPISAL baglayici.
+            # b*-swap'in olctugu "readout ama kol degil" patolojisinin mimari cozumu
+            # (CIL 2018: komut input verilirse ag yok sayar, branch SECMELI). Ornek
+            # basina gradyan yalniz aktif (lat-dal, lon-dal) ciftine akar. mode_query +
+            # cross PAYLASILIR (CIL'in ortak algi govdesi karsiligi).
+            assert self.dod_meta, "dec_moe dod_meta gerektirir"
+            assert num_lon == NUM_LON5 and num_lat == NUM_LAT5, \
+                "dec_moe 5x5 sozluk gerektirir (num_lon=5, num_lat=5)"
+            self.register_buffer('lon_family', torch.tensor(LON5_FAMILY, dtype=torch.long))
+            self.register_buffer('lat_family', torch.tensor(LAT5_FAMILY, dtype=torch.long))
+            self.q_enh_fam = nn.ModuleList(
+                [nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU(), nn.Linear(dim, dim))
+                 for _ in range(NUM_FAMILIES)])
+            self.predictor_fam = nn.ModuleList(
+                [GMMPredictor(modalities=modes) for _ in range(NUM_FAMILIES)])
+        elif self.lat_moe:
+            # lat_moe (v2, 2026-08-25): expert'ler CIKIS tarafinda ve LAT SINIFI basina (5,
+            # katlama yok — sinif=expert). Gerekce OLCULMUS lateral mode collapse: any-mode
+            # lon %55-96 (mod seti hiz alternatiflerini iceriyor) ama any-mode lat %4-20
+            # (donus alternatifi yok). Uretec expert'i coken eksene koyulur: GMM[turn_left]
+            # yalniz sola-giden sahnelerle egitilir -> tum cikti dagilimi solcu olur ve lat
+            # zorlamasi ilk kez gercek bir uretec degistirir. Lon dallanmaz: embedding + TF
+            # + karar-tutarli secim tasir (v3'te bile lon any-mode yuksekti). q_enh + cross
+            # PAYLASILIR.
+            assert self.dod_meta, "lat_moe dod_meta gerektirir"
+            self.q_enh = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU(), nn.Linear(dim, dim))
+            self.predictor_fam = nn.ModuleList(
+                [GMMPredictor(modalities=modes) for _ in range(num_lat)])
+        else:
+            self.q_enh = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU(), nn.Linear(dim, dim))
+            self.predictor = GMMPredictor(modalities=modes)
 
     def forward(self, f_cas, ego_token, b_star=None):
         # ego_token = TEMIZ ego (ego_clean): confounding sizintisi olmasin diye. Head'e sahne bilgisi
@@ -878,6 +917,55 @@ class CausalEgoHead(nn.Module):
         ctx = torch.cat([f_cas[:, None], ego_token[:, None]], dim=1)             # [B,2,D]
         ctx_pad = torch.zeros(B, 2, dtype=torch.bool, device=f_cas.device)       # ikisi de gecerli
         q = self.mode_query.weight[None].expand(B, -1, -1)                       # [B,M,D]
+        if self.dec_moe:
+            assert b_star is not None, "dec_moe karar gerektirir"
+            b_lon, b_lat = b_star                                                # ([B], [B]) 5-sinif
+            dec_vec = self.decision_emb_lon(b_lon) + self.decision_emb_lat(b_lat)
+            dec = dec_vec[:, None].expand(-1, self.modes, -1)                    # [B,M,D]
+            qc = torch.cat([q, dec], dim=-1)                                     # [B,M,2D]
+            # 1) lat ailesi -> q_enh dali (yon/mod hedefi)
+            qe = None
+            famL = self.lat_family[b_lat]                                        # [B] 0/1/2
+            for f in range(len(self.q_enh_fam)):
+                idx = (famL == f).nonzero(as_tuple=True)[0]
+                if idx.numel() == 0:
+                    continue
+                out_f = self.q_enh_fam[f](qc[idx])                               # [b,M,D]
+                if qe is None:
+                    qe = out_f.new_zeros(B, self.modes, self.dim)
+                qe[idx] = out_f
+            content = self.cross(qe, ctx, ctx, mask=ctx_pad)                     # [B,M,D] tek gecis
+            # 2) lon ailesi -> predictor dali (hiz profili yasasi)
+            traj = score = None
+            famS = self.lon_family[b_lon]                                        # [B] 0/1/2
+            for f in range(len(self.predictor_fam)):
+                idx = (famS == f).nonzero(as_tuple=True)[0]
+                if idx.numel() == 0:
+                    continue
+                tf_, sf_ = self.predictor_fam[f](content[idx].unsqueeze(1))      # [b,1,M,80,4], [b,1,M]
+                if traj is None:
+                    traj = tf_.new_zeros((B,) + tf_.shape[1:])
+                    score = sf_.new_zeros((B,) + sf_.shape[1:])
+                traj[idx], score[idx] = tf_, sf_
+            return traj, score
+        if self.lat_moe:
+            assert b_star is not None, "lat_moe karar gerektirir"
+            b_lon, b_lat = b_star                                                # ([B], [B])
+            dec_vec = self.decision_emb_lon(b_lon) + self.decision_emb_lat(b_lat)
+            dec = dec_vec[:, None].expand(-1, self.modes, -1)                    # [B,M,D]
+            q = self.q_enh(torch.cat([q, dec], dim=-1))                          # paylasilan
+            content = self.cross(q, ctx, ctx, mask=ctx_pad)                      # [B,M,D] tek gecis
+            traj = score = None
+            for c in range(len(self.predictor_fam)):                             # lat SINIFI dali
+                idx = (b_lat == c).nonzero(as_tuple=True)[0]
+                if idx.numel() == 0:
+                    continue
+                tf_, sf_ = self.predictor_fam[c](content[idx].unsqueeze(1))      # [b,1,M,80,4]
+                if traj is None:
+                    traj = tf_.new_zeros((B,) + tf_.shape[1:])
+                    score = sf_.new_zeros((B,) + sf_.shape[1:])
+                traj[idx], score[idx] = tf_, sf_
+            return traj, score
         if b_star is not None:
             # DOD: her mode query'ye tahmin edilen karari (embedding) besle.
             if self.dod_meta:
@@ -899,9 +987,33 @@ class CausalPlanner(nn.Module):
                  recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax',
                  conflict_feats=0, conflict_bias=0, compute_conflict=0, aligned_mode='straight',
                  ego_residual=1, gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
-                 dod_meta=0, num_lon=9, num_lat=7, uniform_mask=0, joint_softmax=0):
+                 dod_meta=0, num_lon=9, num_lat=7, uniform_mask=0, joint_softmax=0, dec_moe=0,
+                 dod_tf=0, lat_moe=0):
         super().__init__()
         self.dod_meta = bool(dod_meta)
+        self.dec_moe = bool(dec_moe)
+        self.lat_moe = bool(lat_moe)
+        # dod_tf: YALNIZ teacher forcing (dal yok, sozluk 9x7 aynen) — dec_moe ablasyonunun
+        # "TF tek basina yeter mi?" basamagi. Egitimde embedding'e GT (lon,lat) verilir.
+        self.dod_tf = bool(dod_tf)
+        # scheduled sampling (SS): egitimde ss_p olasilikla GT yerine TAHMIN (b*) ile kosulla.
+        # Egitim dongusu epoch basina set eder (0 -> ss_max lineer). Amac: exposure bias'i
+        # kapatmak (saf TF'te train 0.55 / val 1.08 makasi olculdu) — model kendi hatali
+        # kararlariyla yasamayi ogrenir. ss_p=0 = saf TF.
+        self.ss_p = 0.0
+        assert not (self.dod_tf and not self.dod_meta), "dod_tf dod_meta gerektirir"
+        assert not (self.dod_tf and self.dec_moe), "dod_tf ile dec_moe birlesmez (dec_moe zaten TF icerir)"
+        assert not (self.lat_moe and (self.dec_moe or self.dod_tf)), \
+            "lat_moe tek basina (TF'i zaten icerir)"
+        assert not (self.lat_moe and not self.dod_meta), "lat_moe dod_meta gerektirir"
+        if self.dec_moe:
+            # Cache etiketleri ham 9x7; model 5x5 calisir -> teacher-forcing remap'i icin.
+            self.register_buffer('lon5_remap', torch.tensor(LON5_MAP, dtype=torch.long))
+            self.register_buffer('lat5_remap', torch.tensor(LAT5_MAP, dtype=torch.long))
+        if self.lat_moe:
+            # Cache etiketleri ham 9x7; model 4x5 calisir -> teacher-forcing remap'i icin.
+            self.register_buffer('lon4_remap', torch.tensor(LON4_MAP, dtype=torch.long))
+            self.register_buffer('lat5v_remap', torch.tensor(LAT5V_MAP, dtype=torch.long))
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
                                                   gate=gate, conflict_feats=conflict_feats,
                                                   conflict_bias=conflict_bias,
@@ -918,7 +1030,8 @@ class CausalPlanner(nn.Module):
         self.disentangler.compute_conflict = bool(compute_conflict or conflict_feats or conflict_bias)
         self.disentangler.aligned_mode = aligned_mode
         self.head = CausalEgoHead(dim, modes, dropout, num_maneuvers=num_maneuvers,
-                                  dod_meta=dod_meta, num_lon=num_lon, num_lat=num_lat)
+                                  dod_meta=dod_meta, num_lon=num_lon, num_lat=num_lat,
+                                  dec_moe=dec_moe, lat_moe=lat_moe)
         # PAYLASILAN karar head'i (Causal-Planner gibi: decisioon_decoder causal VE confound icin AYNI).
         # Ayri head'ler kullanirsak confound head'i "girdiyi yok say -> uniform" hilesiyle entropy'yi
         # trivial cozuyor (gradyan 0 -> f_cfd sekillenmez). Paylasinca head causal'i dogru tahmin etmek
@@ -992,7 +1105,31 @@ class CausalPlanner(nn.Module):
 
         # ANA plan: head'e TEMIZ ego (ego_clean) + SADECE f_cas + karar-embedding girer. f_cas artik
         # gate'li ajan+harita tasir -> trajectory yalnizca causal ajanlar+harita+ego+karara bagli.
-        traj, score = self.head(f_cas, dis['ego_clean'], b_star)        # [B,1,M,80,4], [B,1,M]
+        b_head = b_star
+        if (self.dec_moe or self.dod_tf or self.lat_moe) and self.training:
+            # CIL-tarzi ORACLE besleme (teacher forcing): egitimde karar GT'den verilir.
+            # b* = argmax psi(f_cas), f_cas'in deterministik fonksiyonu oldugu icin slot
+            # sifir MARJINAL bilgi tasiyordu ve head okumayi ogrenmiyordu (b*-swap teshisi:
+            # agreement yuksek, compliance %0-33). GT etiket f_cas'in fonksiyonu DEGIL -> head
+            # okumak zorunda. Inference'ta (eval/deployment) tahmin (b*) kullanilir.
+            # dec_moe : GT hem DALLARI hem embedding'i secer (5x5 remap'li).
+            # dod_tf  : GT yalniz embedding'e gider (9x7 ham, dal yok) -- saf-TF ablasyonu.
+            # lat_moe : GT embedding'i VE lat-expert dalini secer (4x5 remap'li).
+            gt_lon, gt_lat = inputs.get('decision_lon'), inputs.get('decision_lat')
+            if gt_lon is not None:
+                if self.dec_moe:
+                    tl, tt = self.lon5_remap[gt_lon], self.lat5_remap[gt_lat]    # ham 9/7 -> 5/5
+                elif self.lat_moe:
+                    tl, tt = self.lon4_remap[gt_lon], self.lat5v_remap[gt_lat]   # ham 9/7 -> 4/5
+                else:
+                    tl, tt = gt_lon, gt_lat                                      # ham 9/7 aynen
+                if self.ss_p > 0.0:
+                    # scheduled sampling: ornek basina ss_p olasilikla GT yerine tahmin.
+                    u = torch.rand(tl.shape[0], device=tl.device) < self.ss_p
+                    tl = torch.where(u, b_star[0], tl)
+                    tt = torch.where(u, b_star[1], tt)
+                b_head = (tl, tt)
+        traj, score = self.head(f_cas, dis['ego_clean'], b_head)        # [B,1,M,80,4], [B,1,M]
 
         # Tanı/ablasyon amaçlı: f_cfd'den de bir plan üret (aynı EĞİTİLMİŞ head ile). Varsayılan KAPALI.
         traj_cfd = score_cfd = None

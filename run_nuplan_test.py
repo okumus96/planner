@@ -193,7 +193,8 @@ def main(args):
             plan_source=args.plan_source, nbr_enrich=args.nbr_enrich, ego_residual=args.ego_residual,
             gate_channels=args.gate_channels, typed_kv=args.typed_kv, joint_softmax=args.joint_softmax,
             channel_evidence=args.channel_evidence, gate_trust=args.gate_trust,
-            dod_meta=args.dod_meta, lon_merge=args.lon_merge,
+            dod_meta=args.dod_meta, lon_merge=args.lon_merge, dec_moe=args.dec_moe,
+            lat_moe=args.lat_moe, cc_select=args.cc_select,
             uniform_mask=args.uniform_mask, device=args.device,
         )
         print(f"[CAUSAL+REFINER] causal={args.causal_path}  "
@@ -383,6 +384,17 @@ if __name__ == "__main__":
                         help='ckpt hangi degerle egitildiyse o: factored (lon x lat) meta-aksiyon DOD\'u (H).')
     parser.add_argument('--lon_merge', type=int, default=0,
                         help='ckpt lon_merge=1 ile egitildiyse o (6 lon sinifi).')
+    parser.add_argument('--cc_select', type=int, default=0,
+                        help='KARAR-TUTARLI mod secimi (egitimsiz): 6 mod icinden ilan edilen '
+                             'b*ya uyan en yuksek skorlu secilir (lon&lat -> lat -> lon -> argmax). '
+                             'dod_meta ckpt gerektirir; yalniz refiner.')
+    parser.add_argument('--lat_moe', type=int, default=0,
+                        help='ckpt lat_moe=1 ile egitildiyse o: 4x5 sozluk + lat-sinifi basina GMM '
+                             'expert (routing b*\'dan). Yalniz --deploy refiner destekli.')
+    parser.add_argument('--dec_moe', type=int, default=0,
+                        help='ckpt dec_moe=1 ile egitildiyse o: 5x5 sozluk + karar-kapili expert '
+                             'decoder (lat ailesi q_enh, lon ailesi predictor dalini secer; '
+                             'deployment routing b*\'dan). Yalniz --deploy refiner destekli.')
     parser.add_argument('--uniform_mask', type=int, default=0,
                         help='RULES-ONLY baseline: kural girdiyi secer, AGIRLIK ogrenilmez -- '
                              'gate\'ten gecen girdiler uzerinde uniform. Ogrenilmis tahsisin '
