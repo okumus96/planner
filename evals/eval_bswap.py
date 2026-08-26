@@ -34,7 +34,8 @@ from GameFormer.decision_labels import (decision_labels, LON_CLASSES, LAT_CLASSE
                                         LON5_MAP, LAT5_MAP, LON5_CLASSES, LAT5_CLASSES,
                                         NUM_LON5, NUM_LAT5,
                                         LON4_MAP, LAT5V_MAP, LON4_CLASSES, LAT5V_CLASSES,
-                                        NUM_LON4, NUM_LAT5V)
+                                        NUM_LON4, NUM_LAT5V,
+                                        LAT5L_MAP, LAT5L_CLASSES, NUM_LAT5L)
 from train_planner import read_batch, extract_neighbor_top1_futures, freeze_gameformer
 
 # aile katlamasi: hareketli ego'ya zorlanmis "dur" ailesi tek grupta adil olculur
@@ -131,15 +132,18 @@ def main(args):
     # test dec_moe'de tam olarak "salter cevirince baska devre calisiyor mu"yu olcer.
     if args.lat_moe:
         # lat_moe: model 4x5 konusur; 4x5 gorunumle BIREBIR ayni uzay -> fold = kimlik.
-        n_lon, n_lat = NUM_LON4, NUM_LAT5V
-        cls_lon, cls_lat = LON4_CLASSES, LAT5V_CLASSES
+        # lat_moe=1: LAT5V (to_*); lat_moe=2: LAT5L (v4, LC birinci-sinif).
+        _lat_cls = LAT5L_CLASSES if int(args.lat_moe) >= 2 else LAT5V_CLASSES
+        _lat_map = LAT5L_MAP if int(args.lat_moe) >= 2 else LAT5V_MAP
+        n_lon, n_lat = NUM_LON4, len(_lat_cls)
+        cls_lon, cls_lat = LON4_CLASSES, _lat_cls
         fam_lon = {i: LON4_CLASSES[i] for i in range(NUM_LON4)}
-        fam_lat = {i: LAT5V_CLASSES[i] for i in range(NUM_LAT5V)}
+        fam_lat = {i: _lat_cls[i] for i in range(len(_lat_cls))}
         lon_map = torch.tensor(LON4_MAP, dtype=torch.long)
-        lat_map = torch.tensor(LAT5V_MAP, dtype=torch.long)
+        lat_map = torch.tensor(_lat_map, dtype=torch.long)
         slow_cls, acc_cls = (0, 1), (2,)          # stop, slow -> hiz dussun; accel -> artsin
         lon_fold = torch.arange(NUM_LON4)
-        lat_fold = torch.arange(NUM_LAT5V)
+        lat_fold = torch.arange(len(_lat_cls))
     elif args.dec_moe:
         n_lon, n_lat = NUM_LON5, NUM_LAT5
         cls_lon, cls_lat = LON5_CLASSES, LAT5_CLASSES
@@ -274,6 +278,11 @@ def main(args):
             f4 = int(lon_fold[c])
             if f4 >= 0:
                 m4 = (lon_fold[b_lon.cpu()] != f4) & mask.cpu()      # ilan zaten ailedeyse zorlama degil
+                if f4 == 1:
+                    # SLOW tanimsal dislama (kullanici karari 2026-08-26): v0 < 1.0 m/s'de
+                    # >=1 m/s kaybetmek imkansiz — hicbir plan "slow" etiketi alamaz; bu
+                    # zorlamalar paydadan cikar (durana yavasla demek testin hatasi).
+                    m4 &= (vstart >= 1.0).cpu()
                 arg_ok4 = (lon_fold[rlF.cpu()] == f4)
                 any_ok4 = (lon_fold[rlA].view(B, M) == f4).any(dim=1)
                 n4[f4] += int(m4.sum())
@@ -370,12 +379,14 @@ def main(args):
     for f in range(4):
         if n4[f] == 0:
             continue
-        print(f"  {LON4_NAMES[f]:16s} {n4[f]:6d} {100*arg4[f]/n4[f]:7.1f}% {100*cc4[f]/n4[f]:13.1f}%")
+        _vn = cls_lon[f] if args.lat_moe else LON4_NAMES[f]        # 4x5-native modelde kendi adi
+        print(f"  {_vn:16s} {n4[f]:6d} {100*arg4[f]/n4[f]:7.1f}% {100*cc4[f]/n4[f]:13.1f}%")
     print(f"\n  {'zorlanan (lat)':16s} {'n':>6s} {'argmax':>8s} {'karar-tutarli':>14s}")
     for f in range(5):
         if n5[f] == 0:
             continue
-        print(f"  {LAT5V_NAMES[f]:16s} {n5[f]:6d} {100*arg5[f]/n5[f]:7.1f}% {100*cc5[f]/n5[f]:13.1f}%")
+        _vn = cls_lat[f] if args.lat_moe else LAT5V_NAMES[f]       # 4x5-native modelde kendi adi
+        print(f"  {_vn:16s} {n5[f]:6d} {100*arg5[f]/n5[f]:7.1f}% {100*cc5[f]/n5[f]:13.1f}%")
 
     if args.feas:
         # DIPNOT (oncelik disi, kullanici karari 2026-08-25): fizibilite dilimi — zorlama yalniz

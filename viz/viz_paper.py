@@ -17,6 +17,10 @@ Kullanim:
 """
 import argparse
 import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "evals"))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -34,8 +38,25 @@ from torch.utils.data import DataLoader
 from GameFormer.predictor import GameFormer
 from GameFormer.causal_graph import CausalPlanner
 from GameFormer.train_utils import DrivingData
-from GameFormer.decision_labels import LON_CLASSES, LAT_CLASSES, LON_MERGED_CLASSES
+from GameFormer.decision_labels import (LON_CLASSES, LAT_CLASSES, LON_MERGED_CLASSES,
+                                        decision_labels, LON4_MAP, LAT5V_MAP, LAT5L_MAP,
+                                        LON4_CLASSES, LAT5V_CLASSES, LAT5L_CLASSES)
 from train_planner import read_batch, extract_neighbor_top1_futures, freeze_gameformer
+
+# ---- CF modu (nuReasoning-tarzi; --cf 1): verdict renkleri ----
+from cf_score import score_plan
+CF_COLOR = {"SAFE": "#2e7d32", "SUBOPTIMAL": "#ef6c00", "UNSAFE": "#c62828"}
+# CF alternatifleri (lat_moe 4x5 uzayi): eksen, sinif, ad — 4 alternatif (7 degil; okunur panel)
+CF_ALTS = [("lon", 0, "stop"), ("lon", 2, "accel"),
+           ("lat", 0, "turn L"), ("lat", 1, "turn R")]
+
+
+def _with_heading(xy):
+    """[K,80,2] -> [K,80,3] (heading ardisik farklardan; relabel icin)."""
+    d = xy[:, 1:] - xy[:, :-1]
+    hd = torch.atan2(d[..., 1], d[..., 0])
+    hd = torch.cat([hd[:, :1], hd], dim=1)
+    return torch.cat([xy, hd.unsqueeze(-1)], dim=-1)
 
 # ---- KG _MAP_LAYER_STYLE (notebook cell 8) ----
 LANE_FACE, LANE_EDGE = "#dfe8f3", "#8aa4c0"
@@ -191,13 +212,19 @@ def render_scene(ax, s, topk=2, reach=35.0):
             _agent(ax, x, y, hd, s["dims"][j, 0], s["dims"][j, 1], int(s["types"][j]),
                    C_FADED, C_FADED_EDGE, 0.7, z=1.5)
 
-    # --- 4. ego + plan ---
+    # --- 4. ego + plan (+ CF alternatif planlari, verdict rengiyle) ---
     _box(ax, 0, 0, 0.0, 4.8, 2.0, C_EGO, "black", 1.2, z=5)
+    if s.get("cf_scored"):
+        for e in s["cf_scored"]:
+            p = _rot(e["plan"])
+            ax.plot(p[:, 0], p[:, 1], color=CF_COLOR[e["verdict"]], lw=1.7, zorder=5.5,
+                    ls="--" if e["fb"] else "-", alpha=0.95, solid_capstyle="round")
     plan = _rot(s["ego_plan"][:, :2])
     ax.plot(plan[:, 0], plan[:, 1], color=C_PLAN, lw=2.4, zorder=6, solid_capstyle="round")
 
-    # --- 5. karar karti (sol ust) ---
-    if s.get("dod"):
+    # --- 5. karar karti (sol ust) — CF modunda GORSELE BASILMAZ (kullanici 2026-08-26):
+    # karar, panel ALTINDA "decision = ..." satiri olarak CF'lerle ayni formatta yazilir ---
+    if s.get("dod") and not s.get("cf_scored"):
         lon_name, lon_p, lat_name, lat_p = s["dod"]
         txt = (f"$\\bf{{decision}}$  {LON_PRETTY.get(lon_name, lon_name)} ({lon_p:.2f})"
                f" + {LAT_PRETTY.get(lat_name, lat_name)} ({lat_p:.2f})")
@@ -229,10 +256,71 @@ def render_scene(ax, s, topk=2, reach=35.0):
         elif s.get("ch_active") is not None:
             parts = [CH_NAMES[c] for c in range(s["ch_active"].shape[-1]) if s["ch_active"][j, c]][:3]
         rows.append(f"$\\bf{{{letters[rank]}}}$ ego$\\rightarrow$agent: " + " · ".join(parts))
+    if s.get("cf_scored"):
+        # CF dokumu (kullanici formati 2026-08-26): karar gorsele degil ALTA yazilir;
+        # once "decision = ..." (ayni skorlayicidan gecmis haliyle), sonra verdict-GRUPLU
+        # satirlar (unsafe ayri, suboptimal ayri, safe ayri). Tamamen Ingilizce.
+        def _pred(r):
+            if r is None:
+                return ""
+            if r["pred"] == "collide":
+                j = r["agent"]
+                ag = letters[causal_idx.index(j)] if j in causal_idx else f"agent{j}"
+                return f"  collide(ego, {ag}, t={r['t']:.1f}s)"
+            if r["pred"] == "offroad":
+                return f"  offroad(ego, t={r['t']:.1f}s)"
+            if r["pred"] == "harsh_accel":
+                return f"  harsh_accel({r['a']:.1f} m/s$^2$)"
+            return "  low_progress(ego)"
+
+        if s.get("dod"):
+            lon_n, lon_p, lat_n, lat_p = s["dod"]
+            bv, br = s.get("cf_base", ("SAFE", None))
+            rows.append(f"$\\bf{{decision}}$ = {lon_n} and {lat_n} "
+                        f"(p={lon_p:.2f}, {lat_p:.2f})  $\\bf{{{bv.lower()}}}$" + _pred(br))
+        any_fb = False
+        for verdict in ("UNSAFE", "SUBOPTIMAL", "SAFE"):
+            items = []
+            for e in s["cf_scored"]:
+                if e["verdict"] != verdict:
+                    continue
+                t = f"{e['lon_name']} and {e['lat_name']} (p={e['p']:.2f})"
+                if e["fb"]:
+                    t += "*"
+                    any_fb = True
+                t += _pred(e.get("reason"))
+                items.append(t)
+            if items:
+                rows.append(f"$\\bf{{{verdict.lower()}}}$ = " + "  ·  ".join(items))
+        if any_fb:
+            rows.append("* no compliant mode; fallback plan scored")
     return rows
 
 
-def build_legend(fig, dod_meta):
+def _score_cf(s, lon_names, lat_names):
+    """Sahnenin CF planlarini skorla (cf_score): serit+route polyline'lari yol-noktasi,
+    GF top-1 future'lari carpisma referansi, taban plan yay boyu ilerleme referansi."""
+    L, C, _ = s["map_counts"]
+    pts = []
+    for i, poly in enumerate(s["map_polys"]):
+        if L <= i < L + C:                       # crosswalk yol-merkezi sayilmaz
+            continue
+        m = np.abs(poly).sum(-1) > 1e-3
+        if m.sum():
+            pts.append(poly[m])
+    road = np.concatenate(pts, 0) if pts else None
+    base_arc = float(np.linalg.norm(np.diff(s["ego_plan"][:, :2], axis=0), axis=1).sum())
+    # taban plan da AYNI skorlayicidan gecer -> "decision = ..." satirinda verdict'iyle yazilir
+    s["cf_base"] = score_plan(s["ego_plan"][:, :2], s["fut"], s["valid"], road, None)
+    out = []
+    for e in s["cf"]:
+        v, r = score_plan(e["plan"], s["fut"], s["valid"], road, base_arc)
+        out.append({**e, "verdict": v, "reason": r,
+                    "lon_name": lon_names[e["lon"]], "lat_name": lat_names[e["lat"]]})
+    return out
+
+
+def build_legend(fig, dod_meta, cf=False):
     handles = [
         Patch(facecolor=C_EGO, edgecolor="black", label="Ego"),
         Line2D([0], [0], color=C_PLAN, lw=2.4, label="Ego plan"),
@@ -250,19 +338,59 @@ def build_legend(fig, dod_meta):
         Line2D([0], [0], marker="^", ls="None", markerfacecolor="0.75", markeredgecolor="0.4",
                markersize=10, label="Bicycle"),
     ]
+    if cf:
+        handles += [Line2D([0], [0], color=CF_COLOR["SAFE"], lw=1.7, label="CF: safe"),
+                    Line2D([0], [0], color=CF_COLOR["SUBOPTIMAL"], lw=1.7, label="CF: suboptimal"),
+                    Line2D([0], [0], color=CF_COLOR["UNSAFE"], lw=1.7, label="CF: unsafe")]
     fig.legend(handles=handles, loc="lower center", ncol=7, fontsize=7.8,
                frameon=True, borderpad=0.6, handletextpad=0.5, columnspacing=1.1,
                bbox_to_anchor=(0.5, -0.02))
 
 
 @torch.no_grad()
-def collect(gameformer, causal, loader, num_neighbors, device, want_tokens, auto_n):
+def collect(gameformer, causal, loader, num_neighbors, device, want_tokens, auto_n,
+            cf=False, lat_names=None):
     scenes, Na = [], num_neighbors + 1
     for batch, files in loader:
         inputs, ego_future, _, ref_path = read_batch(batch, device)
         enc = gameformer.encoder(inputs)
         top1, nbr_states, _ = extract_neighbor_top1_futures(gameformer, enc, num_neighbors)
         out = causal(enc, inputs, num_agents=Na, neighbor_futures=top1, neighbor_states=nbr_states)
+
+        # --- CF modu: 4 alternatif karari zorla, cc-secimli CF plani uret (lat_moe ckpt) ---
+        cf_lists = None
+        if cf:
+            B0 = out["traj"].shape[0]
+            Mm = out["traj"].shape[2]
+            cf_lists = [[] for _ in range(B0)]
+            b_lon = out["psi_lon_cas"].argmax(-1)
+            b_lat = out["psi_lat_cas"].argmax(-1)
+            rep = ref_path.repeat_interleave(Mm, dim=0)
+            L4 = torch.tensor(LON4_MAP)
+            T5 = torch.tensor(LAT5L_MAP if getattr(causal, "lat_moe", 0) >= 2 else LAT5V_MAP)
+            p_lon = torch.softmax(out["psi_lon_cas"], -1)
+            p_lat = torch.softmax(out["psi_lat_cas"], -1)
+            for axis, cls, name in CF_ALTS:
+                fl, ft = b_lon.clone(), b_lat.clone()
+                (fl if axis == "lon" else ft).fill_(cls)
+                trajF, scoreF = causal.head(out["f_cas"], out["ego_clean"], (fl, ft))
+                modes = trajF[:, 0][..., :2]                                  # [B,M,80,2]
+                rl, rt = decision_labels(_with_heading(modes.reshape(B0 * Mm, -1, 2)).cpu(),
+                                         rep.cpu())
+                okm = ((L4[rl] if axis == "lon" else T5[rt]) == cls).view(B0, Mm)
+                sc = scoreF[:, 0].cpu().clone()
+                sc[~okm] = -1e9
+                pick = torch.where(okm.any(1), sc.argmax(1), scoreF[:, 0].cpu().argmax(1))
+                for b in range(B0):
+                    announced = (b_lon[b] if axis == "lon" else b_lat[b]).item()
+                    if announced == cls:
+                        continue                                               # zorlama degil
+                    cf_lists[b].append({
+                        "lon": int(fl[b]), "lat": int(ft[b]),
+                        "p": float((p_lon if axis == "lon" else p_lat)[b, cls]),
+                        "plan": modes[b, pick[b]].cpu().numpy(),
+                        "fb": not bool(okm[b].any()),
+                    })
         actors = enc["actors"][:, :, -1]
         traj = out["traj"][:, 0, :, :, :2]
         best = out["score"][:, 0].argmax(-1)
@@ -274,13 +402,16 @@ def collect(gameformer, causal, loader, num_neighbors, device, want_tokens, auto
         M_map_typed = out.get("M_cas_map_typed")
         dods = []
         if out.get("psi_lon_cas") is not None:
-            lon_names = (LON_MERGED_CLASSES if out["psi_lon_cas"].shape[-1] == len(LON_MERGED_CLASSES)
+            _nl = out["psi_lon_cas"].shape[-1]
+            lon_names = (LON4_CLASSES if _nl == 4
+                         else LON_MERGED_CLASSES if _nl == len(LON_MERGED_CLASSES)
                          else LON_CLASSES)
+            LAT_NAMES = lat_names if lat_names is not None else LAT_CLASSES
             p1 = torch.softmax(out["psi_lon_cas"], -1); p2 = torch.softmax(out["psi_lat_cas"], -1)
             i1, i2 = p1.argmax(-1), p2.argmax(-1)
             for b in range(i1.shape[0]):
                 dods.append((lon_names[int(i1[b])], float(p1[b, i1[b]]),
-                             LAT_CLASSES[int(i2[b])], float(p2[b, i2[b]])))
+                             LAT_NAMES[int(i2[b])], float(p2[b, i2[b]])))
         else:
             dods = [None] * actors.shape[0]
 
@@ -317,6 +448,7 @@ def collect(gameformer, causal, loader, num_neighbors, device, want_tokens, auto
                 "map_counts": (inputs["map_lanes"].shape[1], inputs["map_crosswalks"].shape[1],
                                inputs["route_lanes"].shape[1]),
                 "dod": dods[b],
+                "cf": (cf_lists[b] if cf_lists is not None else None),
             })
             if want_tokens is None and len(scenes) >= max(auto_n * 8, 40):
                 return scenes
@@ -345,7 +477,11 @@ def main(args):
                            gate=args.gate, ego_residual=args.ego_residual,
                            gate_channels=args.gate_channels, typed_kv=args.typed_kv,
                            channel_evidence=args.channel_evidence, gate_trust=args.gate_trust,
-                           dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9)).to(dev)
+                           dod_meta=args.dod_meta, lat_moe=args.lat_moe,
+                           num_lon=(4 if args.lat_moe else 6 if args.lon_merge else 9),
+                           num_lat=(5 if args.lat_moe else 7)).to(dev)
+    if args.cf:
+        assert args.lat_moe, "--cf lat_moe ckpt ister (4x5 sozluk + lat expert'leri)"
     missing, unexpected = causal.load_state_dict(torch.load(args.causal_path, map_location=dev),
                                                  strict=False)
     if missing or unexpected:
@@ -356,8 +492,16 @@ def main(args):
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=4,
                         collate_fn=_collate)
     want = set(args.tokens.split(",")) if args.tokens else None
-    scenes = collect(gameformer, causal, loader, args.num_neighbors, dev, want, args.auto)
+    lat_names = (LAT5L_CLASSES if int(args.lat_moe) >= 2 else LAT5V_CLASSES) if args.lat_moe else None
+    scenes = collect(gameformer, causal, loader, args.num_neighbors, dev, want, args.auto,
+                     cf=bool(args.cf), lat_names=lat_names)
     print(f"collected {len(scenes)} candidate scenes")
+    if args.cf:
+        _lon_names = LON4_CLASSES
+        _lat_names = lat_names if lat_names is not None else LAT_CLASSES
+        for s in scenes:
+            if s.get("cf"):
+                s["cf_scored"] = _score_cf(s, _lon_names, _lat_names)
 
     if want is None:
         def _pick_diverse(cands, n):
@@ -391,10 +535,10 @@ def main(args):
 
     # tekil sahneler
     for i in range(n):
-        fig, ax = plt.subplots(figsize=(3.6, 3.8))
+        fig, ax = plt.subplots(figsize=((4.8, 5.0) if args.cf else (3.6, 3.8)))
         rows = render_scene(ax, scenes[i], topk=args.topk)
         _caption(ax, rows)
-        build_legend(fig, args.dod_meta)
+        build_legend(fig, args.dod_meta, cf=bool(args.cf))
         fig.tight_layout(rect=(0, 0.12, 1, 1))
         p = f"{args.out}_{scenes[i]['token']}.png"
         fig.savefig(p, dpi=300, bbox_inches="tight")
@@ -407,7 +551,7 @@ def main(args):
         for ax, s in zip(axes, scenes[:3]):
             rows = render_scene(ax, s, topk=args.topk)
             _caption(ax, rows)
-        build_legend(fig, args.dod_meta)
+        build_legend(fig, args.dod_meta, cf=bool(args.cf))
         fig.tight_layout(rect=(0, 0.12, 1, 1))
         for ext in ("png", "pdf"):
             fig.savefig(f"{args.out}_strip.{ext}", dpi=300, bbox_inches="tight")
@@ -436,6 +580,12 @@ if __name__ == "__main__":
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"])
     p.add_argument("--modes", type=int, default=6)
     p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--lat_moe", type=int, default=0,
+                   help="ckpt lat_moe surumu (1=to_* sozlugu, 2=LC sozlugu)")
+    p.add_argument("--cf", type=int, default=0,
+                   help="CF modu (nuReasoning-tarzi): 4 alternatif karar zorlanir, cc-secimli "
+                        "planlari verdict rengiyle cizilir (safe/suboptimal/unsafe), panel alti "
+                        "CF satiri. lat_moe ckpt ister. * = uyan mod yok (argmax'a dusuldu).")
     p.add_argument("--out", type=str, default="viz_out/paper")
     p.add_argument("--device", type=str, default="cuda")
     main(p.parse_args())

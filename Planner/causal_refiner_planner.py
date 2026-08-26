@@ -188,7 +188,7 @@ class CausalRefinerPlanner(PlannerV2):
         Oncelik: (lon & lat) -> lat -> lon -> argmax (fallback). Relabel, egitim/eval ile
         AYNI fonksiyon (decision_labels), ckpt sozlugune katlanir."""
         from GameFormer.decision_labels import (decision_labels, LON4_MAP, LAT5V_MAP,
-                                                LON5_MAP, LAT5_MAP)
+                                                LON5_MAP, LAT5_MAP, LAT5L_MAP)
         M = traj.shape[0]
         xy = traj[:, :, :2].detach().cpu()
         d = xy[:, 1:] - xy[:, :-1]
@@ -197,7 +197,8 @@ class CausalRefinerPlanner(PlannerV2):
         plans = torch.cat([xy, hd.unsqueeze(-1)], dim=-1)                 # [M,80,3]
         rl, rt = decision_labels(plans, ch_ref.cpu().expand(M, -1, -1, -1))
         if self._lat_moe:
-            rl, rt = torch.tensor(LON4_MAP)[rl], torch.tensor(LAT5V_MAP)[rt]
+            _lm = LAT5L_MAP if int(self._lat_moe) >= 2 else LAT5V_MAP
+            rl, rt = torch.tensor(LON4_MAP)[rl], torch.tensor(_lm)[rt]
         elif self._dec_moe:
             rl, rt = torch.tensor(LON5_MAP)[rl], torch.tensor(LAT5_MAP)[rt]
         bl = int(out['psi_lon_cas'][0].argmax())

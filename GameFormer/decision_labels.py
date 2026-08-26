@@ -103,6 +103,16 @@ LAT5V_CLASSES = ['turn_left', 'turn_right', 'to_left', 'to_right', 'none']
 NUM_LAT5V = len(LAT5V_CLASSES)
 LAT5V_CE_WEIGHT = [0.65, 1.35, 5.28, 4.41, 0.43]
 
+# lat_moe=2 (v4 sozlugu, kullanici karari 2026-08-26): to_* KALKAR, LC birinci-sinif.
+# inlane -> none (karar degil suruklenme; LC expert'inin diyeti saf >=2 m gercek serit
+# degisimi kalir — to_*'in "%70 inlane diyeti" hatasi tekrarlanmaz). CE agirliklari
+# dup_boost>0 iken egitimde EFEKTIF (cogaltilmis) dagilimdan yeniden hesaplanir; buradaki
+# statik degerler cogaltmasiz fallback (20k sayimlar: 6130/2955/235/291/10389).
+LAT5L_MAP = [0, 1, 2, 3, 4, 4, 4]             # LAT_CLASSES(7) -> LAT5L (inlane -> none)
+LAT5L_CLASSES = ['turn_left', 'turn_right', 'lane_change_left', 'lane_change_right', 'none']
+NUM_LAT5L = len(LAT5L_CLASSES)
+LAT5L_CE_WEIGHT = [0.65, 1.35, 10.0, 10.0, 0.39]
+
 DT = 0.1                 # [s] frame araligi
 LON_WINDOW = 40          # longitudinal pencere: ilk 4 s
 V_STOP = 0.5             # [m/s] altinda "duruk" sayilir
@@ -113,6 +123,14 @@ A_SMOOTH_W = 5           # ivme duzlestirme penceresi (frame) = 0.5 s
 REV_X = -0.5             # [m] pencere sonunda geri net yer degistirme -> reverse
 LC_DLAT = 2.0            # [m] koridor-goreli |delta d_lat| >= -> lane change (serit ~3.5 m)
 INLANE_DLAT = 0.6        # [m] koridor-goreli |delta d_lat| >= -> in-lane kayma
+# HAKEM DUZELTMESI (v4, 2026-08-26): turn/LC siniri koridor-bazli. LC yanal ofseti degistirir
+# ama koridora PARALEL biter; donus koridor yonunu TERK eder. Buyuk ofset + paralel bitis ->
+# lane_change, eski koridor-kor turn testinden ONCE. (Zorlanmis planlarda guclu yanal
+# hamlelerin turn'e etiketlenmesi olculdu; GT'de gecis matrisi eval_grader_fix.py ile dogrulanir.)
+LC_PAR_RAD = 0.26        # [rad ~15 deg] bitiste |plan_heading - koridor tangenti| <= -> paralel
+LC_NET_ROT = 0.35        # [rad ~20 deg] LC plan NET donmez (|yaw_son - yaw_ilk| <=); donus ~90
+                         # doner. Koridor donusle birlikte kivrildiginda paralel-bitis tek basina
+                         # yaniltici (GT'de %20 donus kacagi olculdu) -> bu guard sart.
 MIN_ARC = 3.0            # [m] lateral siniflar icin asgari kat edilen yol (durukta lateral yok)
 # turn esikleri: train_planner._maneuver_one ile AYNI (get_decision.py'a sadik)
 TURN_C_LO, TURN_C_HI = 0.03, 0.18
@@ -196,9 +214,26 @@ def _lon_one(xy, yaw):
     return LON_CLASSES.index('maintain')
 
 
-def _lat_one(xy, yaw, dlat=None):
-    """Tam ufuktan lateral sinif (0..6). dlat: koridor-goreli lateral ofset [P] (None -> fallback)."""
+def _lat_one(xy, yaw, dlat=None, dth=None):
+    """Tam ufuktan lateral sinif (0..6). dlat: koridor-goreli lateral ofset [P]; dth:
+    koridor tangentine gore heading farki [P] (None -> eski davranis, turn-once)."""
     turn = _turn_class(xy, yaw)
+    # HAKEM DUZELTMESI (v4): buyuk yanal ofset + koridora PARALEL bitis = lane_change —
+    # koridor-kor turn testinden ONCE gelir. Donus koridor yonunu terk ederek biter
+    # (bitiste dth buyuk); LC ofseti degistirip paralel biter (dth ~ 0).
+    if dlat is not None and dth is not None:
+        v = ~np.all(xy == 0, axis=1)
+        if v.sum() >= 2:
+            dl, dt = dlat[v], dth[v]
+            k = max(len(dl) // 8, 1)
+            delta_c = float(np.median(dl[-k:]) - np.median(dl[:k]))
+            end_par = abs(float(np.median(dt[-k:]))) <= LC_PAR_RAD
+            yv = yaw[v]
+            net = float(yv[-1] - yv[0])
+            net = abs(np.arctan2(np.sin(net), np.cos(net)))
+            if abs(delta_c) >= LC_DLAT and end_par and net <= LC_NET_ROT:
+                return LAT_CLASSES.index('lane_change_left' if delta_c > 0
+                                         else 'lane_change_right')
     if turn is not None:
         return LAT_CLASSES.index('turn_left' if turn == 'left' else 'turn_right')
     valid = ~np.all(xy == 0, axis=1)
@@ -227,23 +262,29 @@ def _lat_one(xy, yaw, dlat=None):
     return LAT_CLASSES.index('no_lateral')
 
 
-def decision_labels(ego_future, ref_path=None):
+def decision_labels(ego_future, ref_path=None, turn_fix=True):
     """ego_future [B,80,3] (x,y,heading; ego-frame) [+ ref_path [B,R,P,>=3], aday 0 = ego seridi]
-    -> (lon [B], lat [B]) LongTensor, ayni cihazda."""
+    -> (lon [B], lat [B]) LongTensor, ayni cihazda. turn_fix=False = eski (koridor-kor
+    turn-once) hakem — yalniz gecis-matrisi dogrulamasi/arkeoloji icin."""
     ef = ego_future.detach().cpu().numpy()
     B = ef.shape[0]
-    dlat_np = None
+    dlat_np = dth_np = None
     if ref_path is not None:
         cxy, cyaw, ccum, cvalid = _corridor_arrays(ref_path)
         pts = ego_future[..., :2].float().to(ref_path.device)               # [B,80,2]
-        _, d_lat, _, _ = _project(pts, cxy, cyaw, ccum, cvalid)             # [B,80]
+        _, d_lat, tyaw, _ = _project(pts, cxy, cyaw, ccum, cvalid)          # [B,80]
         has_corr = cvalid.any(dim=1).cpu().numpy()                          # koridor bos -> fallback
         dlat_np = d_lat.detach().cpu().numpy()
+        if turn_fix:
+            dth = ego_future[..., 2].float().to(ref_path.device) - tyaw     # plan - koridor tangenti
+            dth = torch.atan2(torch.sin(dth), torch.cos(dth))               # wrap
+            dth_np = dth.detach().cpu().numpy()
     lon, lat = [], []
     for b in range(B):
         lo = _lon_one(ef[b, :, :2], ef[b, :, 2])
         dl = dlat_np[b] if (dlat_np is not None and has_corr[b]) else None
-        la = _lat_one(ef[b, :, :2], ef[b, :, 2], dl)
+        dt = dth_np[b] if (dth_np is not None and has_corr[b]) else None
+        la = _lat_one(ef[b, :, :2], ef[b, :, 2], dl, dt)
         lon.append(lo)
         lat.append(la)
     dev = ego_future.device

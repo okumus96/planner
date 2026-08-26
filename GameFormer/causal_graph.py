@@ -40,7 +40,7 @@ from .channels import (compute_channels, compute_map_channels, select_ego_corrid
                        CH_COLLISION_COURSE, CH_SHARES_INTERSECTION, CH_MERGES)
 from .decision_labels import (LON5_MAP, LAT5_MAP, NUM_LON5, NUM_LAT5,
                               LON5_FAMILY, LAT5_FAMILY, NUM_FAMILIES,
-                              LON4_MAP, LAT5V_MAP, NUM_LON4, NUM_LAT5V)
+                              LON4_MAP, LAT5V_MAP, NUM_LON4, NUM_LAT5V, LAT5L_MAP)
 
 NUM_AGENT_TYPES = 4  # ego, vehicle, pedestrian, bicycle
 CONFLICT_FEATURE_DIM = 4  # [d_route, d_ego_aligned, d_ego_spatial, approaching]
@@ -992,7 +992,7 @@ class CausalPlanner(nn.Module):
         super().__init__()
         self.dod_meta = bool(dod_meta)
         self.dec_moe = bool(dec_moe)
-        self.lat_moe = bool(lat_moe)
+        self.lat_moe = int(lat_moe)              # 0=yok, 1=LAT5V (to_*), 2=LAT5L (LC, v4)
         # dod_tf: YALNIZ teacher forcing (dal yok, sozluk 9x7 aynen) — dec_moe ablasyonunun
         # "TF tek basina yeter mi?" basamagi. Egitimde embedding'e GT (lon,lat) verilir.
         self.dod_tf = bool(dod_tf)
@@ -1012,8 +1012,11 @@ class CausalPlanner(nn.Module):
             self.register_buffer('lat5_remap', torch.tensor(LAT5_MAP, dtype=torch.long))
         if self.lat_moe:
             # Cache etiketleri ham 9x7; model 4x5 calisir -> teacher-forcing remap'i icin.
+            # lat_moe=1: LAT5V (to_* sozlugu, v3_latmoe ckpt'leri); lat_moe=2: LAT5L
+            # (v4: LC birinci-sinif, inlane->none).
+            _lat_map = LAT5L_MAP if int(lat_moe) >= 2 else LAT5V_MAP
             self.register_buffer('lon4_remap', torch.tensor(LON4_MAP, dtype=torch.long))
-            self.register_buffer('lat5v_remap', torch.tensor(LAT5V_MAP, dtype=torch.long))
+            self.register_buffer('lat5v_remap', torch.tensor(_lat_map, dtype=torch.long))
         self.disentangler = EgoCausalDisentangler(dim, heads, layers, dropout, nbr_enrich=nbr_enrich,
                                                   gate=gate, conflict_feats=conflict_feats,
                                                   conflict_bias=conflict_bias,

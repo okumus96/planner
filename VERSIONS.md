@@ -47,11 +47,16 @@ python run_nuplan_test.py --experiment_name closed_loop_reactive_agents \
 skorlu; oncelik lon&lat -> lat -> lon -> argmax). CLS'e maliyeti olculmedi degil: OLCULDU,
 sifir (0.8421 vs 0.8409).
 
-**Sonuclar (bu ckpt):** val minADE 0.7998 · CLS reduced 0.8409 (cc kapali) / **0.8421 (cc
-acik)** — GF 0.8199, v3-soyu bandi 0.833-0.858 · agreement (4x5, cc) 99.6/92.6/91.6 ·
-compliance (cc): lon stop 25.5 / slow 41.9 / accel 71.3 / maintain 87.7; lat turn_l 98.7 /
-turn_r 96.7 / to_l 31.0 / to_r 31.8 / none 48.6. Detay: plan.md par.12-13, drift teshisi
-par.14.
+**Sonuclar (bu ckpt; DUZELTILMIS hakemle — resmi sayilar, 2026-08-26):** val minADE 0.7998 ·
+CLS reduced 0.8409 (cc kapali) / **0.8421 (cc acik)** — GF 0.8199, v3-soyu bandi 0.833-0.858 ·
+agreement (4x5, cc) 99.6/93.4/92.3 · compliance (cc): lon stop 25.5 / **slow 72.6** (tanimsal
+dislama: v0<1 m/s zorlamalari paydada degil — durana yavasla denmez; disla yalniz slow'da) /
+accel 71.3 / maintain 87.7; lat turn_l 98.5 / turn_r 96.5 / to_l 32.9 / to_r 32.8 / none 48.6.
+Dipnotlar: stop hiz-bantli (duruk %90 / 0.5-4 %37 / 4-8 %13 / >8 %0 — uretec siniri, 8-s
+pencere de kurtarmiyor: %1.8); none duz-koridorda %62.7.
+(Hakem duzeltmesi: turn/LC siniri koridor-bazli, GT'de sifir degisim — eski-hakem sayilarindan
+farklar: lat agreement +0.8, to_* +1-2, turn -0.2, lon aynen. Ilan-kosullu agreement ve
+v4_lcmoe ablasyonu: plan.md par.14+.)
 
 **Soy:** v3 (`dodmeta_v3_egoline` e13, tag oncesi) -> v3_tf (yalniz TF ablasyonu) ->
 v3_moe (aile-dallari ablasyonu) -> **v3_latmoe** (secilen). Ablasyon ckpt'leri:

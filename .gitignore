@@ -9,3 +9,4 @@ viz_out/
 *.png
 *.jpg
 *.json
+*.out

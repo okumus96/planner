@@ -90,7 +90,8 @@ from GameFormer.decision_labels import (LON_CE_WEIGHT, LAT_CE_WEIGHT, LON_MERGE_
                                         LON5_MAP, LAT5_MAP, LON5_CE_WEIGHT, LAT5_CE_WEIGHT,
                                         NUM_LON5, NUM_LAT5,
                                         LON4_MAP, LAT5V_MAP, LON4_CE_WEIGHT, LAT5V_CE_WEIGHT,
-                                        NUM_LON4, NUM_LAT5V)
+                                        NUM_LON4, NUM_LAT5V,
+                                        LAT5L_MAP, LAT5L_CE_WEIGHT, NUM_LAT5L)
 _LON_W = torch.tensor(LON_CE_WEIGHT, dtype=torch.float32)
 _LAT_W = torch.tensor(LAT_CE_WEIGHT, dtype=torch.float32)
 _LON_REMAP = None      # lon_merge=1 -> LongTensor[9], etiketleri 6 sinifa katlar
@@ -490,13 +491,18 @@ def model_training(args):
         assert args.dod_meta and not args.lon_merge and not args.dec_moe, \
             "dod_tf: dod_meta=1, lon_merge=0, dec_moe=0 gerektirir"
     if args.lat_moe:
-        # lat_moe (v2): 4x5 GERCEK sozluk (LON4/LAT5V) + lat-sinifi basina GMM expert.
+        # lat_moe: 4x5 GERCEK sozluk + lat-sinifi basina GMM expert.
+        # lat_moe=1: LAT5V (to_*, v3_latmoe); lat_moe=2: LAT5L (v4 — LC birinci-sinif).
         assert args.dod_meta and not (args.lon_merge or args.dec_moe or args.dod_tf), \
             "lat_moe: dod_meta=1; lon_merge/dec_moe/dod_tf ile birlesmez"
         _LON_W = torch.tensor(LON4_CE_WEIGHT, dtype=torch.float32)
         _LON_REMAP = torch.tensor(LON4_MAP, dtype=torch.long)
-        _LAT_W = torch.tensor(LAT5V_CE_WEIGHT, dtype=torch.float32)
-        _LAT_REMAP = torch.tensor(LAT5V_MAP, dtype=torch.long)
+        if int(args.lat_moe) >= 2:
+            _LAT_W = torch.tensor(LAT5L_CE_WEIGHT, dtype=torch.float32)
+            _LAT_REMAP = torch.tensor(LAT5L_MAP, dtype=torch.long)
+        else:
+            _LAT_W = torch.tensor(LAT5V_CE_WEIGHT, dtype=torch.float32)
+            _LAT_REMAP = torch.tensor(LAT5V_MAP, dtype=torch.long)
 
     log_path = f"./training_log/{args.name}/"
     os.makedirs(log_path, exist_ok=True)
@@ -547,6 +553,41 @@ def model_training(args):
 
     train_set = DrivingData(args.train_set + "/*.npz", args.num_neighbors)
     valid_set = DrivingData(args.valid_set + "/*.npz", args.num_neighbors)
+
+    # --- dup_boost (v4, kullanici karari 2026-08-26): DETERMINISTIK COGALTMA ---
+    # CIL soyunun dengeli-ornekleme pratiginin ilimli hali: LC sahneleri ve dinamik stop/slow
+    # sahneleri indeks listesinde dup_boost kopya, gerisi 1 (iadeli-cekilis sampler DEGIL:
+    # her sahne her epoch garantili gorulur). Etiket kaynagi: evals/build_label_cache.py
+    # ciktisi (ham 9x7). CE agirliklari cogaltilmis EFEKTIF dagilimdan yeniden hesaplanir
+    # (sampler + ters-frekans cifte sayimi onlenir).
+    if args.dup_boost > 0:
+        cache = np.load(args.label_cache)
+        lon_raw = torch.from_numpy(cache['lon'].astype(np.int64))
+        lat_raw = torch.from_numpy(cache['lat'].astype(np.int64))
+        assert len(lon_raw) == len(train_set), \
+            f"label cache {len(lon_raw)} != train_set {len(train_set)} — cache'i yeniden uret"
+        boost = ((lat_raw == 2) | (lat_raw == 3)                      # lane_change_l/r (ham)
+                 | ((lon_raw >= 1) & (lon_raw <= 4)))                 # stop_q/g, slow_q/g (ham)
+        idx = torch.arange(len(train_set))
+        dup = idx[boost].repeat(args.dup_boost - 1)
+        idx = torch.cat([idx, dup])
+        logging.info(f"dup_boost x{args.dup_boost}: {int(boost.sum())} sahne cogaltildi "
+                     f"({100.0*float(boost.float().mean()):.1f}%), epoch {len(train_set)} -> {len(idx)}")
+        train_set = torch.utils.data.Subset(train_set, idx.tolist())
+        # efektif CE agirliklari (remap'li sinif uzayinda, w = N/(K*n), cap 10, bos sinif 1)
+        def _eff_w(raw, remap, k):
+            lab = remap[raw] if remap is not None else raw
+            lab = torch.cat([lab, (remap[raw] if remap is not None else raw)[boost].repeat(
+                args.dup_boost - 1)])
+            cnt = torch.bincount(lab, minlength=k).float()
+            w = len(lab) / (k * cnt.clamp(min=1.0))
+            w = torch.where(cnt > 0, w.clamp(max=10.0), torch.ones_like(w))
+            return w.float()
+        _LON_W = _eff_w(lon_raw, _LON_REMAP, len(_LON_W))
+        _LAT_W = _eff_w(lat_raw, _LAT_REMAP, len(_LAT_W))
+        logging.info(f"efektif CE agirliklari: lon={[round(float(x),2) for x in _LON_W]} "
+                     f"lat={[round(float(x),2) for x in _LAT_W]}")
+
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=os.cpu_count())
     valid_loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, num_workers=os.cpu_count())
     logging.info("Dataset Prepared: {} train data, {} validation data\n".format(len(train_set), len(valid_set)))
@@ -647,11 +688,16 @@ if __name__ == "__main__":
                         help="dod_meta ile: quickly/gently katla (9 -> 6 lon sinifi). psi_lon confusion "
                              "matrisi ayrimi ogrenemezse acilir; extractor'a dokunmaz.")
     parser.add_argument("--lat_moe", type=int, default=0,
-                        help="v2 (2026-08-25): 4x5 GERCEK sozluk (LON4: stop/slow/accel/maintain, "
-                             "LAT5V: turn_l/turn_r/to_left/to_right/none) + CA sonrasi LAT SINIFI "
-                             "basina GMM expert (5; olculmus lateral mode collapse'a karsi). Lon "
-                             "dallanmaz (embedding+TF). Egitimde GT routing (TF); --ss_max ile "
+                        help="4x5 GERCEK sozluk + CA sonrasi LAT SINIFI basina GMM expert (5). "
+                             "1 = LAT5V (to_*, v3_latmoe sozlugu) | 2 = LAT5L (v4: LC birinci-"
+                             "sinif, inlane->none). Lon dallanmaz (embedding+TF); --ss_max ile "
                              "scheduled sampling. dod_meta gerektirir.")
+    parser.add_argument("--dup_boost", type=int, default=0,
+                        help="deterministik cogaltma katsayisi (0=kapali): LC + dinamik stop/slow "
+                             "sahneleri indekste bu kadar kopya, gerisi 1. --label_cache ister; "
+                             "CE agirliklari efektif dagilimdan yeniden hesaplanir.")
+    parser.add_argument("--label_cache", type=str, default="",
+                        help="evals/build_label_cache.py ciktisi (npz: lon[N], lat[N] ham 9x7).")
     parser.add_argument("--ss_max", type=float, default=0.0,
                         help="scheduled sampling tavani: egitimde GT yerine TAHMINLE kosullama "
                              "olasiligi 0'dan bu degere lineer rampa (TF varyantlari icin; 0 = saf TF).")
