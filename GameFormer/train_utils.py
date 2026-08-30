@@ -55,12 +55,31 @@ def sort_candidates_by_lateral(c_lat_ego, c_lat_global=None):
 
 
 class DrivingData(Dataset):
-    def __init__(self, data_dir, n_neighbors):
+    def __init__(self, data_dir, n_neighbors, l1_labels=None):
         self.data_list = glob.glob(data_dir)
         self._n_neighbors = n_neighbors
+        # L1 etiketleri (evals/build_l1_labels.py ciktisi) -- npz'ye YAZMADAN, dosya adiyla
+        # eslestirilerek tasinir. Yoksa sifir dondurulur ve L_attr agirligi 0 olmalidir.
+        self._l1 = None
+        if l1_labels:
+            import numpy as _np, os as _os
+            z = _np.load(l1_labels, allow_pickle=True)
+            idx = {str(f): i for i, f in enumerate(z['files'])}
+            self._l1 = (z['agent'], z['map'], idx)
 
     def __len__(self):
         return len(self.data_list)
+
+    def _l1_for(self, idx):
+        """L1 etiketleri; yoksa sifir (L_attr agirligi 0 olmali)."""
+        import os as _os
+        if self._l1 is None:
+            return np.zeros(self._n_neighbors, np.int64), np.zeros(55, np.int64)
+        A, M, index = self._l1
+        k = index.get(_os.path.basename(self.data_list[idx]))
+        if k is None:
+            return np.zeros(A.shape[1], np.int64), np.zeros(M.shape[1], np.int64)
+        return A[k].astype(np.int64), M[k].astype(np.int64)
 
     def __getitem__(self, idx):
         data = np.load(self.data_list[idx])
@@ -107,10 +126,11 @@ class DrivingData(Dataset):
             mch_active = np.zeros((S, NUM_MAP_CHANNELS), dtype=bool)
             mch_evidence = np.zeros((S, NUM_MAP_EVIDENCE), dtype=np.float32)
 
+        l1_ag, l1_mp = self._l1_for(idx)
         return (ego, neighbors, map_lanes, map_crosswalks, route_lanes, ego_future_gt,
                 neighbors_future_gt, c_lat_candidates, c_lat_candidates_global,
                 ch_active, ch_evidence, mch_active, mch_evidence,
-                np.int64(dec_lon), np.int64(dec_lat))
+                np.int64(dec_lon), np.int64(dec_lat), l1_ag, l1_mp)
 
 
 def imitation_loss(gmm, scores, ground_truth):

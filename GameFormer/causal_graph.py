@@ -495,7 +495,13 @@ class EgoCausalLayer(nn.Module):
         cfd = (M_cfd_h[..., None] * msg).sum(dim=(1, 2)).reshape(B, self.dim)
         M_cas_typed = M_cas_h.mean(-1)                                    # [B,S,R] (head-ort)
         M_cfd_typed = M_cfd_h.mean(-1)
-        return cas, cfd, M_cas_typed.sum(-1), M_cfd_typed.sum(-1), M_cas_typed, M_cfd_typed
+        # L1: KAYNAK basina toplam -- iliski ekseninde toplanir ama AJAN/ELEMAN ekseni
+        # KORUNUR. Bu, L1 head'inin girdisi: "ajan j ile iliskim ne" sorusu ajan basina
+        # cevaplanmali, havuzlanmis f_cas'ta o eksen kayboluyor.
+        src_cas = (M_cas_h[..., None] * msg).sum(dim=2).reshape(B, S, self.dim)   # [B,S,D]
+        src_cfd = (M_cfd_h[..., None] * msg).sum(dim=2).reshape(B, S, self.dim)
+        return (cas, cfd, M_cas_typed.sum(-1), M_cfd_typed.sum(-1), M_cas_typed, M_cfd_typed,
+                src_cas, src_cfd)
 
     @staticmethod
     def _per_type(mods, x, types):
@@ -523,6 +529,7 @@ class EgoCausalLayer(nn.Module):
             cb = (F.softplus(self.conflict_w) * conflict[..., :3]).sum(-1)          # [B,N] >= 0
         M_cas_typed = M_cfd_typed = None
         agent_mass = map_mass = M_cas_raw = M_cas_map_raw = None
+        src_cas_ag = src_cas_mp = src_cfd_ag = src_cfd_mp = None
         joint = (self.joint_softmax and self.typed_kv
                  and ch_active is not None and mch_active is not None)
         if joint:
@@ -538,7 +545,8 @@ class EgoCausalLayer(nn.Module):
         elif self.typed_kv and ch_active is not None:
             # TYPED: girdiler = yanan (ajan, kanal); node K/V kanal setinden, edge paylasilir.
             entry_valid = nbr_valid[:, :, None] & ch_active
-            (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag, M_cas_typed, M_cfd_typed) = self._attend_typed(
+            (ag_cas, ag_cfd, M_cas_ag, M_cfd_ag, M_cas_typed, M_cfd_typed,
+             src_cas_ag, src_cfd_ag) = self._attend_typed(
                 q_ag, h_nbr, ek_ag, ev_ag, entry_valid, self.Wk_ch, self.Wv_ch,
                 self.attn_cas_ch, self.attn_cfd_ch, conflict_bias=cb)
             ent_cas_mean = ent_cas_headmean = ent_cfd_mean = ent_cfd_headmean = \
@@ -582,7 +590,8 @@ class EgoCausalLayer(nn.Module):
                 torch.zeros(B, device=h_ego.device)
         elif self.typed_kv and mch_active is not None:
             entry_valid_mp = map_valid[:, :, None] & mch_active
-            (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp, M_cas_mp_typed, M_cfd_mp_typed) = self._attend_typed(
+            (mp_cas, mp_cfd, M_cas_mp, M_cfd_mp, M_cas_mp_typed, M_cfd_mp_typed,
+             src_cas_mp, src_cfd_mp) = self._attend_typed(
                 q_mp, h_map, ek_mp, ev_mp, entry_valid_mp, self.Wk_mch, self.Wv_mch,
                 self.attn_cas_mch, self.attn_cfd_mch)
             ent_cas_mp_mean = ent_cas_mp_headmean = ent_cfd_mp_mean = ent_cfd_mp_headmean = \
@@ -630,7 +639,8 @@ class EgoCausalLayer(nn.Module):
                 ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
                 ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
                 gate_cos, f_all, M_cas_typed, M_cfd_typed, M_cas_mp_typed, M_cfd_mp_typed,
-                agent_mass, map_mass, M_cas_raw, M_cas_map_raw)
+                agent_mass, map_mass, M_cas_raw, M_cas_map_raw,
+                src_cas_ag, src_cas_mp, src_cfd_ag, src_cfd_mp)
 
 
 class EgoCausalDisentangler(nn.Module):
@@ -809,7 +819,8 @@ class EgoCausalDisentangler(nn.Module):
              ent_cas_mean, ent_cas_headmean, ent_cfd_mean, ent_cfd_headmean,
              ent_cas_mp_mean, ent_cas_mp_headmean, ent_cfd_mp_mean, ent_cfd_mp_headmean,
              gate_cos, f_all, M_cas_ty, M_cfd_ty, M_cas_mp_ty, M_cfd_mp_ty,
-             agent_mass, map_mass, M_cas_raw, M_cas_map_raw) = layer(
+             agent_mass, map_mass, M_cas_raw, M_cas_map_raw,
+             src_cas_ag, src_cas_mp, src_cfd_ag, src_cfd_mp) = layer(
                 h_ego, h_nbr, nbr_types, edge_ego, gated_valid, h_map, edge_map, gated_map_valid,
                 conflict=conf,
                 ch_active=(ch_active if self.typed_kv else None),
@@ -841,6 +852,9 @@ class EgoCausalDisentangler(nn.Module):
             'M_cas_map_typed': M_cas_mp_ty, 'M_cfd_map_typed': M_cfd_mp_ty,
             'gated_valid': gated_valid, 'gated_map_valid': gated_map_valid,
             'ch_active': ch_active, 'mch_active': mch_active,
+            # L1: kaynak-basina causal toplam [B,N,D] / [B,S,D] -- L1 head'inin girdisi
+            'src_cas_ag': src_cas_ag, 'src_cas_mp': src_cas_mp,
+            'src_cfd_ag': src_cfd_ag, 'src_cfd_mp': src_cfd_mp,
             # katman-basina cos(f_cas, h_ego) [B,L] -- ~1'e yakinsa gate marjinal (h_ego bypass'i baskin).
             'gate_cos': gate_cos_stack,
         }
@@ -988,7 +1002,8 @@ class CausalPlanner(nn.Module):
                  conflict_feats=0, conflict_bias=0, compute_conflict=0, aligned_mode='straight',
                  ego_residual=1, gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
                  dod_meta=0, num_lon=9, num_lat=7, uniform_mask=0, joint_softmax=0, dec_moe=0,
-                 dod_tf=0, lat_moe=0):
+                 dod_tf=0, lat_moe=0, l1=0, l1_bottleneck=0,
+                 num_l1_ag=6, num_l1_mp=2):
         super().__init__()
         self.dod_meta = bool(dod_meta)
         self.dec_moe = bool(dec_moe)
@@ -1041,11 +1056,29 @@ class CausalPlanner(nn.Module):
         # ZORUNDA -> hile yapamaz -> uniform baskisi f_cfd FEATURE'larina akar -> entropy CANLI kalir.
         # Cikti = 5-sinif MANEVRA (CP get_decision.py) VEYA dod_meta=1'de factored (lon x lat)
         # meta-aksiyon ciftleri (decision_labels.py) -- her iki durumda SABIT GT-turevi hedef.
+        # --- L1: ETKILESIM KARARI katmani (konsept bottleneck) ---
+        # Girdi = kaynak-basina causal toplam (iliski ekseni toplanmis, AJAN ekseni korunmus).
+        # Cikti = ajan basina 6 sinif {none, follows, yieldingTo, waitingFor,
+        #         mergesInFrontOf, overtakes},
+        #         harita elemani basina 2 sinif {none, keepsLane}.
+        # l1_bottleneck=1: psi ARTIK f_cas OKUMAZ, yalnizca L1'in ciktisini okur -> saf CBM.
+        # l1_bottleneck=0: hibrit (psi f_cas'i da gorur) -- performans sigortasi.
+        self.l1 = bool(l1)
+        self.l1_bottleneck = bool(l1_bottleneck)
+        self.num_l1_ag, self.num_l1_mp = num_l1_ag, num_l1_mp
+        psi_in = dim
+        if self.l1:
+            self.l1_head_ag = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_l1_ag))
+            self.l1_head_mp = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_l1_mp))
+            # psi'ye giden ozet: sinif basina KAC ajan/eleman o sinifta (softmax toplami).
+            # Ajan kimligi degil SINIF DAGILIMI tasinir -> N'den bagimsiz, permutasyona duyarsiz.
+            l1_sum = num_l1_ag + num_l1_mp
+            psi_in = l1_sum if self.l1_bottleneck else dim + l1_sum
         if self.dod_meta:
-            self.psi_lon = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_lon))
-            self.psi_lat = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_lat))
+            self.psi_lon = nn.Sequential(nn.Linear(psi_in, 128), nn.ReLU(), nn.Linear(128, num_lon))
+            self.psi_lat = nn.Sequential(nn.Linear(psi_in, 128), nn.ReLU(), nn.Linear(128, num_lat))
         else:
-            self.psi = nn.Sequential(nn.Linear(dim, 128), nn.ReLU(), nn.Linear(128, num_maneuvers))
+            self.psi = nn.Sequential(nn.Linear(psi_in, 128), nn.ReLU(), nn.Linear(128, num_maneuvers))
 
         # STEP 2 -- f_cfd COLLAPSE FIX. Olculen kusur: fcfd_var/fcas_var ~ 1e-4 (3 kosuda), yani
         # f_cfd her sahnede AYNI vektor. Sebep: loss ondan tek sey istiyor ("manevrayi ele verme"),
@@ -1095,14 +1128,37 @@ class CausalPlanner(nn.Module):
         # DOD: psi'yi head'den ONCE hesapla; tahmin edilen karar (b*) decoder query'sine besle.
         psi_cas = psi_cfd = None
         psi_lon_cas = psi_lat_cas = psi_lon_cfd = psi_lat_cfd = None
+        # --- L1 head: ajan/eleman basina etkilesim karari ---
+        l1_ag = l1_mp = None
+        z_cas, z_cfd = f_cas, f_cfd
+        if self.l1 and dis['src_cas_ag'] is not None:
+            l1_ag = self.l1_head_ag(dis['src_cas_ag'])                  # [B,N,C_ag]
+            l1_mp = self.l1_head_mp(dis['src_cas_mp'])                  # [B,S,C_mp]
+            # gecerli olmayan yuvalar ozete girmesin
+            # Ozet = KUTLE-AGIRLIKLI sinif dagilimi: "causal dikkatin ne kadari hangi
+            # etkilesim sinifinda". Duz sayimdan iyi (hangi ajanin onemli oldugunu tasir),
+            # ama yine YALNIZCA konseptlerden olusur -- ajan kimligi/konumu gecmez.
+            va = (dis['gated_valid'].float() * dis['M_cas'])[..., None]
+            vm = (dis['gated_map_valid'].float() * dis['M_cas_map'])[..., None]
+            summ = torch.cat([(torch.softmax(l1_ag, -1) * va).sum(1),
+                              (torch.softmax(l1_mp, -1) * vm).sum(1)], dim=-1)   # [B,C_ag+C_mp]
+            z_cas = summ if self.l1_bottleneck else torch.cat([f_cas, summ], dim=-1)
+            # confound dali AYNI L1 head'ini kullanir (paylasilan head = hile korumasi,
+            # psi_cas/psi_cfd'deki mantigin aynisi). Fark yalnizca agirlik: M_cfd.
+            vac = (dis['gated_valid'].float() * dis['M_cfd'])[..., None]
+            vmc = (dis['gated_map_valid'].float() * dis['M_cfd_map'])[..., None]
+            summ_cfd = torch.cat([(torch.softmax(self.l1_head_ag(dis['src_cfd_ag']), -1) * vac).sum(1),
+                                  (torch.softmax(self.l1_head_mp(dis['src_cfd_mp']), -1) * vmc).sum(1)],
+                                 dim=-1)
+            z_cfd = summ_cfd if self.l1_bottleneck else torch.cat([f_cfd, summ_cfd], dim=-1)
         if self.dod_meta:
-            psi_lon_cas, psi_lat_cas = self.psi_lon(f_cas), self.psi_lat(f_cas)
-            psi_lon_cfd, psi_lat_cfd = self.psi_lon(f_cfd), self.psi_lat(f_cfd)
+            psi_lon_cas, psi_lat_cas = self.psi_lon(z_cas), self.psi_lat(z_cas)
+            psi_lon_cfd, psi_lat_cfd = self.psi_lon(z_cfd), self.psi_lat(z_cfd)
             b_star = (psi_lon_cas.argmax(-1), psi_lat_cas.argmax(-1))   # (argmax non-diff -> psi'ye sizmaz)
             b_cfd = (psi_lon_cfd.argmax(-1), psi_lat_cfd.argmax(-1))
         else:
-            psi_cas = self.psi(f_cas)
-            psi_cfd = self.psi(f_cfd)
+            psi_cas = self.psi(z_cas)
+            psi_cfd = self.psi(z_cfd)
             b_star = psi_cas.argmax(-1)                                  # [B] (argmax non-diff -> psi'ye sizmaz)
             b_cfd = psi_cfd.argmax(-1)
 
@@ -1172,5 +1228,6 @@ class CausalPlanner(nn.Module):
             'M_cas_map_typed': dis['M_cas_map_typed'], 'M_cfd_map_typed': dis['M_cfd_map_typed'],
             'gated_valid': dis['gated_valid'], 'gated_map_valid': dis['gated_map_valid'],
             'ch_active': dis['ch_active'], 'mch_active': dis['mch_active'],
+            'l1_ag': l1_ag, 'l1_mp': l1_mp,        # L1 logitleri (L_attr hedefi)
         }
         return out

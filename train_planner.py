@@ -68,6 +68,10 @@ def read_batch(batch, device):
     if len(batch) > 14:
         inputs["decision_lon"] = batch[13].to(device).long()
         inputs["decision_lat"] = batch[14].to(device).long()
+    # L1 etiketleri (build_l1_labels.py); model girdisi DEGIL, L_attr hedefi
+    if len(batch) > 16:
+        inputs["l1_agent"] = batch[15].to(device).long()
+        inputs["l1_map"] = batch[16].to(device).long()
     return inputs, ego_future, neighbors_future, c_lat_candidates
 
 
@@ -151,7 +155,17 @@ def maneuver_labels(ego_future):
     return torch.tensor(labs, dtype=torch.long, device=ego_future.device)
 
 
+# L1 ajan sinif agirliklari -- olculen dagilimin TERSI, ust sinir 40 (evals/build_l1_labels.py,
+# validation): none %93.21, follows %3.21, yieldingTo %0.06, waitingFor %0.09,
+# mergesInFrontOf %0.64, overtakes %2.79.
+# yieldingTo/waitingFor cok seyrek (7 ve 10 ornek): ham ters-frekans 417/278 olurdu, egitimi
+# dagitir. 40'ta sinirlandi -- sozlukte KALIYORLAR (iz onlari ifade edebilsin diye) ama
+# ogrenilmeleri beklenmiyor; olculecek, raporlanacak.
+L1_AG_WEIGHT = [0.27, 7.8, 40.0, 40.0, 39.0, 9.0]
+
+
 def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0,
+                            lambda_attr=0.0, l1_labels=None,
                             neighbors_future=None, lambda_nbr=0.0, lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
                             lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5,
                             lambda_conflict=0.0, conflict_terms='all', dec_labels=None):
@@ -306,7 +320,24 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
         l_conflict = (out['M_cas'] * penalty).sum(-1).mean()
 
     nv_f = out['nbr_valid'].float()
+    # --- L_attr: L1 (etkilesim karari) denetimi ---
+    # M_cas'i SEMANTIK bir hedefe baglar. Olculdu (2026-08-30): M_cas'in kisitlayan ajani
+    # kisitlamayanin ustune koyma AUC'si 0.710, ham geometri 0.975 -- maske dogru ajani
+    # buluyor ama siralamasi zayif. Bu kayip ona ilk kez "kim ve NE ILISKISI" der.
+    # Girdi kanallari GF-tabanli (gurultulu), hedef GT-tabanli (temiz): CHANNELS_AUDIT'in
+    # weak-evidence problemi boylece girdi gurultusu olmaktan cikip denetim sinyaline doner.
+    l_attr = torch.zeros((), device=out['traj'].device)
+    if lambda_attr > 0 and l1_labels is not None and out.get('l1_ag') is not None:
+        y_ag, y_mp = l1_labels
+        va, vm = out['gated_valid'], out['gated_map_valid']
+        la, lm = out['l1_ag'], out['l1_mp']
+        w_ag = torch.tensor(L1_AG_WEIGHT, device=la.device, dtype=la.dtype)
+        if va.any():
+            l_attr = l_attr + F.cross_entropy(la[va], y_ag[:, :la.shape[1]][va], weight=w_ag)
+        if vm.any():
+            l_attr = l_attr + F.cross_entropy(lm[vm], y_mp[:, :lm.shape[1]][vm])
     loss = (l_traj + lambda_kld * l_kld + lambda_ci * l_ci + lambda_mask * l_mask
+            + lambda_attr * l_attr
             + lambda_recon * l_recon + lambda_nbr * l_nbr + lambda_budget * l_budget + lambda_bc * l_bc + lambda_peak * l_peak
             + lambda_conflict * l_conflict)
 
@@ -416,7 +447,7 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0, lambda_nbr=0.0,
                lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
                lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5, lambda_conflict=0.0, conflict_terms='all',
-               ego_corridor='refpath', optimizer=None, desc="Training"):
+               ego_corridor='refpath', optimizer=None, desc="Training", lambda_attr=0.0):
     train = optimizer is not None
     causal.train() if train else causal.eval()
     gameformer.eval()
@@ -450,7 +481,10 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                                                          lambda_bc, lambda_peak, peak_tau,
                                                          lambda_conflict, conflict_terms,
                                                          dec_labels=(inputs.get('decision_lon'),
-                                                                     inputs.get('decision_lat')))
+                                                                     inputs.get('decision_lat')),
+                                                         lambda_attr=lambda_attr,
+                                                         l1_labels=((inputs['l1_agent'], inputs['l1_map'])
+                                                                    if 'l1_agent' in inputs else None))
 
             if train:
                 optimizer.zero_grad()
@@ -543,6 +577,8 @@ def model_training(args):
                            gate_trust=args.gate_trust,
                            dod_meta=args.dod_meta, dec_moe=args.dec_moe, dod_tf=args.dod_tf,
                            lat_moe=args.lat_moe,
+                           l1=args.l1, l1_bottleneck=args.l1_bottleneck,
+                           num_l1_ag=args.num_l1_ag, num_l1_mp=args.num_l1_mp,
                            num_lon=(NUM_LON4 if args.lat_moe else NUM_LON5 if args.dec_moe
                                     else NUM_LON_MERGED if args.lon_merge else NUM_LON),
                            num_lat=(NUM_LAT5V if args.lat_moe
@@ -551,8 +587,10 @@ def model_training(args):
     optimizer = optim.AdamW(causal.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 12, 14, 16, 18], gamma=0.5)
 
-    train_set = DrivingData(args.train_set + "/*.npz", args.num_neighbors)
-    valid_set = DrivingData(args.valid_set + "/*.npz", args.num_neighbors)
+    train_set = DrivingData(args.train_set + "/*.npz", args.num_neighbors,
+                            l1_labels=(args.l1_labels or None))
+    valid_set = DrivingData(args.valid_set + "/*.npz", args.num_neighbors,
+                            l1_labels=(args.l1_valid_labels or args.l1_labels or None))
 
     # --- dup_boost (v4, kullanici karari 2026-08-26): DETERMINISTIK COGALTMA ---
     # CIL soyunun dengeli-ornekleme pratiginin ilimli hali: LC sahneleri ve dinamik stop/slow
@@ -600,12 +638,14 @@ def model_training(args):
                              args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_recon, args.lambda_nbr,
                              args.lambda_budget, args.budget_rho, args.budget_lo,
                              args.lambda_bc, args.lambda_peak, args.peak_tau, args.lambda_conflict, args.conflict_terms,
-                             args.ego_corridor, optimizer=optimizer, desc="Training")
+                             args.ego_corridor, optimizer=optimizer, desc="Training",
+                             lambda_attr=args.lambda_attr)
         val_m = _run_epoch(valid_loader, gameformer, causal, args.device, args.num_neighbors,
                            args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_recon, args.lambda_nbr,
                            args.lambda_budget, args.budget_rho, args.budget_lo,
                            args.lambda_bc, args.lambda_peak, args.peak_tau, args.lambda_conflict, args.conflict_terms,
-                           args.ego_corridor, optimizer=None, desc="Validation")
+                           args.ego_corridor, optimizer=None, desc="Validation",
+                           lambda_attr=args.lambda_attr)
 
         log = {"epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]}
         log.update({f"train-{k}": v for k, v in train_m.items()})
@@ -687,6 +727,21 @@ if __name__ == "__main__":
     parser.add_argument("--lon_merge", type=int, default=0,
                         help="dod_meta ile: quickly/gently katla (9 -> 6 lon sinifi). psi_lon confusion "
                              "matrisi ayrimi ogrenemezse acilir; extractor'a dokunmaz.")
+    parser.add_argument("--l1", type=int, default=0,
+                        help="1 = L1 (etkilesim karari) katmani: ajan/eleman basina sinif "
+                             "{none, follows, mergesInFrontOf, overtakes} / {none, keepsLane}. "
+                             "Etiket build_l1_labels.py'den (GT kanallari + KG intent kurali).")
+    parser.add_argument("--l1_bottleneck", type=int, default=0,
+                        help="1 = psi ARTIK f_cas okumaz, yalniz L1 ozetini okur (saf CBM). "
+                             "0 = hibrit (f_cas + L1 ozeti), performans sigortasi.")
+    parser.add_argument("--num_l1_ag", type=int, default=6)
+    parser.add_argument("--num_l1_mp", type=int, default=2)
+    parser.add_argument("--lambda_attr", type=float, default=0.0,
+                        help="L_attr agirligi (L1 denetimi). 0 = kapali.")
+    parser.add_argument("--l1_valid_labels", type=str, default="",
+                        help="validation icin ayri L1 etiket dosyasi")
+    parser.add_argument("--l1_labels", type=str, default="",
+                        help="build_l1_labels.py ciktisi (npz). Bos = L1 etiketi yok.")
     parser.add_argument("--lat_moe", type=int, default=0,
                         help="4x5 GERCEK sozluk + CA sonrasi LAT SINIFI basina GMM expert (5). "
                              "1 = LAT5V (to_*, v3_latmoe sozlugu) | 2 = LAT5L (v4: LC birinci-"
