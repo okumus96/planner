@@ -106,3 +106,94 @@ Agent colors mapped onto the KG relation palette (follows dark blue, merges oran
 3. v2 (data_process + map_api): compute channels with the KG functions unchanged, cache into npz (training), per-cycle calls at inference; closes the deviations marked above (lane-ID adjacency, primary-lane disambiguation, true `inIntersection`, connector-based traffic control).
 4. Cross-check run: extractor with `spatial,map,pairwise` on 10–20 scenarios, frame×pair/element agreement — the numeric fidelity report of the v1 geometry.
 5. Ablations queued: map `near` on/off; merges/traffic_control weight-sharing.
+
+---
+
+# v2 — KG predicate inventory and the L0/L1/L2 layering (2026-08-30)
+
+The v1 audit above maps our 11 agent + 8 map channels onto the KG. This section does the
+reverse: it surveys what the KG *actually emits* and sorts it into the three layers the
+relational decision trace needs.
+
+Source of truth is **not** `PREDICATES.md` — that file documents 5 sections (spatial, motion,
+temporal, map, interaction) and omits several categories that the code emits. The full
+inventory is `nuplan_predicates_modular/categories/*.py`, 18 modules. Notably `PREDICATES.md`
+contains no yield, no traffic-light and no collision/TTC predicates, while the code emits all
+three families.
+
+## The layering
+
+**L0 — structure / gating.** Current-frame, static relations. Their job is to decide which
+agents and map elements enter the causal graph. Measured (redundancy probe, 10 659 pairs):
+8 of our 11 agent channels are recoverable from the raw 7-d edge at >= 0.90 balanced accuracy,
+so *structure* is the honest job for them; asking them to carry semantics is asking for what
+they provably do not have.
+
+**L1 — interaction decision.** Requires future or temporal evidence; expresses what the ego is
+*doing about* another agent or map element. This is the concept-bottleneck layer.
+
+**L2 — maneuver.** The ego's own action. Unchanged from v2/`lat_moe`.
+
+## L0 (structure)
+
+| KG category | predicates | our channel |
+|---|---|---|
+| `spatial` | `near`, `veryNear` | `CH_NEAR` |
+| position (§1) | `inFrontOf`, `behind`, `leftOf`, `rightOf`, `front/rearLeft/RightOf`, `overlapping`, `touching` | `CH_SAME_LANE_AHEAD/BEHIND`, `CH_ADJACENT_LEFT/RIGHT` |
+| `map` | `inLane`, `inLaneConnector`, `inIntersection`, `inCrosswalk`, `hasPrimaryLane`, `hasSpatialMapRelation`, `inSameLaneAs`, `sharesIntersectionWith`, `hasParentRoadblock` | the 8 map channels |
+| `route` | `onExpertRoute` | `MCH_ROUTE` |
+| `visibility` | `geometricallyVisibleToEgo`, `withinEgoFieldOfView`, `occludedByAgent` | **absent — strong gating candidate** |
+| `traffic_control` | `hasRelevantTrafficLight`, `hasTrafficLightStatus`, `controlsLaneConnector` | `MCH_TRAFFIC` (coarse) |
+
+## L1 (interaction decision)
+
+| KG category | predicates | status here |
+|---|---|---|
+| **`intent`** | **`yieldingTo`**, **`waitingFor`**, `creatingGapFor`, `competingForGapWith` | **absent — the core of the layer** |
+| **`traffic_control`** | **`waitsAtRedLight`**, `runsRedLight`, `crossesStopLine` | **absent — the map-side twin of `yieldingTo`** |
+| `future_observation` | `onObservedCollisionCourseWith`, `cautionCollisionRisk`, `criticalCollisionRisk` | `CH_COLLISION_COURSE` — currently an *input*; belongs here as an *output* |
+| `interaction` | `mergesInFrontOf`, `mergesBehind`, `overtakes` | `CH_MERGES`, `CH_OVERTAKES` — same move |
+| `interaction` | `follows` | named as interaction but geometric in content (0.96 recoverable); **stays in L0** |
+
+## L2 (maneuver) — unchanged
+
+| KG category | predicates | ours |
+|---|---|---|
+| `maneuver` | `turnsLeft/Right`, `goesStraight`, `keepsLane`, `changesLaneLeft/Right`, `makesUTurn`, `enters/exitsLaneConnector` | LAT5V / LAT5L (`lat_moe`) — near one-to-one |
+| — | (no longitudinal counterpart in the KG) | LON4 `stop/slow/accel/maintain` (ours) |
+
+## Evidence (quantities, not predicates)
+
+`geometry` (centre/free-space/lateral/longitudinal distances, footprint gaps) ·
+`motion` (`hasClosingSpeedTo`, relative speeds, travel-direction difference) ·
+`risk` (`hasPredictedTimeToClosestApproach`, `hasPredictedClosestApproachClearance`,
+`hasTimeHeadwayCandidate`) · `temporal` (durations, per-frame deltas).
+
+## `np:yieldingTo` — definition and measured frequency
+
+`categories/intent.py:66-117`, thresholds from `predicate_logic.py`:
+
+```
+1) buffered future paths of subject and object intersect -> common conflict region
+2) subject decelerating (<= -0.30 m/s^2) OR stopped (<= 0.30 m/s)
+3) object reaches the conflict point first (object_arrival + 1.5 s < subject_arrival)
+4) sustained >= 1.0 s
+```
+
+Measured on our cache (1118 validation scenes, ego as subject, GT futures, conflict region as
+the closest-approach point of the two paths instead of the shapely buffer intersection —
+same test, vectorised): **27 scenes, 2.4%, always exactly one target.**
+
+Too sparse to supervise a head on its own (0.27% of agent-pairs). Consequence for the design:
+L1 must be **multi-class over the whole interaction family** (none / follows / yielding /
+merging / overtaking / collision-risk), not a yield-only binary.
+
+## Two constraints this survey imposes
+
+1. **Whatever is promoted to L1 must leave the input channels.** If `collision_course` is both
+   an input channel and the L1 target, the head copies the input bit, `L_attr` goes to zero and
+   `M_cas` gets no useful gradient. `yieldingTo` is safe (never was an input); `collision_course`,
+   `merges`, `overtakes` are not.
+2. **The map side has its own L1.** `waitsAtRedLight` / `crossesStopLine` are the map twin of
+   `yieldingTo`. This is the first construct that would join the agent and map branches, which
+   today live in separate softmaxes.
