@@ -30,6 +30,45 @@ from GameFormer.channels import (compute_channels, CHANNEL_NAMES, NUM_CHANNELS,
                                  MCH_ROUTE, MCH_TRAFFIC, MCH_NEAR)
 
 
+# --- kanal kumesi anahtari -------------------------------------------------
+# v2 (channels.py, 11 ajan / 8 harita) varsayilan; --v3 ile channels_v3.py
+# (10 ajan / 8 harita) kullanilir. Iki kume de ayni istatistik + BEV yolundan gecer.
+A_SHORT_V2 = ["ahead", "behind", "adjL", "adjR", "collide", "intersect", "near",
+              "follows", "merges", "overtakes", "vru"]
+A_COLORS_V2 = ["#1565c0", "#64b5f6", "#6a1b9a", "#8e24aa", "#b93b3b", "#c9a55a",
+               "#9e9e9e", "#0d47a1", "#fb8c00", "#e53935", "#00838f"]
+# onRouteCorridor, same_lane_behind, staticObstacleOnPath, inCrosswalk,
+# sharedTrafficControl kapatildi
+# -- gerekceleri channels_v3.py basindaki bloklarda
+A_SHORT_V3 = ["ahead", "behind", "adjL", "adjR", "intersect", "vru"]
+A_COLORS_V3 = ["#1565c0", "#64b5f6", "#6a1b9a", "#8e24aa", "#c9a55a", "#00838f"]
+
+CFG = {
+    "v3": False,
+    "a_names": CHANNEL_NAMES, "n_a": NUM_CHANNELS,
+    "a_short": A_SHORT_V2, "a_colors": A_COLORS_V2,
+    "m_names": MAP_CHANNEL_NAMES, "n_m": NUM_MAP_CHANNELS,
+    # _draw'in R2 boyamasinda kullandigi mantiksal indeksler (kumeye gore kayiyor)
+    "m_idx": {"inlane": MCH_IN_LANE, "succ": MCH_SUCCESSOR, "adjL": MCH_ADJ_LEFT,
+              "adjR": MCH_ADJ_RIGHT, "route": MCH_ROUTE, "tl": MCH_TRAFFIC,
+              "intx": None, "xwalk": None, "cross": None},
+}
+
+
+def use_v3():
+    """Kanal kumesini v3'e cevir (channels_v3.py)."""
+    from GameFormer.channels_v3 import (A_NAMES, NUM_A, M_NAMES, NUM_M, M_IN_LANE,
+                                        M_LEFT_ADJACENT, M_RIGHT_ADJACENT, M_SUCCESSOR,
+                                        M_IN_INTERSECTION, M_CROSSES_EGO_PATH,
+                                        M_TRAFFIC_CONTROL)
+    CFG.update(v3=True, a_names=A_NAMES, n_a=NUM_A, a_short=A_SHORT_V3,
+               a_colors=A_COLORS_V3, m_names=M_NAMES, n_m=NUM_M,
+               m_idx={"inlane": M_IN_LANE, "succ": M_SUCCESSOR, "adjL": M_LEFT_ADJACENT,
+                      "adjR": M_RIGHT_ADJACENT, "route": None,
+                      "tl": M_TRAFFIC_CONTROL, "intx": M_IN_INTERSECTION,
+                      "xwalk": None, "cross": M_CROSSES_EGO_PATH})
+
+
 def _load_npz(path, num_neighbors):
     d = np.load(path, allow_pickle=True)
     out = {
@@ -42,6 +81,10 @@ def _load_npz(path, num_neighbors):
         "route_lanes": torch.from_numpy(d["route_lanes"]).float()[None],
         "token": str(d["token"]),
     }
+    # v3 alanlari (eski npz'lerde yok -- yoksa sessizce atlanir, v2 yolu etkilenmez)
+    for k in ("lane_tl", "intersections", "stop_polygons"):
+        if k in d.files:
+            out[k] = torch.from_numpy(d[k]).float()[None]
     return out
 
 
@@ -75,11 +118,13 @@ def run_dataset(args):
         gameformer.load_state_dict(torch.load(args.pretrained_path, map_location=args.device))
         gameformer.to(args.device).eval()
 
-    fire = np.zeros(NUM_CHANNELS, dtype=np.int64)      # kanal basina yanan pair sayisi
-    agree = np.zeros(NUM_CHANNELS, dtype=np.int64)     # GT-vs-GF ayni karar
-    both = np.zeros(NUM_CHANNELS, dtype=np.int64)      # karsilastirilan pair sayisi
-    inter = np.zeros(NUM_CHANNELS, dtype=np.int64)     # GT ∧ GF yanan (pozitif-IoU pay)
-    union = np.zeros(NUM_CHANNELS, dtype=np.int64)     # GT ∨ GF yanan (pozitif-IoU payda)
+    NA, NM = CFG["n_a"], CFG["n_m"]
+    fire = np.zeros(NA, dtype=np.int64)      # kanal basina yanan pair sayisi
+    sole = np.zeros(NA, dtype=np.int64)      # o kanal TEK BASINA yanan pair sayisi
+    agree = np.zeros(NA, dtype=np.int64)     # GT-vs-GF ayni karar
+    both = np.zeros(NA, dtype=np.int64)      # karsilastirilan pair sayisi
+    inter = np.zeros(NA, dtype=np.int64)     # GT ∧ GF yanan (pozitif-IoU pay)
+    union = np.zeros(NA, dtype=np.int64)     # GT ∨ GF yanan (pozitif-IoU payda)
     multi = np.zeros(6, dtype=np.int64)                # 0,1,2,3,4,5+ kanal yanan pair histogrami
     n_pairs = 0
     cover_miss = 0                                     # yakin/kapanan ama sifir kanal
@@ -87,7 +132,8 @@ def run_dataset(args):
     miss_tip = np.zeros(3, dtype=np.int64)             # kacanlar: veh/ped/bic
     miss_dir = np.zeros(3, dtype=np.int64)             # kacanlar: ayni-yon / kesen / karsi-yon
     # R2 (harita) istatistikleri
-    mfire = np.zeros(NUM_MAP_CHANNELS, dtype=np.int64)
+    mfire = np.zeros(NM, dtype=np.int64)
+    msole = np.zeros(NM, dtype=np.int64)
     mmulti = np.zeros(4, dtype=np.int64)               # 0,1,2,3+ kanal yanan eleman
     n_elems = 0
     viz_scenes = []
@@ -95,10 +141,18 @@ def run_dataset(args):
     for f in files:
         s = _load_npz(f, args.num_neighbors)
         valid = s["neighbor_agents_past"][0, :, -1, :2].abs().sum(-1) > 1e-6
-        act = torch.zeros(1, s["neighbor_agents_past"].shape[1], NUM_CHANNELS, dtype=torch.bool)
+        act = torch.zeros(1, s["neighbor_agents_past"].shape[1], NA, dtype=torch.bool)
         if do_r1:
             act_gt, ev = compute_channels(s["neighbor_agents_past"], s["ego_agent_past"],
                                           s["gt_futures"], s["ref_path"])
+            if CFG["v3"]:
+                # kanallar v3'ten; ev (ds/dlat/d_fs/closing/ttc/dtheta) saf geometri oldugu
+                # icin kapsam ve --inspect kolonlarinda aynen kullanilir.
+                from GameFormer.channels_v3 import compute_agent_channels
+                act_gt = compute_agent_channels(
+                    s["neighbor_agents_past"], s["ego_agent_past"], s["ref_path"],
+                    s["route_lanes"], s["map_crosswalks"], s["intersections"],
+                    s["stop_polygons"], s["lane_tl"], s["map_lanes"])
             act = act_gt
             if gameformer is not None:
                 npast = s["neighbor_agents_past"].to(args.device)
@@ -125,6 +179,7 @@ def run_dataset(args):
             e = ev[0][valid]
             n_pairs += len(a)
             fire += a.sum(0).numpy()
+            sole += (a & (a.sum(-1, keepdim=True) == 1)).sum(0).numpy()
             cnt = a.sum(-1).clamp(max=5).numpy()
             for c in cnt:
                 multi[int(c)] += 1
@@ -145,8 +200,7 @@ def run_dataset(args):
             miss_dir[1] += int((miss & (dthv > 0.45) & (dthv < 2.70)).sum())
             miss_dir[2] += int((miss & (dthv >= 2.70)).sum())
             if args.inspect and args.inspect in s["token"]:
-                short = ["ahead", "behind", "adjL", "adjR", "collide", "intersect", "near",
-                         "follows", "merges", "overtakes", "vru"]
+                short = CFG["a_short"]
                 tipn = ["veh", "ped", "bic"]
                 cur = s["neighbor_agents_past"][0, :, -1]
                 print(f"\n--- INSPECT {s['token']} (ajan-basina ego->agent karari) ---")
@@ -155,7 +209,7 @@ def run_dataset(args):
                 for j in range(act.shape[1]):
                     if not valid[j]:
                         continue
-                    chs = ",".join(short[c] for c in range(NUM_CHANNELS) if act[0, j, c]) or "-"
+                    chs = ",".join(short[c] for c in range(NA) if act[0, j, c]) or "-"
                     ej = ev[0, j]
                     print(f"{j:>4} {tipn[int(cur[j, 8:11].argmax())]:>4} {chs:<24} "
                           f"{float(cur[j, 0]):>7.1f} {float(cur[j, 1]):>7.1f} {float(ej[EV_DFS]):>6.1f} "
@@ -164,11 +218,21 @@ def run_dataset(args):
 
         # R2: harita kanallari (future gerektirmez; token sirasi modelle ayni)
         if do_r2:
-            mact, mev = compute_map_channels(s["map_lanes"], s["map_crosswalks"],
-                                             s["route_lanes"], s["ref_path"])
+            if CFG["v3"]:
+                from GameFormer.channels_v3 import compute_map_channels_v3
+                mact = compute_map_channels_v3(s["map_lanes"], s["map_crosswalks"],
+                                               s["route_lanes"], s["ref_path"],
+                                               s["lane_tl"], s["intersections"],
+                                               s["stop_polygons"])
+                _, mev = compute_map_channels(s["map_lanes"], s["map_crosswalks"],
+                                              s["route_lanes"], s["ref_path"])
+            else:
+                mact, mev = compute_map_channels(s["map_lanes"], s["map_crosswalks"],
+                                                 s["route_lanes"], s["ref_path"])
             ma = mact[0]                               # gecerlilik compute icinde maskelendi
             n_elems += int(ma.shape[0])
             mfire += ma.sum(0).numpy()
+            msole += (ma & (ma.sum(-1, keepdim=True) == 1)).sum(0).numpy()
             mcnt = ma.sum(-1).clamp(max=3).numpy()
             for c in mcnt:
                 mmulti[int(c)] += 1
@@ -185,15 +249,19 @@ def run_dataset(args):
                     if float(me[k, 0]) > 45.0 and not ma[k].any():
                         continue                        # uzak ve sessiz -> atla
                     kind = "lane" if k < Lc else ("cwalk" if k < Lc + Cc else "route")
-                    chs = ",".join(MAP_CHANNEL_NAMES[c] for c in range(NUM_MAP_CHANNELS)
+                    chs = ",".join(CFG["m_names"][c] for c in range(NM)
                                    if ma[k, c]) or "-"
                     print(f"{k:>4} {kind:>6} {chs:<28} {float(me[k, 0]):>7.1f} "
                           f"{float(me[k, 1]):>9.1f} {float(me[k, 2]):>7.1f} {float(me[k, 3]):>7.2f}")
         else:
             S = (s["map_lanes"].shape[1] + s["map_crosswalks"].shape[1]
                  + s["route_lanes"].shape[1])
-            ma = torch.zeros(S, NUM_MAP_CHANNELS, dtype=torch.bool)
+            ma = torch.zeros(S, NM, dtype=torch.bool)
 
+        if args.viz and args.focus and do_r1:
+            fi = CFG["a_names"].index(args.focus)
+            if not act[0, :, fi].any():
+                continue                     # odak kanali yanmayan sahneyi cizme
         if args.viz and len(viz_scenes) < args.viz:
             # cizilen future = KARARI VEREN future (GF kullanildiysa GF; yoksa GT) --
             # aksi halde GT cizgisi duz giderken etiket collide diyebilir (olculdu: f4d2 j=6)
@@ -202,9 +270,11 @@ def run_dataset(args):
             viz_scenes.append((s, act[0].numpy(), valid.numpy(), ma.numpy(), fut_used))
 
     if do_r1:
-        print("\n=== R1 KANAL FIRE ORANLARI (pair basina) ===")
-        for i, name in enumerate(CHANNEL_NAMES):
-            print(f"  {name:20s} {fire[i]:6d}  ({100.0 * fire[i] / max(n_pairs, 1):5.1f}%)")
+        print(f"\n=== R1 KANAL FIRE ORANLARI ({n_pairs} pair) ===")
+        print(f"  {'kanal':24s} {'yanma':>7s} {'oran':>7s} {'TEK':>7s} {'tek/yanma':>10s}")
+        for i, name in enumerate(CFG["a_names"]):
+            print(f"  {name:24s} {fire[i]:7d} {100.0 * fire[i] / max(n_pairs, 1):6.1f}% "
+                  f"{sole[i]:7d} {100.0 * sole[i] / max(fire[i], 1):9.1f}%")
         print(f"\n=== R1 MULTI-FIRE HISTOGRAMI ({n_pairs} pair) ===")
         for k in range(6):
             lab = f"{k}" if k < 5 else "5+"
@@ -220,13 +290,15 @@ def run_dataset(args):
               f"karsi {miss_dir[2]} ({100.0 * miss_dir[2] / cm:.0f}%)")
         if gameformer is not None:
             print("\n=== R1 GT-vs-GF KANAL UYUMU (ham | pozitif-IoU) ===")
-            for i, name in enumerate(CHANNEL_NAMES):
+            for i, name in enumerate(CFG["a_names"]):
                 iou = 100.0 * inter[i] / union[i] if union[i] else float("nan")
                 print(f"  {name:20s} {100.0 * agree[i] / max(both[i], 1):6.2f}%  |  IoU {iou:6.2f}%")
     if do_r2:
         print(f"\n=== R2 HARITA KANALLARI ({n_elems} eleman) ===")
-        for i, name in enumerate(MAP_CHANNEL_NAMES):
-            print(f"  {name:24s} {mfire[i]:7d}  ({100.0 * mfire[i] / max(n_elems, 1):5.1f}%)")
+        print(f"  {'kanal':24s} {'yanma':>7s} {'oran':>7s} {'TEK':>7s} {'tek/yanma':>10s}")
+        for i, name in enumerate(CFG["m_names"]):
+            print(f"  {name:24s} {mfire[i]:7d} {100.0 * mfire[i] / max(n_elems, 1):6.1f}% "
+                  f"{msole[i]:7d} {100.0 * msole[i] / max(mfire[i], 1):9.1f}%")
         for k in range(4):
             lab = f"{k}" if k < 3 else "3+"
             print(f"  {lab:>2s} kanal yanan eleman: {mmulti[k]:7d}  ({100.0 * mmulti[k] / max(n_elems, 1):5.1f}%)")
@@ -234,16 +306,16 @@ def run_dataset(args):
     if args.viz:
         _draw(viz_scenes, args.out, mode=args.mode)
     if args.json:
-        payload = {"mode": args.mode}
+        payload = {"mode": args.mode, "channel_set": "v3" if CFG["v3"] else "v2"}
         if do_r1:
             payload.update({"n_pairs": int(n_pairs), "fire": fire.tolist(),
-                            "channel_names": CHANNEL_NAMES, "multi": multi.tolist(),
+                            "channel_names": CFG["a_names"], "sole": sole.tolist(), "multi": multi.tolist(),
                             "coverage_miss": int(cover_miss), "coverage_all": int(cover_all),
                             "agree": agree.tolist(), "compared": both.tolist(),
                             "iou_inter": inter.tolist(), "iou_union": union.tolist()})
         if do_r2:
             payload.update({"r2_n_elems": int(n_elems), "r2_fire": mfire.tolist(),
-                            "r2_channel_names": MAP_CHANNEL_NAMES,
+                            "r2_channel_names": CFG["m_names"], "r2_sole": msole.tolist(),
                             "r2_multi": mmulti.tolist()})
         with open(args.json, "w") as fh:
             json.dump(payload, fh, indent=2)
@@ -260,20 +332,10 @@ def _draw(scenes, out, mode="all"):
     from matplotlib.patches import Rectangle, Circle, RegularPolygon, Patch
     from matplotlib.lines import Line2D
     from matplotlib.transforms import Affine2D
-    # ego->agent kanal renkleri (R=10) -- KG iliski paleti (cell 10) uzerine eslenmis
-    colors = ["#1565c0",  # same_lane_ahead  (mavi)
-              "#64b5f6",  # same_lane_behind (acik mavi)
-              "#6a1b9a",  # adjacent_left    (KG moru)
-              "#8e24aa",  # adjacent_right
-              "#b93b3b",  # onObservedCollisionCourseWith (KG stop-line kirmizisi)
-              "#c9a55a",  # sharesIntersectionWith (KG intersection tonu)
-              "#9e9e9e",  # near             (KG unknown grisi)
-              "#0d47a1",  # follows          (KG follows koyu mavisi)
-              "#fb8c00",  # merges           (KG merge turuncusu)
-              "#e53935",  # overtakes        (KG overtake kirmizisi)
-              "#00838f"]  # vulnerable_road_user_near_ego_path (teal)
-    short = ["ahead", "behind", "adjL", "adjR", "collide", "intersect", "near",
-             "follows", "merges", "overtakes", "vru"]
+    # ego->agent kanal renkleri -- KG iliski paleti (cell 10) uzerine eslenmis; kume CFG'den
+    colors = CFG["a_colors"]
+    short = CFG["a_short"]
+    MI = CFG["m_idx"]
     # R2: taban serit NOTR GRI (kanal renkleri okunabilsin diye maviden cekildi);
     # her kanal AYRI renk, oncelik: inLane > successor > adjacent > route
     LANE_FACE, LANE_EDGE = "#e8e8e8", "#c4c4c4"
@@ -282,9 +344,18 @@ def _draw(scenes, out, mode="all"):
     R2_ADJ = "#ce93d8"            # mor: komsu serit
     R2_ROUTE = "#f06292"          # pembe: rota seridi (yesil/mavi/mor/teal ile karismayan tek bos ton)
     CW_FACE, CW_EDGE = "#fff4b8", "#b59b31"
+    R2_INTX = "#c9a55a"           # v3: inIntersection (KG intersection tonu)
+    R2_XWALK = "#f9a825"          # v3: inCrosswalk (eski; v3'te artik yok)
+    R2_CROSS = "#e53935"          # v3: crossesEgoPath (yolu kesen eleman)
+    # poligon dolgulari serit renklerinden AYRI tutulur (yoksa inIntersection seridi ile
+    # kavsak poligonu ayni gold'a dusup okunamaz oluyor)
+    INTX_FACE, STOP_FACE = "#26a69a", "#d81b60"   # v3 poligonlari: teal / macenta
     ROUTE_C = "#7b1fa2"
     TL_EDGE = "#b93b3b"
     EGO_C = "#212121"             # KG ego rengi
+    # BAGLAM renkleri: incelenmeyen katman bunlarla cizilir -- geometri gorunur kalir,
+    # ama hicbir KANAL rengi tasimaz (ajan/harita katmanlari birbirine karismasin).
+    CTX_GREY, CTX_FILL = "#b0b0b0", "#d8d8d8"
 
     show_r1 = mode in ("all", "r1")
     show_r2 = mode in ("all", "r2")
@@ -305,38 +376,56 @@ def _draw(scenes, out, mode="all"):
         routes = _poly(s["route_lanes"][0])
         L = len(lanes)
         C = len(cwalks)
-        # seritler: genis bant (KG lane dolgusu) + ince centerline; R2 yanan seritler koyu ton
-        for k, p in enumerate(lanes):
-            if len(p) < 2:
-                continue
-            face, alpha = LANE_FACE, 0.55
-            if show_r2:
-                if mact[k, MCH_IN_LANE]:
-                    face, alpha = R2_INLANE, 0.8
-                elif mact[k, MCH_SUCCESSOR]:
-                    face, alpha = R2_SUCC, 0.8
-                elif mact[k, MCH_ADJ_LEFT] or mact[k, MCH_ADJ_RIGHT]:
-                    face, alpha = R2_ADJ, 0.75
-                elif mact[k, MCH_ROUTE]:
-                    face, alpha = R2_ROUTE, 0.75
-            ax.plot(p[:, 0], p[:, 1], color=face, lw=8, alpha=alpha,
-                    solid_capstyle="round", zorder=0.6)
-            ax.plot(p[:, 0], p[:, 1], color=LANE_EDGE, lw=0.6, alpha=0.6, zorder=0.7)
-            if show_r2 and mact[k, MCH_TRAFFIC]:
-                ax.plot(p[:, 0], p[:, 1], color=TL_EDGE, lw=1.1, ls="--", alpha=0.9, zorder=0.8)
-        if show_r2:                                     # r1 modunda crosswalk cizilmez (ajan odagi)
-            for k, p in enumerate(cwalks):
+        # R2 kanallari S = L + C + R elemanin HEPSINDE hesaplaniyor; bu yuzden boyama da
+        # ucune birden uygulanir. Onceden yalnizca lane'ler boyaniyor, crosswalk/route tur
+        # rengiyle ciziliyordu -> inCrosswalk ve onExpertRoute kararlari gorunmuyordu.
+        # Tur, artik RENK degil CIZGI STILI ile ayirt edilir: lane duz, crosswalk noktali,
+        # route kesikli.
+        def _face(k):
+            """eleman k'nin kanal rengi (oncelik sirasi) ve yanip yanmadigi."""
+            if not show_r2:
+                return CTX_FILL, 0.5, False
+            if mact[k, MI["inlane"]]:
+                return R2_INLANE, 0.85, True
+            if mact[k, MI["succ"]]:
+                return R2_SUCC, 0.85, True
+            if mact[k, MI["adjL"]] or mact[k, MI["adjR"]]:
+                return R2_ADJ, 0.8, True
+            if MI["intx"] is not None and mact[k, MI["intx"]]:
+                return R2_INTX, 0.8, True
+            if MI.get("cross") is not None and mact[k, MI["cross"]]:
+                return R2_CROSS, 0.85, True
+            if MI["xwalk"] is not None and mact[k, MI["xwalk"]]:
+                return R2_XWALK, 0.8, True
+            if MI["route"] is not None and mact[k, MI["route"]]:
+                return R2_ROUTE, 0.8, True
+            return LANE_FACE, 0.55, False
+
+        for grp, off, ls, zb in ((lanes, 0, "-", 0.6), (cwalks, L, ":", 0.9),
+                                 (routes, L + C, "--", 1.0)):
+            for j, p in enumerate(grp):
                 if len(p) < 2:
                     continue
-                ax.plot(p[:, 0], p[:, 1], color=CW_FACE, lw=8, alpha=0.8, solid_capstyle="round", zorder=0.9)
-                ax.plot(p[:, 0], p[:, 1], color=CW_EDGE, lw=0.8, alpha=0.8, zorder=1.0)
-        for p in routes:
-            p = p[p[:, 0] > 0.0]            # ego'nun gerisindeki route parcasi cizilmez (lookbehind=0)
-            if len(p) < 2:
-                continue
-            # route tokenlari = ego_route_corridor kanalinin kendisi -> PEMBE (legend'la tutarli;
-            # onceden koyu mor cizilip adjacent moruyla karisiyordu)
-            ax.plot(p[:, 0], p[:, 1], color=R2_ROUTE, lw=1.6, ls="--", alpha=0.9, zorder=1.1)
+                k = off + j
+                face, alpha, fired = _face(k)
+                ax.plot(p[:, 0], p[:, 1], color=face, lw=8, alpha=alpha,
+                        solid_capstyle="round", zorder=zb)
+                ax.plot(p[:, 0], p[:, 1], color=LANE_EDGE if not fired else "#5a5a5a",
+                        lw=0.7, ls=ls, alpha=0.75, zorder=zb + 0.1)
+                if show_r2 and mact[k, MI["tl"]]:
+                    ax.plot(p[:, 0], p[:, 1], color=TL_EDGE, lw=1.2, ls="--",
+                            alpha=0.95, zorder=zb + 0.2)
+        if "intersections" in s:                    # v3: gercek kavsak/dur poligonlari
+            from matplotlib.patches import Polygon as _Poly
+            pal = ((("intersections", INTX_FACE), ("stop_polygons", STOP_FACE)) if show_r2
+                   else (("intersections", CTX_GREY), ("stop_polygons", CTX_GREY)))
+            for key, fcol in pal:
+                for pg in s[key][0].numpy():
+                    v = np.abs(pg[:, :2]).sum(-1) > 1e-6
+                    if v.sum() >= 3:
+                        ax.add_patch(_Poly(pg[v, :2], closed=True, facecolor=fcol,
+                                           edgecolor=fcol, alpha=0.16, lw=1.2, ls="--",
+                                           zorder=0.4))
         rp = s["ref_path"][0, 0, :, :2].numpy()
         rp = rp[np.abs(rp).sum(-1) > 1e-6]
         ax.plot(rp[:, 0], rp[:, 1], color="#616161", lw=1.6, ls=":", alpha=0.9, zorder=1.2)
@@ -373,30 +462,43 @@ def _draw(scenes, out, mode="all"):
         ax.set_ylim(-40, 40)
         ax.set_aspect("equal")
         ax.set_title(s["token"][:12], fontsize=8)
+    fig.suptitle(("AJAN (R1) kanallari  --  harita NOTR cizilir" if show_r1 else
+                  "HARITA (R2) kanallari  --  ajanlar NOTR cizilir")
+                 + f"   |   kanal kumesi: {'v3' if CFG['v3'] else 'v2'}", fontsize=10, y=0.995)
     for i in range(n, rows * cols):
         axes[i // cols][i % cols].axis("off")
     handles = []
     if show_r1:
         seen = set()
-        for k in range(NUM_CHANNELS):
+        for k in range(CFG["n_a"]):
             if colors[k] in seen:
                 continue
             seen.add(colors[k])
             # legend = viz tag'iyle AYNI kisa ad + tam KG adi (tag/legend uyumsuzlugu duzeltmesi)
-            handles.append(Patch(facecolor=colors[k], label=f"{short[k]} = {CHANNEL_NAMES[k]}"))
+            handles.append(Patch(facecolor=colors[k], label=f"{short[k]} = {CFG['a_names'][k]}"))
     if show_r2:
         handles += [
-            Patch(facecolor=R2_INLANE, label="inLane"),
-            Patch(facecolor=R2_SUCC, label="successor"),
-            Patch(facecolor=R2_ADJ, label="adjacent_L/R"),
-            Line2D([0], [0], color=R2_ROUTE, ls="--", label="ego_route_corridor (route)"),
-            Line2D([0], [0], color=TL_EDGE, ls="--", label="traffic_control"),
+            Patch(facecolor=R2_INLANE, label=CFG["m_names"][MI["inlane"]]),
+            Patch(facecolor=R2_SUCC, label=CFG["m_names"][MI["succ"]]),
+            Patch(facecolor=R2_ADJ, label="left/rightAdjacent"),
+            Line2D([0], [0], color=TL_EDGE, ls="--", label=CFG["m_names"][MI["tl"]]),
         ]
+        if MI["route"] is not None:
+            handles += [Line2D([0], [0], color=R2_ROUTE, ls="--",
+                               label=CFG["m_names"][MI["route"]])]
+        if MI["intx"] is not None:
+            handles += [Patch(facecolor=R2_INTX, label=CFG["m_names"][MI["intx"]])]
+        if MI.get("cross") is not None:
+            handles += [Patch(facecolor=R2_CROSS, label=CFG["m_names"][MI["cross"]]),
+                        Patch(facecolor=INTX_FACE, alpha=0.4, label="INTERSECTION poligonu (npz)"),
+                        Patch(facecolor=STOP_FACE, alpha=0.4, label="STOP_LINE poligonu (npz)")]
+        handles += [Line2D([0], [0], color="#5a5a5a", ls="-", label="tur: lane"),
+                    Line2D([0], [0], color="#5a5a5a", ls=":", label="tur: crosswalk"),
+                    Line2D([0], [0], color="#5a5a5a", ls="--", label="tur: route"),
+                    Patch(facecolor="#eeeeee", label="ajan (baglam, kanalsiz)")]
     else:
-        handles += [Line2D([0], [0], color=R2_ROUTE, ls="--", label="route")]
+        handles += [Patch(facecolor=CTX_FILL, label="harita (baglam, kanalsiz)")]
     handles += [Patch(facecolor=LANE_FACE, label="lane")]
-    if show_r2:
-        handles += [Patch(facecolor=CW_FACE, label="crosswalk")]
     handles += [
         Line2D([0], [0], color="#616161", ls=":", label="ref path"),
         Patch(facecolor=EGO_C, label="ego"),
@@ -522,15 +624,24 @@ def selftest():
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--selftest", action="store_true")
+    p.add_argument("--v3", action="store_true",
+                   help="channels_v3.py kanal kumesini kullan (10 ajan / 8 harita); "
+                        "npz'de lane_tl+intersections+stop_polygons olmali")
     p.add_argument("--data", type=str, default=None, help="npz dizini (test14_random_reduced islenmis)")
     p.add_argument("--pretrained_path", type=str, default=None, help="verilirse GT-vs-GF uyumu da olculur")
     p.add_argument("--num_neighbors", type=int, default=10)
     p.add_argument("--encoder_layers", type=int, default=3)
     p.add_argument("--decoder_levels", type=int, default=2)
     p.add_argument("--viz", type=int, default=0)
+    p.add_argument("--focus", type=str, default="",
+                   help="sadece bu AJAN kanali yanan sahneleri ciz (--only agent ile)")
     p.add_argument("--inspect", type=str, default=None,
                    help="senaryo token on-eki: o sahnede eleman-basina R2 kararlari + kanitlari yazdirilir")
-    p.add_argument("--mode", type=str, default="all", choices=["all", "r1", "r2"],
+    p.add_argument("--only", type=str, default=None, choices=["agent", "map", "both"],
+                   help="agent = sadece R1 (ajan kanallari), map = sadece R2 (harita kanallari). "
+                        "both yalnizca istatistik icin; --viz ile kullanilamaz cunku iki kanal "
+                        "kumesini ayni panelde boyamak okunmaz oluyor.")
+    p.add_argument("--mode", type=str, default=None, choices=["all", "r1", "r2"],
                    help="r1 = sadece ajan kanallari, r2 = sadece harita kanallari; "
                         "istatistik + JSON + viz + legend HEPSI bu moda uyar")
     p.add_argument("--shuffle", action="store_true", help="sahneleri rastgele sirala (viz orneklemesi icin)")
@@ -539,7 +650,20 @@ if __name__ == "__main__":
     p.add_argument("--json", type=str, default=None)
     p.add_argument("--device", type=str, default="cpu")
     args = p.parse_args()
+    # --only yeni ad; --mode eski ad. Ikisi de yoksa varsayilan: sadece ajan.
+    if args.only is None:
+        args.only = {"r1": "agent", "r2": "map", "all": "both", None: "agent"}[args.mode]
+    args.mode = {"agent": "r1", "map": "r2", "both": "all"}[args.only]
+    if args.focus and args.focus not in (A_SHORT_V3 if args.v3 else A_SHORT_V2) \
+            and args.v3:
+        from GameFormer.channels_v3 import A_NAMES as _AN
+        assert args.focus in _AN, f"--focus {args.focus} yok: {_AN}"
+    if args.viz and args.only == "both":
+        raise SystemExit("--viz ile --only both olmaz: --only agent VEYA --only map sec.")
+    if args.v3:
+        use_v3()          # selftest v2 kumesine gore yazildi -> v3 ile birlikte kullanilmaz
     if args.selftest:
+        assert not args.v3, "--selftest v2 kanal kumesine gore yazildi"
         raise SystemExit(selftest())
     assert args.data, "--data veya --selftest gerekli"
     run_dataset(args)

@@ -10,3 +10,5 @@ viz_out/
 *.jpg
 *.json
 *.out
+*.npz
+*.txt

@@ -195,6 +195,8 @@ def main(args):
             channel_evidence=args.channel_evidence, gate_trust=args.gate_trust,
             dod_meta=args.dod_meta, lon_merge=args.lon_merge, dec_moe=args.dec_moe,
             lat_moe=args.lat_moe, cc_select=args.cc_select,
+            l1=args.l1, l1_bottleneck=args.l1_bottleneck, l1_drop_input=args.l1_drop_input,
+            psi_prior_alpha=args.psi_prior_alpha,
             uniform_mask=args.uniform_mask, device=args.device,
         )
         print(f"[CAUSAL+REFINER] causal={args.causal_path}  "
@@ -384,10 +386,22 @@ if __name__ == "__main__":
                         help='ckpt hangi degerle egitildiyse o: factored (lon x lat) meta-aksiyon DOD\'u (H).')
     parser.add_argument('--lon_merge', type=int, default=0,
                         help='ckpt lon_merge=1 ile egitildiyse o (6 lon sinifi).')
+    parser.add_argument('--psi_prior_alpha', type=float, default=0.0,
+                        help="psi logit'lerinden alpha*log(CE agirligi) cikar (egitimsiz kalibrasyon). "
+                             "Agirlikli CE b*'i nadir sinifa kaydiriyor; b* head'e girdigi icin tum "
+                             "modlar yavasliyor. 0 = eski davranis; validation'da 0.5 onerilir.")
     parser.add_argument('--cc_select', type=int, default=0,
                         help='KARAR-TUTARLI mod secimi (egitimsiz): 6 mod icinden ilan edilen '
                              'b*ya uyan en yuksek skorlu secilir (lon&lat -> lat -> lon -> argmax). '
                              'dod_meta ckpt gerektirir; yalniz refiner.')
+    parser.add_argument('--l1', type=int, default=0,
+                        help='ckpt l1=1 ile egitildiyse o: L1 etkilesim-karari katmani')
+    parser.add_argument('--l1_drop_input', type=int, default=0,
+                        help='ckpt --l1_drop_input 1 ile egitildiyse ZORUNLU: follows/merges/'
+                             'overtakes kanallari girdiden silinir. Verilmezse deployment egitimde '
+                             'olmayan kanallari gorur -> girdi uyusmazligi.')
+    parser.add_argument('--l1_bottleneck', type=int, default=0,
+                        help='ckpt l1_bottleneck=1 ile egitildiyse o: psi yalniz L1 ozetini okur')
     parser.add_argument('--lat_moe', type=int, default=0,
                         help='ckpt lat_moe=1 ile egitildiyse o: 4x5 sozluk + lat-sinifi basina GMM '
                              'expert (routing b*\'dan). Yalniz --deploy refiner destekli.')

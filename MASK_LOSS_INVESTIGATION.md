@@ -22,18 +22,11 @@ Three things were **measured**, not argued:
    have came from *deleting* CP's term and replacing it with two terms that are
    dimensionally appropriate for a distribution.
 
-**And then a fourth, which supersedes the other three in importance:**
+**And then a fourth:**
 
-4. **The mask does not select interacting agents.** Measured against ground-truth
-   trajectories only — no model output involved — the highest-scored agent is
-   **1.03–1.26× closer to the ego than a randomly chosen neighbour**, while the
-   a one-line "pick the nearest agent" rule also scores above chance. The sharpest model
-   (Step A) sits at **1.03×**, i.e. **indistinguishable from random**.
-
-Everything we improved — entropy, peak, overlap, collapse — is a property of the
-mask's **shape**. None of it moved the mask's **content**. See
-[Finding 3](#finding-3--the-mask-does-not-select-interacting-agents) and
-[Next steps](#next-steps).
+4. *[Retracted 2026-08-24, user decision: the `eval_interaction.py` top1-vs-random
+   proximity test was judged an invalid measure of mask correctness; its conclusions
+   are withdrawn. See Finding 3.]*
 
 **And a fifth, from the closed-loop grid once it was completed:**
 
@@ -311,114 +304,12 @@ with everything else visibly excluded.
 
 ## Finding 3 — the mask does not select interacting agents
 
-*This is the most important measurement in the log. It reframes everything above.*
-
-### Why a new test was needed
-
-Every acceptance test we had asks the model about **itself**. RemoveNonCausal deletes an
-agent and checks whether *the model's own plan* moves. For a strictly-gated head this is
-circular: `f_cas = Σ M_cas[j]·msg_j`, so `M_cas[j] ≈ 0` means agent *j* is not in the sum
-at all, and removing it cannot change anything. The test passes for **any** peaked mask,
-including one that peaks on a randomly chosen agent.
-
-`eval_interaction.py` never touches the model's output. It uses **ground-truth
-trajectories only**, so it is independent evidence about the *selection*, not about the
-gating mechanism.
-
-### What is measured
-
-For the agent the mask scores highest in each scene:
-
-| column | definition | reads as |
-|---|---|---|
-| `d0` | distance from ego to that agent at *t* = 0, in metres (ego-frame, so just `‖pos‖`) | how far away it is **right now** |
-| **`dmin`** | take the ego's GT future (80 steps, 8 s) and the agent's GT future; at each timestep measure the gap; keep the minimum | **"at their closest moment, how close do these two actually get?"** small = they genuinely interact |
-| `path` | same, but ignoring time: minimum distance between *any* point on the ego's path and *any* point on the agent's path | "do their routes cross at all, even at different times?" A car that clears the junction 10 s ahead of us has small `path`, large `dmin` |
-| `tmin` | the timestep at which `dmin` occurs, in seconds | when the encounter happens |
-| `dmin < 5 m` | fraction of scenes whose `dmin` is under 5 m | share of picks that are genuine close encounters |
-| `vs random` | `mean dmin(random) / mean dmin(top1)` | **1.00 = the mask's pick is as far away as a random neighbour** |
-| `mean M_cas` | the score the model gave its own top pick | how confident it was while doing this |
-
-### The three reference rows
-
-| row | what it is | role |
-|---|---|---|
-| **top1** | agent with the highest `M_cas` | the thing under test |
-| **random** | a uniformly random valid neighbour | **floor** — chance level |
-| near | the physically closest agent at *t* = 0 | reference selector — a one-line heuristic, wins on proximity by construction, worse than random on direction |
-
-Both references are necessary. Without `random` we cannot tell whether 1.24× is good;
-without `near` we cannot tell whether a learned mask beats a trivial rule.
-
-**Reading rule**
-
-```
-top1 ≈ random   ->  the mask knows nothing about interaction
-top1 ≈ near     ->  the mask is just re-encoding distance
-near  < top1    ->  the mask is worse than distance
-top1  < near    ->  the mask carries information beyond distance   <- the goal
-```
-
-### Results (1104 validation scenes, identical scene set for all rows)
-
-| | `d0` (m) | **`dmin`** (m) | `path` (m) | `tmin` (s) | `dmin<5m` | **vs random** | mean `M_cas` |
-|---|---|---|---|---|---|---|---|
-| **random** (floor) | 18.13 | 15.37 | 12.96 | 2.17 | 0.101 | 1.00× | — |
-| near (reference selector) | 8.28 | 7.25 | 5.87 | 1.73 | 0.455 | 2.12× | — |
-| `dod_manlbl` (baseline) | 16.21 | 12.40 | 8.34 | 2.74 | 0.155 | 1.24× | 0.255 |
-| `recon(2)` | 16.29 | 12.65 | 8.83 | 2.66 | 0.173 | 1.21× | 0.251 |
-| `nbr(2b)` | 15.41 | **12.24** | 8.44 | 2.55 | 0.146 | **1.26×** | 0.231 |
-| **`stepA`** | 17.60 | 14.89 | 10.94 | 2.62 | 0.123 | **1.03×** | **0.809** |
-
-### What it says
-
-**1. No model is meaningfully above chance.** All sit at 1.21–1.26×, while "pick the
-nearest agent" also scores above chance. The learned mask captures part of the interaction
-that a one-line heuristic does.
-
-**2. Step A is at chance (1.03×).** Sharpening the mask made the interaction alignment
-*worse* (1.24× → 1.03×); `dmin<5m` fell from 0.155 to 0.123, essentially onto random's
-0.101. The model became **confident about a criterion that is not interaction** — it
-assigns `M_cas = 0.809` to an agent no more relevant than one drawn at random. This is
-the concrete cost of optimising shape without content: decisiveness without correctness
-is worse than indecision, because the model now confidently excludes everything else.
-
-**3. `nbr(2b)` is nominally best but the effect is not real.** 1.26× vs the baseline's
-1.24×. The impression from nine visualisation frames does not survive 1104 scenes.
-
-**4. The mask is not distance either.** `top1 d0 = 16.2 m` vs `near 8.3 m`, and the two
-pick the same agent only **16%** of the time. So it is neither distance nor interaction —
-it is whatever happens to help `L_traj` and `CE`.
-
-**5. The opportunity is large.** A neighbour comes within 5 m of the ego in **45.5%** of
-scenes. The models find it in 12–17%.
-
-### Consequences for the earlier results
-
-Every acceptance test above has to be re-read:
-
-- **RemoveNonCausal passing** is circular, as argued. We now know the selected agent is
-  usually not interacting, and the test still passes with `hi/lo` up to 3889×.
-- **The ROAR distance-matched control passing** was never evidence of causality. It shows
-  the mask is not re-encoding distance — which is trivially true of a mask that is near
-  random on interaction. **"Not distance" ≠ "causal".**
-- **`mcas_ent` 0.908 → 0.194, `mcas_peak` 6.7× uniform, `bc` 1.0 → 0.03** are all *shape*
-  statistics. This measurement shows none of them implied anything about content.
-
-### Honest caveat
-
-`dmin` is a **proxy**, not ground truth. An agent far away but on a collision course can
-be causal; a parked car 3 m away need not be. So we cannot declare the 1.2× models
-"wrong" from this alone.
-
-Step A's **1.03×** is not subject to that defence: a genuinely causal selection cannot
-correlate with physical interaction at chance level.
-
-### The target this gives us
-
-`top1 vs random` must move up from 1.03–1.26×.
-Beating the distance heuristic *on the interaction metric* is the real test of the claim
-that `M_cas` carries information beyond geometry.
+*[Retracted 2026-08-24, user decision. The test behind this finding —
+`eval_interaction.py`'s top1-vs-random GT-proximity ratio (`vs random`) — was judged an
+invalid measure of mask correctness; the finding's tables and conclusions were removed.
+Note for later readers: other passages in this log and in plan.md cite the same metric
+family (e.g. the gate's "selection 1.24×→1.45×"); before paper use those citations should
+be re-based on RNC calibration / CLS / binding-test interventions or re-argued.]*
 
 ---
 

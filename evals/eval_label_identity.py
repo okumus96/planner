@@ -112,6 +112,8 @@ def build_model(a, dev):
         kw.update(lat_moe=a.lat_moe, num_lon=NUM_LON4, num_lat=NUM_LAT5V)
     else:
         kw.update(num_lon=9, num_lat=7)
+    if a.l1:
+        kw.update(l1=a.l1, l1_bottleneck=a.l1_bottleneck, num_l1_ag=6, num_l1_mp=2)
     for k in ('rel_bottleneck', 'rel_evidence'):
         v = getattr(a, k)
         if v:
@@ -321,6 +323,8 @@ if __name__ == "__main__":
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--assert_masks", type=int, default=0)
     p.add_argument("--lat_moe", type=int, default=0)
+    p.add_argument("--l1", type=int, default=0)
+    p.add_argument("--l1_bottleneck", type=int, default=0)
     p.add_argument("--rel_bottleneck", type=int, default=0)
     p.add_argument("--rel_evidence", type=int, default=0)
     p.add_argument("--num_neighbors", type=int, default=10)

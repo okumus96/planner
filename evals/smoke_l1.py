@@ -114,7 +114,7 @@ def main(a):
         n = 0.0 if gsum is None else float(gsum.abs().sum())
         print(f"       {lab}: psi -> agent_tokens gradyan normu = {n:.3e}")
     print("       (bottleneck'te SIFIR degil: L1 ozeti de agent_tokens'tan turuyor -- beklenen. "
-          "Onemli olan f_cas'in psi'ye DOGRUDAN girmemesi, o da psi_in=6 ile yapisal.)")
+          "Onemli olan f_cas'in psi'ye DOGRUDAN girmemesi, o da psi_in=8 (6 ajan + 2 harita sinifi) ile yapisal.)")
 
     print("\n" + "=" * 58)
     print("SMOKE TEST: PASS" if not fails else f"SMOKE TEST: {len(fails)} HATA")

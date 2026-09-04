@@ -29,6 +29,7 @@ class CausalRefinerPlanner(PlannerV2):
                  use_causal=True, remove='none', remove_k=1, plan_source='cas', nbr_enrich=0, ego_residual=1, joint_softmax=0,
                  gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
                  dod_meta=0, lon_merge=0, uniform_mask=0, dec_moe=0, lat_moe=0, cc_select=0,
+                 l1=0, l1_bottleneck=0, l1_drop_input=0, psi_prior_alpha=0.0,
                  device=None):
         super().__init__(model_path=causal_path, device=device, debug=False,
                          debug_dir=None, debug_max_plots=0, oracle_mode=False)
@@ -53,11 +54,19 @@ class CausalRefinerPlanner(PlannerV2):
         self._lon_merge = lon_merge
         self._dec_moe = dec_moe          # dec_moe ckpt: 5x5 sozluk + aile-dallari; routing b*'dan
         self._lat_moe = lat_moe          # lat_moe ckpt: 4x5 sozluk + lat-sinifi GMM expert'leri
+        self._l1, self._l1_bottleneck = l1, l1_bottleneck
+        self._l1_drop_input = l1_drop_input
         # cc_select (egitimsiz, 2026-08-26): KARAR-TUTARLI mod secimi — 6 mod icinden ilan
         # edilen b*'a uyan en yuksek skorlu secilir (oncelik: lon&lat -> lat -> lon -> argmax).
         # Skorcu karar-kor oldugu icin argmax baglam-tercihli modu secebiliyordu; bu kural
         # eval'deki karar-tutarli compliance'i deployment davranisina tasir. Retrain yok.
         self._cc_select = cc_select
+        # psi prior duzeltmesi (egitimsiz, 2026-09-02): psi logit'lerinden alpha*log(CE agirligi)
+        # cikarilir. Agirlikli CE (train_planner.py:220) b*'i nadir sinifa ('slow') kaydiriyor;
+        # b* decision_emb ile head'e girdigi icin ALTI MODU BIRDEN yavaslatiyor. Validation
+        # olcumu (n=1118): alpha 0 -> 0.5 ile b*_lon dogrulugu %60.6 -> %65.7, planin 8 s yay
+        # sapmasi (ego hareketli) -2.83 m -> -0.84 m, FDE 6.926 -> 6.663 m. alpha=0 = eski davranis.
+        self._psi_prior_alpha = float(psi_prior_alpha)
         self._uniform_mask = uniform_mask
         self._ch_logged = False          # ilk frame'de kanal durumunu bir kez yazdir
         self._ch_missing_warned = False  # kanal istendi ama ref path yok uyarisi (bir kez)
@@ -72,8 +81,11 @@ class CausalRefinerPlanner(PlannerV2):
         self._plan_source = plan_source
 
     def name(self) -> str:
+        # prior yalniz acikken ada yazilir -> eski kosularin planner_name'i degismez, parquet'ler
+        # karsilastirilabilir kalir.
+        _pr = f";prior={self._psi_prior_alpha:g}" if self._psi_prior_alpha else ""
         return (f"CausalRefinerPlanner[{'causal' if self._use_causal else 'baseline-gf'};"
-                f"remove={self._remove}x{self._remove_k};plan={self._plan_source}]")
+                f"remove={self._remove}x{self._remove_k};plan={self._plan_source}{_pr}]")
 
     def _remove_agents(self, features, ch_ref_path=None):
         """M_cas'a gore en causal/az causal k komsuyu girdiden sifirla. RemoveNonCausal, closed-loop."""
@@ -114,6 +126,9 @@ class CausalRefinerPlanner(PlannerV2):
                                     channel_evidence=self._channel_evidence, gate_trust=self._gate_trust,
                                     dod_meta=self._dod_meta, dec_moe=self._dec_moe,
                                     lat_moe=self._lat_moe,
+                                    l1=self._l1, l1_bottleneck=self._l1_bottleneck,
+                                    l1_drop_input=self._l1_drop_input,
+                                    num_l1_ag=6, num_l1_mp=2,
                                     num_lon=(4 if self._lat_moe else 5 if self._dec_moe
                                              else 6 if self._lon_merge else 9),
                                     num_lat=(5 if (self._dec_moe or self._lat_moe) else 7),
@@ -126,7 +141,11 @@ class CausalRefinerPlanner(PlannerV2):
             torch.load(self._causal_path, map_location=self._device), strict=False)
         if _miss or _unexp:
             print(f'[load] missing={list(_miss)}  unexpected={list(_unexp)}')
+        self.causal.psi_prior_alpha = self._psi_prior_alpha
         self.causal.to(self._device).eval()
+        if self._psi_prior_alpha:
+            print(f"[psi] prior duzeltmesi AKTIF: alpha={self._psi_prior_alpha:g} "
+                  f"(psi logit -= alpha*log(CE agirligi); yalniz cikarimda)")
         self.relevance_graph = None
 
     def _channels_ref_path(self, ego_state, traffic_light_data):

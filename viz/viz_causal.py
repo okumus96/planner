@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader
 
 from GameFormer.predictor import GameFormer
 from GameFormer.causal_graph import CausalPlanner
+from GameFormer.decision_labels import NUM_LON4, NUM_LAT5V
 from GameFormer.train_utils import DrivingData
 from train_planner import read_batch, extract_neighbor_top1_futures, freeze_gameformer
 
@@ -44,6 +45,10 @@ from train_planner import read_batch, extract_neighbor_top1_futures, freeze_game
 CMAP = LinearSegmentedColormap.from_list("mcas_seq", mpl.colormaps["Reds"](np.linspace(0.12, 1.0, 256)))
 FUTURE_COLOR = "#1565C0"    # blue: causal agent's predicted future (contrast vs red map)
 # agent type idx: neighbor_agents_past[..., 8:11] one-hot argmax -> 0=vehicle, 1=pedestrian, 2=bicycle
+
+
+L1_SHORT = ['none', 'follows', 'yieldTo', 'waitFor', 'mergesIF', 'overtake']
+L1_MP_SHORT = ['none', 'keepsLane']
 
 
 def select_mask(values, valid, mode, thr, topn):
@@ -223,7 +228,20 @@ def plot_scene(ax, s, mode, thr, topn, branch="cas", show_channels=False):
             fm = np.abs(fut).sum(-1) > 1e-3
             if fm.sum() > 1:
                 ax.plot(fut[fm, 0], fut[fm, 1], "-", color=FUTURE_COLOR, lw=1.6, alpha=0.95, zorder=6)
-        if show_channels and s.get("ch_active") is not None:
+        if s.get("l1_pred") is not None:
+            # L1 ETIKETI: modelin tahmini / GT (varsa). L0 kanal etiketinin yerine gecer --
+            # soru "ajan j ile iliskim ne" ise cevabi L1 verir, L0 yalnizca kimin YARISTIGINI.
+            pr = int(s["l1_pred"][j])
+            txt = L1_SHORT[pr]
+            if s.get("l1_gt") is not None:
+                gt = int(s["l1_gt"][j])
+                txt = f"{L1_SHORT[pr]}|{L1_SHORT[gt]}" if gt != pr else f"{L1_SHORT[pr]}\u2713"
+            bad = (s.get("l1_gt") is not None and int(s["l1_gt"][j]) != pr)
+            ax.text(x, y - 2.6, txt,
+                    color=("#c62828" if bad else ("black" if causal else "0.35")),
+                    fontsize=6.0, ha="center",
+                    fontweight=("bold" if (causal or bad) else "normal"), zorder=9)
+        elif show_channels and s.get("ch_active") is not None:
             fired = [c for c in range(s["ch_active"].shape[-1]) if s["ch_active"][j, c]]
             if s.get("M_typed") is not None and fired:
                 # typed model: kanal-basina M_cas agirligi (softmax (ajan,kanal) girisleri uzerinde;
@@ -250,15 +268,27 @@ def plot_scene(ax, s, mode, thr, topn, branch="cas", show_channels=False):
         tag = "start+" + tag
     if man.get("stopping"):
         tag = "stop+" + tag
+    extra = ""
+    if s.get("l1_gt") is not None and s.get("l1_pred") is not None:
+        v = s["valid"][:s["N"]]
+        nn = [j for j in range(s["N"]) if v[j] and int(s["l1_gt"][j]) > 0]
+        if nn:
+            mm = s["M_cas"][:s["N"]]
+            tot = float(mm[v].sum()) or 1.0
+            share = 100.0 * float(mm[nn].sum()) / tot
+            extra = f"  |  non-none GT kutlesi: %{share:.0f}"
+        else:
+            extra = "  |  GT: hepsi none"
     ax.set_title(f"[{tag}]  {tag_word} agents: {int(agent_sel.sum())}  |  "
                  f"maxA={s['M_cas'][s['valid']].max():.2f}  maxMap={s['map_mcas'][s['map_valid']].max():.2f}"
-                 + (f"  agmass={s['agent_mass']:.2f}" if s.get("agent_mass") is not None else ""),
-                 fontsize=8)
+                 + (f"  agmass={s['agent_mass']:.2f}" if s.get("agent_mass") is not None else "")
+                 + extra, fontsize=8)
 
 
 @torch.no_grad()
 def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device,
-                   scenario, mode, thr, topn, branch="cas", ref_idx=0, joint_norm=False):
+                   scenario, mode, thr, topn, branch="cas", ref_idx=0, joint_norm=False,
+                   l1_gt=None):
     """branch='cas' (varsayilan) -> M_cas/M_cas_map + f_cas'ten uretilen plan (ANA, deploy edilen).
     branch='cfd' -> M_cfd/M_cfd_map + f_cfd'den uretilen plan (traj_cfd/score_cfd, tani/ablasyon amacli,
     hicbir ajan silinmez)."""
@@ -292,13 +322,22 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
             dod_texts = [f"DOD: {MANEUVER_SHORT[int(dod_idx[b])]} ({float(psi_prob[b, dod_idx[b]]):.2f})"
                          for b in range(dod_idx.shape[0])]
         else:
-            from GameFormer.decision_labels import LON_CLASSES, LAT_CLASSES, LON_MERGED_CLASSES
-            lon_names = LON_MERGED_CLASSES if out["psi_lon_cas"].shape[-1] == len(LON_MERGED_CLASSES) else LON_CLASSES
+            from GameFormer.decision_labels import (LON_CLASSES, LAT_CLASSES, LON_MERGED_CLASSES,
+                                                    LON4_CLASSES, LAT5V_CLASSES, LAT5L_CLASSES)
+            # SINIF ADLARI logit GENISLIGINDEN secilir. lat_moe modelleri 4x5 konusuyor;
+            # sabit LON_CLASSES/LAT_CLASSES (9x7) ile indekslemek YANLIS ad basar.
+            _nlon, _nlat = out["psi_lon_cas"].shape[-1], out["psi_lat_cas"].shape[-1]
+            lon_names = (LON4_CLASSES if _nlon == len(LON4_CLASSES)
+                         else LON_MERGED_CLASSES if _nlon == len(LON_MERGED_CLASSES) else LON_CLASSES)
+            if _nlat == len(LAT5V_CLASSES):   # LAT5V ve LAT5L ayni genislikte -> ckpt bayragindan ayir
+                lat_names = LAT5L_CLASSES if int(getattr(causal, "lat_moe", 0)) >= 2 else LAT5V_CLASSES
+            else:
+                lat_names = LAT_CLASSES
             p1 = torch.softmax(out["psi_lon_cas"], dim=-1)
             p2 = torch.softmax(out["psi_lat_cas"], dim=-1)
             i1, i2 = p1.argmax(-1), p2.argmax(-1)
             dod_texts = [f"DOD: {lon_names[int(i1[b])]} ({float(p1[b, i1[b]]):.2f}) + "
-                         f"{LAT_CLASSES[int(i2[b])]} ({float(p2[b, i2[b]]):.2f})"
+                         f"{lat_names[int(i2[b])]} ({float(p2[b, i2[b]]):.2f})"
                          for b in range(i1.shape[0])]
         actors = enc["actors"][:, :, -1]
         traj_key, score_key = ("traj_cfd", "score_cfd") if branch == "cfd" else ("traj", "score")
@@ -349,6 +388,11 @@ def collect_scenes(gameformer, causal, loader, num_neighbors, num_scenes, device
                               if out.get("ch_active") is not None else None),
                 # typed (ajan,kanal) M agirliklari [N,R] (typed_kv=0 -> None; per-agent M = satir toplami)
                 "M_typed": (M_typed[b].cpu().numpy() if M_typed is not None else None),
+                # L1: ajan basina tahmin edilen etkilesim sinifi (+ varsa GT)
+                "l1_pred": (out["l1_ag"][b].argmax(-1).cpu().numpy()
+                            if out.get("l1_ag") is not None else None),
+                "l1_gt": (inputs["l1_agent"][b, :num_neighbors].cpu().numpy()
+                          if "l1_agent" in inputs else None),
                 # DOD: hazir-formatli etiket metni (5-sinif VEYA dod_meta lon+lat) -- modelin tahmini
                 "dod_text": dod_texts[b],
                 # arka plan stillemesi icin poly tip sayilari (lanes, crosswalks, routes)
@@ -376,17 +420,28 @@ def main(args):
     gameformer.load_state_dict(torch.load(args.pretrained_path, map_location=dev))
     gameformer = gameformer.to(dev); freeze_gameformer(gameformer)
 
-    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, num_lon=(6 if args.lon_merge else 9), joint_softmax=args.joint_softmax).to(dev)
+    causal = CausalPlanner(layers=args.graph_layers, modes=args.modes, nbr_enrich=args.nbr_enrich, gate=args.gate, ego_residual=args.ego_residual, gate_channels=args.gate_channels, typed_kv=args.typed_kv, channel_evidence=args.channel_evidence, gate_trust=args.gate_trust, dod_meta=args.dod_meta, lat_moe=args.lat_moe, num_lon=(NUM_LON4 if args.lat_moe else 6 if args.lon_merge else 9), num_lat=(NUM_LAT5V if args.lat_moe else 7), joint_softmax=args.joint_softmax,
+                           l1=args.l1, l1_bottleneck=args.l1_bottleneck,
+                           num_l1_ag=6, num_l1_mp=2).to(dev)
     # strict=False: eski checkpoint'ler (ornegin Step 2 oncesi) cfd_recon agirliklarini icermez.
     # O modul viz yolunda HIC kullanilmaz, o yuzden eksik olmasi zararsiz -- ama ne eksikse yazdir,
     # sessizce gercek bir uyumsuzlugu yutmayalim.
     missing, unexpected = causal.load_state_dict(torch.load(args.causal_path, map_location=dev), strict=False)
+    if not args.l1:
+        missing = [k for k in missing if not any(t in k for t in
+                   ('l1_head',))]
     if missing or unexpected:
         print(f"[load] missing={list(missing)}  unexpected={list(unexpected)}")
     causal.eval()
 
-    valid_set = DrivingData(args.valid_set + "/*.npz", args.num_neighbors)
-    loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    valid_set = DrivingData(args.valid_set + "/*.npz", args.num_neighbors,
+                            l1_labels=(args.l1_labels or None))
+    if args.shuffle_seed >= 0:      # farkli sahne kumesi cikarmak icin: sabit tohumla karistir
+        g = torch.Generator(); g.manual_seed(args.shuffle_seed)
+        loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=True,
+                            generator=g, num_workers=4)
+    else:
+        loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     scenes = collect_scenes(gameformer, causal, loader, args.num_neighbors, args.num_scenes, dev,
                             args.scenario, args.select, args.threshold, args.topn, branch=args.branch,
@@ -487,6 +542,8 @@ if __name__ == "__main__":
                    help="ckpt hangi degerle egitildiyse o: factored (lon x lat) meta-aksiyon DOD'u")
     p.add_argument("--lon_merge", type=int, default=0,
                    help="ckpt lon_merge=1 ile egitildiyse o (6 lon sinifi)")
+    p.add_argument("--lat_moe", type=int, default=0,
+                   help="v2 lat-anahtarli GMM expertleri: 1=LAT5V, 2=LAT5L (ckpt ile AYNI olmali)")
     p.add_argument("--joint_softmax", type=int, default=0,
                    help="1 = ajan+harita ORTAK softmax paydasi. Checkpoint hangi modda egitildiyse "
                         "o verilmeli (agirliksiz anahtar, strict=False uyarmaz).")
@@ -498,6 +555,16 @@ if __name__ == "__main__":
                    help="checkpoint hangi degerle EGITILDIYSE o verilmeli (0 = h_ego residual yok)")
     p.add_argument("--gate", type=str, default="softmax", choices=["softmax", "sigmoid"],
                    help="checkpoint hangi kapi moduyla EGITILDIYSE o verilmeli (aksi halde maske yanlis hesaplanir)")
+    # --- relational-psi dali bayraklari (checkpoint ne ile egitildiyse aynisi verilmeli) ---
+    p.add_argument("--l1", type=int, default=0)
+    p.add_argument("--l1_bottleneck", type=int, default=0)
+    p.add_argument("--shuffle_seed", type=int, default=-1,
+                   help="-1: dosya sirasiyla (varsayilan, tekrarlanabilir). >=0: bu tohumla "
+                        "karistir -> ayni modelden FARKLI sahne kumesi cikar.")
+    p.add_argument("--l1_labels", type=str, default="",
+                   help="L1 GT etiket npz'si. Verilirse ajan etiketleri 'tahmin|GT' olarak "
+                        "cizilir, yanlislar KIRMIZI; baslikta non-none GT ajanlarina giden "
+                        "M_cas kutle payi gosterilir.")
     p.add_argument("--modes", type=int, default=6)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--out", type=str, default="causal_bev.png")

@@ -281,7 +281,13 @@ def compute_channels(neighbor_agents_past, ego_agent_past, neighbor_futures, ref
     ttc = torch.where(hit.any(-1),
                       tgrid[None, None, :].expand_as(hit).masked_fill(~hit, HORIZON_S).min(-1).values,
                       torch.full_like(d_center, HORIZON_S))
-    active[..., CH_COLLISION_COURSE] = hit.any(-1) & (closing > 0)
+    # YON sarti (gorsel denetim 2026-08-31): kanal yonsuzdu -- ego'yu ARKADAN takip eden
+    # aracin rotasi ego'nunkiyle ortustugu icin de yaniyordu (yanan girdilerin %17.4'u
+    # arkadaki ajanda, M_cas kutlesinin %40-42'si arkaya kaciyordu). Ego'nun KARAR vermesi
+    # gereken catisma ya ONUNDE (yetisiyor) ya da KESISEN bir akistadir; arkadan gelen
+    # ayni-yonlu trafik ego'nun freninin sebebi degildir.
+    cc_directional = (ds > 0) | (dtheta_flow > CROSSING_MIN_ANGLE)
+    active[..., CH_COLLISION_COURSE] = hit.any(-1) & (closing > 0) & cc_directional
 
     # sharesIntersectionWith (v1 geometrik proxy): predicted yol koridoru ILERIDE kesiyor
     fut_head = torch.cat([fut[:, :, 1:] - fut[:, :, :-1], fut[:, :, -1:] - fut[:, :, -2:-1]], dim=2)
@@ -331,12 +337,18 @@ def compute_channels(neighbor_agents_past, ego_agent_past, neighbor_futures, ref
     # SIRA-DEGISIMI sarti (validation kalibrasyonu: bu olmadan "yan seritte zaten onde ve hizli
     # akan" normal trafik overtaking sayiliyordu, %4.1 fire): 2 s once en fazla ~1 m onde olmali.
     was_not_ahead = past_rel[..., 0] <= OT_PAST_ADVANCE_M
+    # TAMAMLANMA sarti (gorsel denetim 2026-08-31): KG np:overtakes gecisi TAMAMLANMIS sayar
+    # (gec VE serite geri don). Eski hal yalnizca 'onume gecer' istiyordu, bu yuzden yanindan
+    # gecip KENDI seridinde kalan arac da overtake etiketi aliyordu. Simdi ayni zaman
+    # adiminda hem onde (ds_fut >= OT_CLEAR_M) hem de EGO'NUN seridinde (|fdlat| yarim serit)
+    # olmasi gerekiyor -- yani onume kesip giriyor.
+    ot_completes = ((ds_fut >= OT_CLEAR_M) & (fdlat.abs() <= 0.5 * LANE_W)).any(-1)
     active[..., CH_OVERTAKES] = ((past_adv >= OT_PAST_ADVANCE_M)
                                   & was_not_ahead
                                   & (ds.abs() <= OT_WINDOW_DS_M)
                                   & (d_lat_eff.abs() >= OT_SIDE_MIN_LAT)
                                   & (v_long_rel >= OT_REL_SPEED_MIN)
-                                  & ((ds_fut >= OT_CLEAR_M).any(-1))
+                                  & ot_completes
                                   & motor)                       # KG: overtakes -> MotorVehicle
 
     # vulnerable_road_user_near_ego_path: yaya/bisiklet ∧ <= 12 m ∧ YAKLASIYOR.

@@ -68,6 +68,7 @@ differences below that are noise.
 | system | CLS-R | note |
 |---|---|---|
 | dod_manlbl (5-class decision, no channels) | 0.8579 | best of the pre-channel lineage |
+| **v6** — gate+typed+H + rel_bottleneck + rel_evidence (`dodmeta_v6_relev`, e18) | 0.8460 | run `2026-08-24 23:35:06`; interpretable-decision variant, best open-loop of lineage (minADE 0.7139) |
 | **dod_meta v1** — gate+typed+H | 0.8487 | λ_nbr accidentally 0, `f_cfd` collapsed |
 | **dod_meta v2** — gate+typed+H, λ_nbr 0.1 | 0.8456 | clean λ_nbr pair with v1 |
 | **typed** — gate+typed, 5-class decision | 0.8453 | |

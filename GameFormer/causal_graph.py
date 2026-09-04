@@ -37,16 +37,26 @@ from .relevance_graph import (
 )
 from .channels import (compute_channels, compute_map_channels, select_ego_corridor,
                        NUM_CHANNELS, NUM_EVIDENCE, NUM_MAP_CHANNELS, NUM_MAP_EVIDENCE,
-                       CH_COLLISION_COURSE, CH_SHARES_INTERSECTION, CH_MERGES)
+                       CH_COLLISION_COURSE, CH_SHARES_INTERSECTION, CH_MERGES,
+                       CH_FOLLOWS, CH_OVERTAKES)
 from .decision_labels import (LON5_MAP, LAT5_MAP, NUM_LON5, NUM_LAT5,
                               LON5_FAMILY, LAT5_FAMILY, NUM_FAMILIES,
-                              LON4_MAP, LAT5V_MAP, NUM_LON4, NUM_LAT5V, LAT5L_MAP)
+                              LON4_MAP, LAT5V_MAP, NUM_LON4, NUM_LAT5V, LAT5L_MAP,
+                              LON_CE_WEIGHT, LAT_CE_WEIGHT, LON_MERGED_CE_WEIGHT,
+                              LON5_CE_WEIGHT, LAT5_CE_WEIGHT, LON4_CE_WEIGHT,
+                              LAT5V_CE_WEIGHT, LAT5L_CE_WEIGHT, NUM_LON_MERGED)
 
 NUM_AGENT_TYPES = 4  # ego, vehicle, pedestrian, bicycle
 CONFLICT_FEATURE_DIM = 4  # [d_route, d_ego_aligned, d_ego_spatial, approaching]
 # Zayif-kanit kanallari (GT-vs-GF IoU: %37/%50/%67, CHANNELS_AUDIT.md) -- gate_trust='reliable'
 # modunda GATING karari bunlara dayandirilmaz (typed girdileri yine kurulur).
 UNRELIABLE_CHANNELS = (CH_COLLISION_COURSE, CH_SHARES_INTERSECTION, CH_MERGES)
+# L1'e TERFI EDEN kanallar. Bunlar hem L0 girdisi hem L1 hedefi olamaz: girdi->hedef bir
+# KOPYA olur ve L1 head'i hicbir sey ogrenmez (olculdu: follows F1 = 1.000, cunku
+# CHANNELS_AUDIT'e gore follows GT-vs-GF IoU %100 -- bit-bit ayni). l1_drop_input=1 bunlari
+# girdiden tamamen siler; L1 head'i onlari GERIYE KALAN yapisal kanallardan tahmin etmek
+# zorunda kalir. yieldingTo/waitingFor zaten girdide yok.
+L1_PROMOTED_CHANNELS = (CH_FOLLOWS, CH_MERGES, CH_OVERTAKES)
 
 
 def _conflict_features(neighbor_futures, neighbor_states, route_xy, route_valid, ego_speed,
@@ -653,7 +663,7 @@ class EgoCausalDisentangler(nn.Module):
 
     def __init__(self, dim=256, heads=8, layers=3, dropout=0.1, nbr_enrich=0, gate='softmax',
                  conflict_feats=0, conflict_bias=0, gate_channels=0, typed_kv=0,
-                 channel_evidence=0, gate_trust='all'):
+                 channel_evidence=0, gate_trust='all', l1_drop_input=0):
         super().__init__()
         # --- predicate kanallari (channels branch) ---
         self.gate_channels = bool(gate_channels)   # yapisal gating: kanali yanmayan girdi yarismaz
@@ -661,6 +671,7 @@ class EgoCausalDisentangler(nn.Module):
         self.channel_evidence = bool(channel_evidence)  # 9/8-dim kanit edge'e concat
         assert gate_trust in ('all', 'reliable')
         self.gate_trust = gate_trust               # 'reliable': zayif-IoU kanallar GATE karari disi
+        self.l1_drop_input = bool(l1_drop_input)    # L1'e terfi edenleri L0 girdisinden sil
         self.conflict_feats = conflict_feats     # 1 -> ajan edge'ine conflict feature'lari EKLE
         self.conflict_bias = conflict_bias       # 1 -> causal logit'e explicit conflict cezasi
         # CausalPlanner bunu ayrica set eder; feature/bias kapaliyken bile L_conflict icin hesaplatir.
@@ -732,6 +743,11 @@ class EgoCausalDisentangler(nn.Module):
                 mch_active, mch_evid = compute_map_channels(
                     inputs["map_lanes"], inputs["map_crosswalks"],
                     inputs["route_lanes"], ref_path)
+            # L1'e terfi edenleri L0 girdisinden sil -- HER IKI yol icin de (kayitli npz ve
+            # on-the-fly compute_channels), yoksa deployment'ta sizinti geri gelir.
+            if self.l1_drop_input and ch_active is not None:
+                ch_active = ch_active.clone()
+                ch_active[..., list(L1_PROMOTED_CHANNELS)] = False
 
         # --- HARITA polygonlari: kendi encoder'larimizla token (agent-free) + polygon->ego kenari ---
         lanes = inputs['map_lanes'][..., :3].float()
@@ -1001,6 +1017,7 @@ class CausalPlanner(nn.Module):
                  recon_drop=0.5, num_neighbors=10, future_steps=80, gate='softmax',
                  conflict_feats=0, conflict_bias=0, compute_conflict=0, aligned_mode='straight',
                  ego_residual=1, gate_channels=0, typed_kv=0, channel_evidence=0, gate_trust='all',
+                 l1_drop_input=0,
                  dod_meta=0, num_lon=9, num_lat=7, uniform_mask=0, joint_softmax=0, dec_moe=0,
                  dod_tf=0, lat_moe=0, l1=0, l1_bottleneck=0,
                  num_l1_ag=6, num_l1_mp=2):
@@ -1016,6 +1033,27 @@ class CausalPlanner(nn.Module):
         # kapatmak (saf TF'te train 0.55 / val 1.08 makasi olculdu) — model kendi hatali
         # kararlariyla yasamayi ogrenir. ss_p=0 = saf TF.
         self.ss_p = 0.0
+        # --- psi prior duzeltmesi (cikarim-zamani kalibrasyon; 2026-09-02) ---
+        # Egitimde F.cross_entropy(..., weight=w) kullanildi (train_planner.py:220). Agirlikli
+        # CE'nin Bayes-optimal karari argmax_c w_c*p(c|x)'tir; yani ogrenilen logit'ler dogal
+        # log-olasiligin uzerine +log(w_c) tasir. OLCULDU (validation n=1118): b*_lon 'slow'a
+        # %25.8 diyor, GT %11.5; 'maintain' %14.8, GT %30.7. b* head'e decision_emb_lon ile
+        # girdigi icin bu sapma ALTI MODU BIRDEN yavaslatiyor -> plan 8 s'de 2.8 m kisa kaliyor.
+        # Cikarimda alpha*log(w) geri cikarilir. alpha=0 -> davranis AYNEN eskisi gibi.
+        # Buffer DEGIL, duz attribute: state_dict'e anahtar eklemez (eski ckpt'ler strict
+        # yuklemede bozulmaz, eval scriptlerindeki missing/unexpected kontrolleri patlamaz).
+        self.psi_prior_alpha = 0.0
+        if self.lat_moe:
+            _w_lon = LON4_CE_WEIGHT
+            _w_lat = LAT5L_CE_WEIGHT if int(lat_moe) >= 2 else LAT5V_CE_WEIGHT
+        elif self.dec_moe:
+            _w_lon, _w_lat = LON5_CE_WEIGHT, LAT5_CE_WEIGHT
+        elif num_lon == NUM_LON_MERGED:                      # lon_merge=1 (9 -> 6 sinif)
+            _w_lon, _w_lat = LON_MERGED_CE_WEIGHT, LAT_CE_WEIGHT
+        else:
+            _w_lon, _w_lat = LON_CE_WEIGHT, LAT_CE_WEIGHT
+        self._psi_log_w_lon = torch.log(torch.tensor(_w_lon, dtype=torch.float32))
+        self._psi_log_w_lat = torch.log(torch.tensor(_w_lat, dtype=torch.float32))
         assert not (self.dod_tf and not self.dod_meta), "dod_tf dod_meta gerektirir"
         assert not (self.dod_tf and self.dec_moe), "dod_tf ile dec_moe birlesmez (dec_moe zaten TF icerir)"
         assert not (self.lat_moe and (self.dec_moe or self.dod_tf)), \
@@ -1037,7 +1075,8 @@ class CausalPlanner(nn.Module):
                                                   conflict_bias=conflict_bias,
                                                   gate_channels=gate_channels, typed_kv=typed_kv,
                                                   channel_evidence=channel_evidence,
-                                                  gate_trust=gate_trust)
+                                                  gate_trust=gate_trust,
+                                                  l1_drop_input=l1_drop_input)
         for _l in self.disentangler.layers:
             _l.ego_residual = bool(ego_residual)
             _l.uniform_mask = bool(uniform_mask)      # rules-only baseline (inference-time)
@@ -1154,6 +1193,15 @@ class CausalPlanner(nn.Module):
         if self.dod_meta:
             psi_lon_cas, psi_lat_cas = self.psi_lon(z_cas), self.psi_lat(z_cas)
             psi_lon_cfd, psi_lat_cfd = self.psi_lon(z_cfd), self.psi_lat(z_cfd)
+            if self.psi_prior_alpha and not self.training:
+                # Agirlikli CE'nin logit'lere ekledigi log(w) sapmasini geri al. Egitimde
+                # ASLA calismaz (loss agirlikli CE'yi kendi hesaplar; burada da cikarmak
+                # duzeltmeyi iki kez uygulardi).
+                _a = float(self.psi_prior_alpha)
+                _wl = self._psi_log_w_lon.to(psi_lon_cas.device)
+                _wt = self._psi_log_w_lat.to(psi_lat_cas.device)
+                psi_lon_cas, psi_lat_cas = psi_lon_cas - _a * _wl, psi_lat_cas - _a * _wt
+                psi_lon_cfd, psi_lat_cfd = psi_lon_cfd - _a * _wl, psi_lat_cfd - _a * _wt
             b_star = (psi_lon_cas.argmax(-1), psi_lat_cas.argmax(-1))   # (argmax non-diff -> psi'ye sizmaz)
             b_cfd = (psi_lon_cfd.argmax(-1), psi_lat_cfd.argmax(-1))
         else:

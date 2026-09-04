@@ -36,7 +36,7 @@ from GameFormer.channels import (compute_channels, compute_map_channels,
 
 # v1.1 (2026-08-18): ego-koridoru adayi select_ego_corridor ile secilir (sabit aday-0 degil).
 # Surum farkli oldugu icin v1.0 damgali dosyalar --force gerekmeden otomatik yeniden basilir.
-VERSION = "channels-v1.1"
+VERSION = "channels-v1.2"   # v1.2 (2026-08-31): overtakes TAMAMLANMA sarti + collision_course YON sarti
 
 
 @torch.no_grad()

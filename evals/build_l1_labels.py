@@ -17,9 +17,14 @@ AJAN L1 (6 sinif, oncelik sirasiyla tek etikete indirgenir):
 HARITA L1 (2 sinif):
   np:keepsLane         ego'nun GT gelecegi bu serit elemanini takip ediyor
   none
-  (np:waitsAtRedLight / np:crossesStopLine CIKARILDI -- olculdu: islenmis veride KIRMIZI
-   isik yok, 1118 sahnede RED one-hot'i sifir. data_process.py kirmizi durumu yalnizca rota
-   dolulugunda kullaniyor, serit kodlamasina gecmemis.)
+  (np:waitsAtRedLight / np:crossesStopLine simdilik CIKARILDI -- islenmis veride KIRMIZI isik
+   yok: train'de de validation'da da RED one-hot'i SIFIR. SEBEP bulundu ve DUZELTILDI
+   (2026-08-31): devkit'in get_traffic_light_encoding'i traffic_light_data'yi IKI KEZ dolasir
+   (once green, sonra red) ama data_process.py ona bir GENERATOR veriyordu; generator ilk
+   gecisde tukendigi icin red_lane_connectors HER ZAMAN bos kaliyordu. Ham nuPlan DB'de
+   633,770 kirmizi kayit var (green: 381,493) -- yani KIRMIZI, YESILDEN DAHA SIK.
+   data_process.py artik list(...) ile sariyor; bu iki sinif ancak veri YENIDEN islendikten
+   sonra eklenebilir, cunku duzeltme map API + senaryo DB'si ister.)
 
 Kosum:
   python evals/build_l1_labels.py --valid_set <dir> --out l1_labels.npz

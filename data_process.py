@@ -10,6 +10,7 @@ from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_utils import ScenarioMapping
 from nuplan.common.actor_state.state_representation import Point2D
+import math
 from nuplan.common.maps.maps_datatypes import SemanticMapLayer
 from nuplan.common.maps.maps_datatypes import TrafficLightStatusType
 from shapely import Point
@@ -393,7 +394,11 @@ class DataProcessor(object):
         ego_state = self.scenario.initial_ego_state
         ego_coords = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
         route_roadblock_ids = self.scenario.get_route_roadblock_ids()
-        traffic_light_data = self.scenario.get_traffic_light_status_at_iteration(0)
+        # list(): get_traffic_light_status_at_iteration bir GENERATOR dondurur, devkit'in
+        # get_traffic_light_encoding'i ise onu IKI KEZ dolasir (once green, sonra red).
+        # Generator ilk gecisde tukendigi icin red_lane_connectors HER ZAMAN bos kaliyordu
+        # -- islenmis veride 0 KIRMIZI isik (ham DB'de 633,770 kirmizi kayit var).
+        traffic_light_data = list(self.scenario.get_traffic_light_status_at_iteration(0))
 
         coords, traffic_light_data = get_neighbor_vector_set_map(
             self.map_api, self._map_features, ego_coords, self._radius, route_roadblock_ids, traffic_light_data
@@ -402,7 +407,66 @@ class DataProcessor(object):
         vector_map = map_process(ego_state.rear_axle, coords, traffic_light_data, self._map_features, 
                                  self._max_elements, self._max_points, self._interpolation_method)
 
+        # === v3 EK ALANLAR (2026-09-02) ==================================================
+        # KURAL: mevcut hicbir alan DEGISMEZ. GameFormer'in lane_encoder'i lanes'in 7 boyutunu
+        # da okuyor (_lane_feature=7), o yuzden lanes[...,3:7]'yi duzeltmek donmus GF'in girdi
+        # dagilimini kaydirirdi. Duzeltilmis isik AYRI diziye yazilir; lanes bozuk haliyle kalir.
+        lanes = vector_map['lanes']                           # numpy [L,P,7]
+        vector_map['lane_tl'] = lanes[..., 3:7].copy()        # DOGRU one-hot [green,yellow,red,unknown]
+        # lanes'i BOZUK hale geri dondur: generator hatasi kirmizi connector'lari hic eslestiremiyordu,
+        # yani RED olan her segment UNKNOWN kaliyordu. Birebir yeniden uretiyoruz ki lanes dizisi
+        # eski npz'lerle BIT-BIT ayni kalsin (donmus GF onu bu haliyle gormeye alisik).
+        red = lanes[..., 5] > 0.5                             # index 5 = lanes[3:7][2] = RED
+        lanes[..., 5][red] = 0.0
+        lanes[..., 6][red] = 1.0                              # UNKNOWN
+        vector_map['lanes'] = lanes
+
+        # Kavsak poligonlari (MCH_IN_INTERSECTION + LANE/LANE_CONNECTOR ayrimi) ve dur cizgileri
+        # (trafficControl'un isik-disi yarisi) TEK map_api sorgusunda cekilir -- iki ayri
+        # get_proximal_map_objects cagrisi sahne basina olcuulebilir yavaslama yapiyordu.
+        # STOP_SIGN ALINMIYOR: nuPlan harita API'si o katmani DESTEKLEMIYOR
+        # (get_available_map_objects: LANE, LANE_CONNECTOR, ROADBLOCK, ROADBLOCK_CONNECTOR,
+        # STOP_LINE, CROSSWALK, INTERSECTION, WALKWAYS, CARPARK_AREA); sorgu AssertionError atar.
+        # Yani dur tabelasi kavrami KG'de degil, VERIDE yok.
+        polys = self._query_polygon_layers(
+            ego_coords, [SemanticMapLayer.INTERSECTION, SemanticMapLayer.STOP_LINE],
+            ego_state.rear_axle)
+        vector_map['intersections'] = polys[SemanticMapLayer.INTERSECTION]
+        vector_map['stop_polygons'] = polys[SemanticMapLayer.STOP_LINE]
         return vector_map
+
+    def _query_polygon_layers(self, point, layers, anchor, max_elems=20, max_pts=20):
+        """TEK map_api sorgusuyla birden cok poligon katmani; KATMAN BASINA ayri dizi doner.
+        Her dizi [max_elems, max_pts, 3] -> (x, y, dolu_bayragi), ego-frame, sifir-pad."""
+        outs = {layer: np.zeros((max_elems, max_pts, 3), dtype=np.float32) for layer in layers}
+        try:
+            got = self.map_api.get_proximal_map_objects(point, self._radius, layers)
+        except AssertionError as e:                # katman bu haritada desteklenmiyor
+            print(f"[warn] desteklenmeyen harita katmani: {[l.name for l in layers]} -- {e}")
+            return outs
+        except Exception:
+            return outs
+        ca, sa = math.cos(anchor.heading), math.sin(anchor.heading)
+        for layer in layers:
+            out = outs[layer]
+            k = 0
+            for obj in got.get(layer, []):
+                if k >= max_elems:
+                    break
+                try:
+                    xy = np.array(obj.polygon.exterior.coords, dtype=np.float32)
+                except Exception:
+                    continue
+                if len(xy) < 2:
+                    continue
+                if len(xy) > max_pts:                      # esit araliklarla altorneklle
+                    xy = xy[np.linspace(0, len(xy) - 1, max_pts).astype(int)]
+                dx, dy = xy[:, 0] - anchor.x, xy[:, 1] - anchor.y
+                out[k, :len(xy), 0] = dx * ca + dy * sa    # ego frame
+                out[k, :len(xy), 1] = -dx * sa + dy * ca
+                out[k, :len(xy), 2] = 1.0                  # dolu isareti (tip zaten dizi adinda)
+                k += 1
+        return outs
 
     def get_ego_agent_future(self):
         current_absolute_state = self.scenario.initial_ego_state
@@ -481,7 +545,7 @@ class DataProcessor(object):
             ego_agent_future = self.get_ego_agent_future()
             neighbor_agents_future = self.get_neighbor_agents_future(neighbor_indices)
 
-            traffic_light_data = self.scenario.get_traffic_light_status_at_iteration(0)
+            traffic_light_data = list(self.scenario.get_traffic_light_status_at_iteration(0))  # bkz. yukaridaki list() notu
             c_lat_candidates, c_lat_candidates_global = self.get_multimodal_reference_paths2(
                 self.scenario.initial_ego_state,
                 traffic_light_data,
@@ -589,21 +653,23 @@ def main(args):
     os.makedirs(args.train_save_path, exist_ok=True)
     os.makedirs(args.val_save_path, exist_ok=True)
 
-    # create scenario filters
-    #scenario_filter_val = ScenarioFilter(*filter_params_default_val)
-    #scenarios_val = builder.get_scenarios(scenario_filter_val, worker)
-    scenario_filter_train = ScenarioFilter(*filter_params_default_train)
-    scenarios_train = builder.get_scenarios(scenario_filter_train, worker)
-    
-    
-    # process data
-    del worker, builder, scenario_filter_train, scenario_mapping
-    #print(f"Total number of scenarios: {len(scenarios_val)}")
-    #processor_val = DataProcessor(scenarios_val)
-    #processor_val.work(args.val_save_path, debug=args.debug)
-    print(f"Total number of scenarios: {len(scenarios_train)}")
-    processor_train = DataProcessor(scenarios_train)
-    processor_train.work(args.train_save_path, debug=args.debug)
+    # --only ile hangi bolumun islenecegi secilir (varsayilan: eski davranis = train)
+    do_val = args.only in ('val', 'both')
+    do_train = args.only in ('train', 'both')
+
+    scenarios_val = scenarios_train = None
+    if do_val:
+        scenarios_val = builder.get_scenarios(ScenarioFilter(*filter_params_default_val), worker)
+    if do_train:
+        scenarios_train = builder.get_scenarios(ScenarioFilter(*filter_params_default_train), worker)
+
+    del worker, builder, scenario_mapping
+    if do_val:
+        print(f"[val] Total number of scenarios: {len(scenarios_val)}")
+        DataProcessor(scenarios_val).work(args.val_save_path, debug=args.debug)
+    if do_train:
+        print(f"[train] Total number of scenarios: {len(scenarios_train)}")
+        DataProcessor(scenarios_train).work(args.train_save_path, debug=args.debug)
 
 
 if __name__ == "__main__":
@@ -617,6 +683,8 @@ if __name__ == "__main__":
     parser.add_argument('--scenarios_per_type', type=int, default=4000, help='number of scenarios per type')
     parser.add_argument('--total_scenarios', default=None, help='limit total number of scenarios')
     parser.add_argument('--shuffle_scenarios', type=bool, default=False, help='shuffle scenarios')
+    parser.add_argument('--only', type=str, default='train', choices=['train','val','both'],
+                        help='hangi bolum islenecek. val = yalniz dogrulama (hizli deneme)')
     parser.add_argument('--debug', action="store_true", help='if visualize the data output', default=False)
     args = parser.parse_args()
 

@@ -163,12 +163,18 @@ def maneuver_labels(ego_future):
 # ogrenilmeleri beklenmiyor; olculecek, raporlanacak.
 L1_AG_WEIGHT = [0.27, 7.8, 40.0, 40.0, 39.0, 9.0]
 
+# L_mass hedef onceligi: AG_CLASSES = ['none','follows','yieldingTo','waitingFor',
+# 'mergesInFrontOf','overtakes'] -> indeksler. Sira build_l1_labels.py'deki AG_PRIORITY ile
+# AYNI: acik KARAR (yield/wait) > manevra (merge/overtake) > varsayilan kisit (follows).
+# En yuksek oncelikli sinifa sahip ajan(lar) kutlenin gitmesi GEREKEN yerdir.
+L1_MASS_PRIORITY = [2, 3, 4, 5, 1]
+
 
 def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0,
-                            lambda_attr=0.0, l1_labels=None,
                             neighbors_future=None, lambda_nbr=0.0, lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
                             lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5,
-                            lambda_conflict=0.0, conflict_terms='all', dec_labels=None):
+                            lambda_conflict=0.0, conflict_terms='all', dec_labels=None,
+                            lambda_attr=0.0, l1_labels=None, lambda_mass=0.0):
     """Causal-Planner'a SADIK loss (ref: ~/Causal-Planner lightning_trainer.py). Backdoor/GRL YOK.
 
     CP'nin toplami:
@@ -336,8 +342,34 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
             l_attr = l_attr + F.cross_entropy(la[va], y_ag[:, :la.shape[1]][va], weight=w_ag)
         if vm.any():
             l_attr = l_attr + F.cross_entropy(lm[vm], y_mp[:, :lm.shape[1]][vm])
+
+    # --- L_mass: M_cas'a DOGRUDAN denetim (L_attr'in ikinci terimi) ---
+    # L_attr yalnizca "ajan j NE yapiyor" sorusunu denetler, "HANGI ajan onemli"yi denetlemez.
+    # Iz (0.33 * follows(ego, agent1)) sinif-dogru ama ajan-yanlis olabilir -- olculdu:
+    # M_cas AUC 0.743, ayni ayrimi ham geometri 0.975 ile yapiyor. Bu terim kutleyi GT'nin
+    # nedensel dedigi ajan(lar)a itiyor: hedef q = en yuksek oncelikli non-none sinifa sahip
+    # gecerli ajanlar uzerinde duzgun dagilim; kayip -sum_j q_j log p_j, p = gecerli ajanlar
+    # uzerinde YENIDEN NORMALIZE edilmis M_cas (M_cas ham halde ~0.92'ye toplaniyor, log'u
+    # normalize etmeden almak toplam kutleyi de yukari iterdi -- istemedigimiz bir yan etki).
+    l_mass = torch.zeros((), device=out['traj'].device)
+    if lambda_mass > 0 and l1_labels is not None and out.get('M_cas') is not None:
+        y_ag = l1_labels[0]
+        Mc, va = out['M_cas'], out['gated_valid']
+        y_ag = y_ag[:, :Mc.shape[1]]
+        rank = torch.zeros_like(Mc)
+        for r, c in enumerate(L1_MASS_PRIORITY):                 # yuksek puan = daha oncelikli
+            rank = torch.where(y_ag == c, float(len(L1_MASS_PRIORITY) - r), rank)
+        rank = rank * va.float()                                 # grafikte olmayan ajan hedef olamaz
+        best = rank.max(-1, keepdim=True).values
+        has = (best.squeeze(-1) > 0)
+        if has.any():
+            q = ((rank == best) & (rank > 0)).float()
+            q = q / q.sum(-1, keepdim=True).clamp(min=1.0)
+            p = Mc * va.float()
+            p = p / p.sum(-1, keepdim=True).clamp(min=1e-6)
+            l_mass = -(q[has] * torch.log(p[has] + 1e-8)).sum(-1).mean()
     loss = (l_traj + lambda_kld * l_kld + lambda_ci * l_ci + lambda_mask * l_mask
-            + lambda_attr * l_attr
+            + lambda_attr * l_attr + lambda_mass * l_mass
             + lambda_recon * l_recon + lambda_nbr * l_nbr + lambda_budget * l_budget + lambda_bc * l_bc + lambda_peak * l_peak
             + lambda_conflict * l_conflict)
 
@@ -385,6 +417,21 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
         # mcas_ent >> mcas_headent ise head'ler FARKLI komsulara tepe yapiyor ve mean/mcas_peak bunu
         # gizleyip duz gosteriyor demektir. Ayni tesihs harita (g2a) icin de tutuluyor: peak/uniform
         # =7.33x iddiasinin head-anlasmazligi artefakti olup olmadigini gorebilmek icin.
+        # L1 metrikleri: genel dogruluk, non-none GERI CAGIRMA (asil onemli olan -- %94 none
+        # oldugu icin duz dogruluk hep yuksek gorunur), harita dogrulugu.
+        l1_acc = l1_rec = l1_macc = 0.0
+        if out.get('l1_ag') is not None and dec_labels is not None and l1_labels is not None:
+            ya, ym = l1_labels
+            if ya is not None:
+                va2, vm2 = out['gated_valid'], out['gated_map_valid']
+                if va2.any():
+                    pa = out['l1_ag'].argmax(-1)[va2]; ta = ya[:, :out['l1_ag'].shape[1]][va2]
+                    l1_acc = (pa == ta).float().mean().item()
+                    nz = ta > 0
+                    l1_rec = (pa[nz] == ta[nz]).float().mean().item() if nz.any() else 0.0
+                if vm2.any():
+                    pm = out['l1_mp'].argmax(-1)[vm2]; tm = ym[:, :out['l1_mp'].shape[1]][vm2]
+                    l1_macc = (pm == tm).float().mean().item()
         mcas_ent = out['M_cas_ent'].mean().item()
         mcas_headent = out['M_cas_headent'].mean().item()
         mcfd_ent = out['M_cfd_ent'].mean().item()
@@ -429,6 +476,7 @@ def causal_loss_and_metrics(out, ego_future, lambda_kld, lambda_ci, lambda_mask,
         'gcfd_mean': ((out['M_cfd'] * nvb_b).sum() / nvb_b.sum().clamp(min=1)).item(),
         'gcas_frac05': (((out['M_cas'] > 0.5) & nvb_b).sum() / nvb_b.sum().clamp(min=1)).item(),
         'minADE': minade, 'minFDE': minfde, 'casacc': cas_acc, 'cfdacc': cfd_acc,
+        'attr': l_attr.item(), 'mass': l_mass.item(), 'l1acc': l1_acc, 'l1rec': l1_rec, 'l1macc': l1_macc,
         'mcas_peak': mcas_peak, 'mcas_map_peak': mcas_map_peak, 'qbar': q_bar,
         'mcfd_peak': mcfd_peak, 'unif': unif,
         'fcfd_var': fcfd_var, 'fcas_var': fcas_var,
@@ -447,7 +495,8 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                lambda_kld, lambda_ci, lambda_mask, lambda_recon=0.0, lambda_nbr=0.0,
                lambda_budget=0.0, budget_rho=0.2, budget_lo=0.0,
                lambda_bc=0.0, lambda_peak=0.0, peak_tau=0.5, lambda_conflict=0.0, conflict_terms='all',
-               ego_corridor='refpath', optimizer=None, desc="Training", lambda_attr=0.0):
+               ego_corridor='refpath', optimizer=None, desc="Training", lambda_attr=0.0,
+               lambda_mass=0.0):
     train = optimizer is not None
     causal.train() if train else causal.eval()
     gameformer.eval()
@@ -483,6 +532,7 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                                                          dec_labels=(inputs.get('decision_lon'),
                                                                      inputs.get('decision_lat')),
                                                          lambda_attr=lambda_attr,
+                                                         lambda_mass=lambda_mass,
                                                          l1_labels=((inputs['l1_agent'], inputs['l1_map'])
                                                                     if 'l1_agent' in inputs else None))
 
@@ -498,6 +548,7 @@ def _run_epoch(data_loader, gameformer, causal, device, num_neighbors,
                 loss=f"{np.mean(agg['loss']):.3f}", minADE=f"{np.mean(agg['minADE']):.3f}",
                 casacc=f"{np.mean(agg['casacc']):.3f}", cfdacc=f"{np.mean(agg['cfdacc']):.3f}",
                 peak=f"{np.mean(agg['mcas_peak']):.3f}", cfdpk=f"{np.mean(agg['mcfd_peak']):.3f}",
+                l1rec=f"{np.mean(agg['l1rec']):.3f}",
                 entgap=f"{np.mean(agg['entgap']):.3f}",
                 unif=f"{np.mean(agg['unif']):.3f}",
             )
@@ -575,6 +626,7 @@ def model_training(args):
                            gate_channels=args.gate_channels, typed_kv=args.typed_kv,
                            channel_evidence=args.channel_evidence,
                            gate_trust=args.gate_trust,
+                           l1_drop_input=args.l1_drop_input,
                            dod_meta=args.dod_meta, dec_moe=args.dec_moe, dod_tf=args.dod_tf,
                            lat_moe=args.lat_moe,
                            l1=args.l1, l1_bottleneck=args.l1_bottleneck,
@@ -639,13 +691,13 @@ def model_training(args):
                              args.lambda_budget, args.budget_rho, args.budget_lo,
                              args.lambda_bc, args.lambda_peak, args.peak_tau, args.lambda_conflict, args.conflict_terms,
                              args.ego_corridor, optimizer=optimizer, desc="Training",
-                             lambda_attr=args.lambda_attr)
+                             lambda_attr=args.lambda_attr, lambda_mass=args.lambda_mass)
         val_m = _run_epoch(valid_loader, gameformer, causal, args.device, args.num_neighbors,
                            args.lambda_kld, args.lambda_ci, args.lambda_mask, args.lambda_recon, args.lambda_nbr,
                            args.lambda_budget, args.budget_rho, args.budget_lo,
                            args.lambda_bc, args.lambda_peak, args.peak_tau, args.lambda_conflict, args.conflict_terms,
                            args.ego_corridor, optimizer=None, desc="Validation",
-                           lambda_attr=args.lambda_attr)
+                           lambda_attr=args.lambda_attr, lambda_mass=args.lambda_mass)
 
         log = {"epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]}
         log.update({f"train-{k}": v for k, v in train_m.items()})
@@ -661,7 +713,8 @@ def model_training(args):
 
         logging.info(
             f"train: minADE={train_m['minADE']:.3f} casacc={train_m['casacc']:.3f} "
-            f"cfdacc={train_m['cfdacc']:.3f} peak={train_m['mcas_peak']:.3f} cfdpk={train_m['mcfd_peak']:.3f} "
+            f"cfdacc={train_m['cfdacc']:.3f} l1acc={train_m['l1acc']:.3f} l1rec={train_m['l1rec']:.3f} "
+            f"l1macc={train_m['l1macc']:.3f} peak={train_m['mcas_peak']:.3f} cfdpk={train_m['mcfd_peak']:.3f} "
             f"hgap={train_m['mcas_ent'] - train_m['mcas_headent']:.3f} "
             f"hgap_mp={train_m['mcas_map_ent'] - train_m['mcas_map_headent']:.3f} "
             f"gcos={train_m['gate_cos_last']:.3f} "
@@ -718,6 +771,9 @@ if __name__ == "__main__":
                         help="channels: (ajan,kanal) girdileri + kanal-basina K/V (gating'i yapisal olarak icerir)")
     parser.add_argument("--channel_evidence", type=int, default=0,
                         help="channels: 9/8-dim kanal kaniti edge'e concat")
+    parser.add_argument("--l1_drop_input", type=int, default=0,
+                        help="L1'e terfi eden kanallari (follows/merges/overtakes) L0 girdisinden sil. "
+                             "l1=1 ile birlikte kullan: aksi halde girdi->hedef kopyadir.")
     parser.add_argument("--gate_trust", type=str, default="all", choices=["all", "reliable"],
                         help="reliable: zayif-IoU kanallar (collision/intersect/merges) GATE kararina sayilmaz")
     parser.add_argument("--dod_meta", type=int, default=0,
@@ -736,6 +792,9 @@ if __name__ == "__main__":
                              "0 = hibrit (f_cas + L1 ozeti), performans sigortasi.")
     parser.add_argument("--num_l1_ag", type=int, default=6)
     parser.add_argument("--num_l1_mp", type=int, default=2)
+    parser.add_argument("--lambda_mass", type=float, default=0.0,
+                        help="M_cas'a DOGRUDAN denetim. L_attr sinifi denetler, bu AJANI denetler: "
+                             "kutle GT'nin nedensel dedigi ajana itilir. --l1_labels ile birlikte kullan.")
     parser.add_argument("--lambda_attr", type=float, default=0.0,
                         help="L_attr agirligi (L1 denetimi). 0 = kapali.")
     parser.add_argument("--l1_valid_labels", type=str, default="",
